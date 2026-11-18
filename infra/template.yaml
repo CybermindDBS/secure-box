@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Secure Box - static web app on S3. No user data is ever stored in AWS: vaults, keys and files are
+  encrypted in the browser and kept in each person's own Google Drive.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Bucket name (no dots, so the HTTPS certificate matches). May be an existing bucket you own.
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+    ConstraintDescription: 3-63 characters; lowercase letters, digits and hyphens only.
+  CreateBucket:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Set to false to use a bucket you already created (deploy.ps1 detects this).
+  BucketNamespace:
+    Type: String
+    Default: global
+    AllowedValues: [global, account-regional]
+    Description: Only used when creating the bucket. Use account-regional for names ending in -<account-id>-<region>-an.
+
+Conditions:
+  ShouldCreateBucket: !Equals [!Ref CreateBucket, 'true']
+  IsAccountRegional: !Equals [!Ref BucketNamespace, account-regional]
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateBucket
+    Properties:
+      BucketName: !Ref BucketName
+      BucketNamespace: !If [IsAccountRegional, account-regional, !Ref 'AWS::NoValue']
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false # the bucket policy below makes ONLY the app files public
+        RestrictPublicBuckets: false
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !If [ShouldCreateBucket, !Ref Bucket, !Ref BucketName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadAppFilesOnly
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/index.html'
+              - !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/sw.js'
+              - !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/assets/*'
+          - Sid: DenyNonTls
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${BucketName}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+Outputs:
+  AppUrl:
+    Description: Open this URL to use Secure Box. Register it as an authorized redirect URI in your Google OAuth client.
+    Value: !Sub 'https://${BucketName}.s3.${AWS::Region}.amazonaws.com/index.html'
+  AppOrigin:
+    Description: Register this as an authorized JavaScript origin in your Google OAuth client.
+    Value: !Sub 'https://${BucketName}.s3.${AWS::Region}.amazonaws.com'
+  BucketName:
+    Value: !Ref BucketName

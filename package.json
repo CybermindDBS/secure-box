@@ -1,0 +1,24 @@
+{
+  "name": "secure-box",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Secure Box: an end-to-end encrypted vault for passwords, secrets and files. Static site on Firebase Hosting or Amazon S3; everything stored encrypted in each person's own Google Drive.",
+  "license": "AGPL-3.0-only",
+  "author": "CybermindDBS",
+  "homepage": "https://github.com/CybermindDBS/secure-box#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CybermindDBS/secure-box.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CybermindDBS/secure-box/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/serve.mjs",
+    "test": "node --test \"tests/*.test.mjs\""
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
