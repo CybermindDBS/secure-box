@@ -509,7 +509,7 @@ function renderAll() {
   if (!state.unlocked) return;
   if (filesMode()) {
     files.render();
-    if (state.section === 'local') renderLocalStatus();
+    renderLocalStatus(); // Files and Local share the file manager: the bar hides itself outside Local
   } else if (state.section === 'local') renderLocalSetup();
   else {
     renderList();
