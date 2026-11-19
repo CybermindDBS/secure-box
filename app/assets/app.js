@@ -9,6 +9,7 @@ import { createCloudBackend } from './backend.js';
 import { generatePassword, passwordEntropyBits } from './crypto.js';
 import { DEMO_PASSWORD, createDemoBackend } from './demo.js';
 import { createFilesView } from './files-view.js';
+import { formatBytes } from './filetypes.js';
 import { GoogleError, beginGoogleSignIn, isAuthPopupReturn, reconnectWithPopup, relayAuthPopupReturn, takeGoogleRedirect } from './google.js';
 import {
   KeyringError,
@@ -24,6 +25,8 @@ import {
   withNewPassword,
   withNewRecovery,
 } from './keyring.js';
+import { createLocalTools } from './local-tools.js';
+import { allowFolder, findLocalVault, forgetFolder, isLocalId, localSupport, openLocalVault } from './localstore.js';
 import { forgetStreams, startStreaming } from './stream.js';
 import { $, $$, avatar, confirmDialog, copyText, downloadFile, formatDate, h, icon, pickFile, relativeTime, toast } from './ui.js';
 import { VaultCipher, VaultError, applyChange, emptyVault, hostnameOf, itemsFromCsv, itemsToCsv, makeItem, parseEnvelope, safeHref } from './vault.js';
@@ -83,6 +86,19 @@ let lastActivity = Date.now();
 let syncLabelTimer = 0;
 let files = null;
 let streamingStarted = Promise.resolve();
+// File and text tools (.sbox files, messages). Opening them also works while locked, with a sharing password.
+const tools = createLocalTools({ master: () => (state.unlocked ? state.master : null) });
+// The local vault on this device (the Local tab): found when the tab first opens.
+const local = { store: null, found: undefined, error: '', busy: '', strays: [] };
+const cloudStore = {
+  kind: 'cloud',
+  getVault: () => state.vault,
+  commit: (change) => commit(change),
+  backend: () => state.backend,
+  ensure: () => ensureDrive(),
+  fresh: (ms) => driveFresh(ms),
+};
+let localFiles = null; // the local vault as the files view sees it
 
 start().catch((err) => {
   console.error(err);
@@ -104,7 +120,8 @@ async function start() {
   }[reason] || '';
   state.lockMessage = lockMessage;
 
-  const streaming = startStreaming({ describe: describeForStream, read: (id, a, b) => state.backend.readBytes(id, a, b) }).then((ok) => {
+  const read = (id, a, b) => (isLocalId(id) ? local.store.backend.readBytes(id, a, b) : state.backend.readBytes(id, a, b));
+  const streaming = startStreaming({ describe: describeForStream, read }).then((ok) => {
     state.streaming = ok;
   });
   streamingStarted = streaming;
@@ -177,8 +194,10 @@ async function loadConfig() {
 function describeForStream(fileId) {
   if (!state.unlocked) return null;
   const entry = state.vault.files.find((f) => f.id === fileId);
-  if (!entry) return null;
-  return { entry, ...state.backend.describe() };
+  if (entry) return { entry, ...state.backend.describe() };
+  // Local vault files: the worker asks this page for their (encrypted) bytes.
+  const localEntry = local.store?.getVault().files.find((f) => f.id === fileId);
+  return localEntry ? { entry: localEntry, source: 'page' } : null;
 }
 
 // ===========================================================================
@@ -429,33 +448,36 @@ function enterApp({ master, cipher, vault, rev, unlockedAt = Date.now() }) {
   lastActivity = Date.now();
   channel?.postMessage({ type: 'unlocked', sub: state.identity?.sub });
   $('#account-email').textContent = state.identity?.email || '';
+  $('#source-email').textContent = state.identity?.email || '';
   $('#demo-badge').hidden = !DEMO;
   $('#gate').hidden = true;
   $('#app').hidden = false;
   files ??= createFilesView({
-    getVault: () => state.vault,
-    commit,
-    backend: () => state.backend,
-    ensureDrive,
-    driveFresh,
+    cloud: cloudStore,
     streaming: () => state.streaming,
     onChange: () => renderAll(),
+    onNavigate: () => pushNav(),
   });
   let section = 'passwords';
   try {
-    section = localStorage.getItem(SECTION_KEY) === 'files' ? 'files' : 'passwords';
+    const saved = localStorage.getItem(SECTION_KEY);
+    if (['files', 'local'].includes(saved)) section = saved;
   } catch {
     /* ignore */
   }
-  setSection(section);
+  setSection(section, { push: false });
+  history.replaceState(navState(), '');
   setSyncStatus('idle');
   startAutoLock();
 }
 
 // ===========================================================================
-// Sections
+// Sections: Google Drive (Passwords, Files) and Local
 // ===========================================================================
-function setSection(section) {
+/** Files and an open local vault share the file manager. */
+const filesMode = () => state.section === 'files' || (state.section === 'local' && Boolean(localFiles));
+
+function setSection(section, { push = true } = {}) {
   state.section = section;
   try {
     localStorage.setItem(SECTION_KEY, section);
@@ -463,25 +485,359 @@ function setSection(section) {
     /* ignore */
   }
   for (const tab of $$('[data-section]')) tab.setAttribute('aria-selected', String(tab.dataset.section === section));
+  if (section === 'files') files.useStore(cloudStore);
+  if (section === 'local' && localFiles) files.useStore(localFiles);
+  const setup = section === 'local' && !localFiles;
   $('#passwords-view').hidden = section !== 'passwords';
-  $('#files-view').hidden = section !== 'files';
+  $('#files-view').hidden = !filesMode();
+  $('#files-view').classList.toggle('is-local', section === 'local');
+  $('#local-setup').hidden = !setup;
   const search = $('#search');
-  search.value = section === 'files' ? files.query : state.query;
-  search.placeholder = section === 'files' ? 'Search files' : 'Search passwords';
+  search.value = filesMode() ? files.query : section === 'passwords' ? state.query : '';
+  search.placeholder = section === 'files' ? 'Search files' : section === 'local' ? 'Search local vault' : 'Search passwords';
+  search.disabled = setup;
   $('.topbar').classList.toggle('is-searching', Boolean(search.value));
-  const primary = $('#primary-action');
-  primary.replaceChildren(icon(section === 'files' ? 'upload' : 'plus', 16), h('span', { text: section === 'files' ? 'Upload' : 'New' }));
-  primary.title = section === 'files' ? 'Upload files (U)' : 'New item (N)';
   renderAll();
+  if (section === 'local') {
+    if (localFiles) checkStrays();
+    else openLocalTab();
+  }
+  if (push) pushNav();
 }
 
 function renderAll() {
   if (!state.unlocked) return;
-  if (state.section === 'files') files.render();
+  if (filesMode()) {
+    files.render();
+    if (state.section === 'local') renderLocalStatus();
+  } else if (state.section === 'local') renderLocalSetup();
   else {
     renderList();
     renderDetail();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Back and Forward move between sections, folders, the viewer and (on phones) an item
+// ---------------------------------------------------------------------------
+const narrow = () => window.matchMedia('(max-width: 760px)').matches;
+let restoringNav = false;
+let viewerEntry = false; // the open viewer has its own history entry
+
+function navState() {
+  return { sb: 1, section: state.section, folder: filesMode() ? files.folder : null, item: state.section === 'passwords' && narrow() ? state.selectedId : null };
+}
+
+function pushNav() {
+  if (restoringNav || !state.unlocked) return;
+  const next = navState();
+  const now = history.state;
+  if (now?.sb && !now.viewer && now.section === next.section && now.folder === next.folder && now.item === next.item) return;
+  history.pushState(next, '');
+}
+
+function onPopState(event) {
+  if (!state.unlocked) return;
+  const target = event.state;
+  if ($('#viewer').open && !target?.viewer) {
+    viewerEntry = false; // Back already took the viewer's entry off
+    files.actions['viewer-close']();
+  }
+  if (!target?.sb) return;
+  restoringNav = true;
+  try {
+    if (target.section !== state.section && ['passwords', 'files', 'local'].includes(target.section)) setSection(target.section, { push: false });
+    if (filesMode() && target.folder !== files.folder) files.goTo(target.folder ?? null, { push: false });
+    if (state.section === 'passwords' && narrow() && target.item !== state.selectedId) {
+      select(target.item && state.vault.items.some((it) => it.id === target.item) ? target.item : null, { push: false });
+    }
+  } finally {
+    restoringNav = false;
+  }
+}
+
+/** The detail's back arrow on phones goes Back, so the browser's Back button stays in step. */
+function closeDetail() {
+  if (history.state?.sb && history.state.item) history.back();
+  else select(null);
+}
+
+// ---------------------------------------------------------------------------
+// Local: the local vault on this device
+// ---------------------------------------------------------------------------
+async function openLocalTab() {
+  if (local.busy) return;
+  if (local.found === undefined) {
+    local.busy = 'Looking for a local vault…';
+    renderAll();
+    try {
+      local.found = await findLocalVault(state.master.kid, { demo: DEMO });
+    } catch (err) {
+      local.found = null;
+      local.error = err.message;
+    }
+    local.busy = '';
+  }
+  if (local.found?.ready) await openLocal({ where: local.found.where, handle: local.found.handle });
+  else renderAll();
+}
+
+async function openLocal({ where, handle = null, create = false }) {
+  local.busy = create ? 'Creating the local vault…' : 'Opening the local vault…';
+  local.error = '';
+  renderAll();
+  try {
+    local.store = await openLocalVault({
+      master: state.master,
+      where,
+      handle,
+      create,
+      demo: DEMO,
+      notify: () => channel?.postMessage({ type: 'local-changed', kid: state.master.kid }),
+    });
+    localFiles = {
+      kind: 'local',
+      getVault: () => local.store.getVault(),
+      commit: (change) => local.store.commit(change),
+      backend: () => local.store.backend,
+      ensure: async () => {},
+      fresh: () => true,
+    };
+    local.found = { where, handle, name: handle?.name, ready: true };
+    local.protection = await local.store.protection();
+  } catch (err) {
+    console.error(err);
+    local.store = null;
+    localFiles = null;
+    local.error = err.code === 'other-account' ? err.message : `The local vault couldn’t be opened: ${err.message}`;
+  } finally {
+    local.busy = '';
+  }
+  if (state.section === 'local') setSection('local', { push: false });
+}
+
+async function createLocal() {
+  const where = $('input[name="local-where"]:checked')?.value === 'folder' ? 'folder' : 'browser';
+  let handle = null;
+  if (where === 'folder') {
+    try {
+      handle = await window.showDirectoryPicker({ id: 'secure-box-local', mode: 'readwrite' });
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      throw err;
+    }
+  } else {
+    // Ask the browser to keep it. Firefox asks the person, which needs this click.
+    navigator.storage?.persist?.().catch(() => {});
+  }
+  await openLocal({ where, handle, create: true });
+  if (local.store) toast(where === 'folder' ? `Local vault ready in “${handle.name}”` : 'Local vault ready');
+}
+
+async function allowLocalFolder() {
+  if (await allowFolder(local.found.handle)) await openLocal({ where: 'folder', handle: local.found.handle });
+  else toast('Secure Box wasn’t allowed to open the folder.', 'error');
+}
+
+async function forgetLocalFolder() {
+  const name = local.found?.name || 'this folder';
+  const ok = await confirmDialog({
+    title: 'Stop using this folder?',
+    message: `Secure Box forgets “${name}”. The encrypted files stay in it: choose the folder again any time to open them.`,
+    confirmLabel: 'Forget folder',
+  });
+  if (!ok) return;
+  await forgetFolder(state.master.kid, { demo: DEMO });
+  Object.assign(local, { store: null, found: null, strays: [], error: '' });
+  localFiles = null;
+  setSection('local', { push: false });
+}
+
+async function protectLocal() {
+  const granted = await local.store.protect();
+  local.protection = await local.store.protection();
+  renderLocalStatus();
+  if (granted) toast('Protected: the browser won’t clear the local vault by itself');
+  else toast('The browser said no. Installing Secure Box as an app (Install app, or Add to Home Screen) usually changes that.', 'error');
+}
+
+const busyText = (label) => (p) => {
+  local.busy = `${label}… ${Math.floor(p * 100)}%`;
+  renderLocalStatus();
+};
+
+async function backupLocal() {
+  if (!local.store || local.busy) return;
+  let backup;
+  try {
+    local.busy = 'Backing up…';
+    renderLocalStatus();
+    backup = await local.store.backup({ onProgress: busyText('Backing up') });
+  } catch (err) {
+    toast(err.message, 'error');
+    return;
+  } finally {
+    local.busy = '';
+    renderLocalStatus();
+  }
+  const { blob, name } = backup;
+  const file = new File([blob], name, { type: 'application/zip' });
+  if (localSupport().ios && navigator.canShare?.({ files: [file] })) {
+    // Sharing needs a fresh tap: building the backup took a while.
+    const ok = await confirmDialog({ title: 'Backup ready', message: `${formatBytes(blob.size)}. Save it somewhere off this device, for example in Files or iCloud Drive.`, confirmLabel: 'Save backup' });
+    if (ok) await navigator.share({ files: [file], title: name }).catch((err) => err.name === 'AbortError' || toast(err.message, 'error'));
+    return;
+  }
+  downloadFile(name, blob, 'application/zip');
+  toast(`Backup saved to your downloads (${formatBytes(blob.size)})`);
+}
+
+async function restoreLocal() {
+  const file = await pickFile('.zip,application/zip');
+  if (!file) return;
+  if (!local.store) await openLocal({ where: 'browser', create: true });
+  if (!local.store) return;
+  try {
+    local.busy = 'Restoring…';
+    renderAll();
+    const added = await local.store.restore(file, { onProgress: busyText('Restoring') });
+    toast(added ? `Restored ${added} ${added === 1 ? 'file' : 'files'}` : 'Nothing to add: everything in that backup is already here');
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    local.busy = '';
+    renderAll();
+  }
+}
+
+/** Plain files put into a folder vault by hand: offer to encrypt them. */
+async function checkStrays() {
+  if (local.store?.where !== 'folder') return;
+  try {
+    local.strays = await local.store.strays();
+  } catch {
+    local.strays = [];
+  }
+  if (state.section === 'local') renderLocalStatus();
+}
+
+async function encryptStrays() {
+  const strays = local.strays;
+  if (!strays.length || !localFiles) return;
+  const count = strays.length === 1 ? `“${strays[0].name}”` : `${strays.length} files`;
+  const ok = await confirmDialog({
+    title: `Encrypt ${count}?`,
+    message: 'They were put into the local vault’s folder by hand, so they aren’t encrypted. Secure Box encrypts each one into the local vault, then deletes the unencrypted original.',
+    confirmLabel: 'Encrypt',
+  });
+  if (!ok) return;
+  local.strays = [];
+  renderLocalStatus();
+  await files.enqueue(strays.map((s) => ({ file: s.file, path: s.path, after: () => local.store.removeStray(s) })), null, localFiles);
+  await local.store.pruneEmptyFolders().catch(() => {});
+  await checkStrays();
+  renderAll();
+}
+
+function renderLocalStatus() {
+  const bar = $('#local-status');
+  const store = local.store;
+  bar.hidden = !store || state.section !== 'local';
+  if (bar.hidden) return;
+  const v = store.getVault();
+  const parts = [];
+  const where = store.where === 'folder' ? `In “${store.name}”` : 'In this browser';
+  parts.push(h('span', { class: 'local-where' }, icon(store.where === 'folder' ? 'folder' : 'device', 16), h('span', { text: where })));
+  if (local.protection === 'protected') parts.push(h('span', { class: 'local-pill is-ok', text: 'Won’t be cleared automatically' }));
+  if (local.protection === 'unprotected') {
+    parts.push(h('span', { class: 'local-pill is-warn', text: 'The browser may clear it when space runs low' }));
+    parts.push(h('button', { type: 'button', class: 'btn btn-ghost btn-sm', dataset: { action: 'local-protect' } }, icon('shield', 16), h('span', { text: 'Protect' })));
+  }
+  if (local.busy) parts.push(h('span', { class: 'local-busy', role: 'status' }, h('span', { class: 'spinner spinner-sm', 'aria-hidden': 'true' }), h('span', { text: local.busy })));
+  else if (store.where === 'browser' && v.files.length) {
+    const stale = !v.backupAt || (v.changedAt > v.backupAt && Date.now() - v.backupAt > 7 * 86_400_000);
+    parts.push(h('span', { class: `local-pill${stale ? ' is-warn' : ''}`, text: v.backupAt ? `Backed up ${relativeTime(v.backupAt)}` : 'Not backed up yet' }));
+    parts.push(h('button', { type: 'button', class: 'btn btn-ghost btn-sm', dataset: { action: 'local-backup' } }, icon('download', 16), h('span', { text: 'Back up' })));
+  }
+  const rows = [h('div', { class: 'local-status-row' }, ...parts)];
+  if (local.strays.length) {
+    const names = local.strays.slice(0, 3).map((s) => s.name).join(', ') + (local.strays.length > 3 ? ` and ${local.strays.length - 3} more` : '');
+    rows.push(
+      h('div', { class: 'local-status-row local-strays' },
+        icon('alert', 16),
+        h('span', { text: `${local.strays.length === 1 ? 'An unencrypted file is' : `${local.strays.length} unencrypted files are`} in this vault’s folder: ${names}` }),
+        h('button', { type: 'button', class: 'btn btn-primary btn-sm', dataset: { action: 'local-strays' } }, icon('lock', 16), h('span', { text: 'Encrypt them' }))),
+    );
+  }
+  bar.replaceChildren(...rows);
+  $('#tools-forget').hidden = store.where !== 'folder';
+  $('#tools-backup').hidden = store.where !== 'browser';
+  // Re-checks quietly: the browser may grant (or drop) protection at any time.
+  store.protection().then((p) => {
+    if (p !== local.protection) {
+      local.protection = p;
+      renderLocalStatus();
+    }
+  }).catch(() => {});
+}
+
+function renderLocalSetup() {
+  const support = localSupport();
+  const parts = [
+    h('div', { class: 'empty-icon' }, icon('device', 22)),
+    h('h2', { class: 'local-title', text: 'Local vault' }),
+    h('p', { class: 'local-lead', text: 'Encrypted files kept on this device only. They never go to Google Drive, and they unlock with your master password, like everything else.' }),
+  ];
+  if (local.busy) {
+    parts.push(h('div', { class: 'working' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }), h('span', { text: local.busy })));
+  } else if (local.found && !local.found.ready) {
+    parts.push(
+      h('p', { class: 'local-note', text: `Your local vault is in the folder “${local.found.name}”. Your browser asks once per visit before Secure Box may open it.` }),
+      h('div', { class: 'local-actions' },
+        h('button', { type: 'button', class: 'btn btn-primary', dataset: { action: 'local-allow' } }, icon('folder', 16), h('span', { text: `Open “${local.found.name}”` })),
+        h('button', { type: 'button', class: 'btn btn-ghost', dataset: { action: 'local-forget' } }, h('span', { text: 'Forget this folder' }))),
+    );
+  } else if (!support.browser && !support.folder) {
+    parts.push(h('p', { class: 'local-note', text: 'This browser can’t keep a local vault. Use an up-to-date Chrome, Edge, Firefox or Safari.' }));
+  } else if (support.ios && !support.standalone) {
+    parts.push(
+      h('p', { class: 'local-note', text: 'On iPhone and iPad, keep your local vault in the Secure Box app on your Home Screen. Safari deletes the data of websites you haven’t opened for 7 days, and only Home Screen apps are safe from that.' }),
+      h('ol', { class: 'local-steps' }, h('li', { text: 'Tap Share in Safari, then Add to Home Screen.' }), h('li', { text: 'Open Secure Box from your Home Screen, unlock, and come back to Local.' })),
+    );
+  } else {
+    const folderChoice = support.folder && !DEMO;
+    if (folderChoice) {
+      parts.push(
+        h('div', { class: 'local-where-choice', role: 'radiogroup', 'aria-label': 'Where to keep it' },
+          h('label', { class: 'local-option' },
+            h('input', { type: 'radio', name: 'local-where', value: 'browser', checked: true }),
+            h('span', {}, h('strong', { text: 'In this browser' }), h('small', { text: 'Nothing to set up. Back it up now and then: clearing this site’s data in the browser deletes it.' }))),
+          h('label', { class: 'local-option' },
+            h('input', { type: 'radio', name: 'local-where', value: 'folder' }),
+            h('span', {}, h('strong', { text: 'In a folder you choose' }), h('small', { text: 'Ordinary encrypted files you can see, copy and back up. A synced folder (OneDrive, Dropbox, iCloud Drive) works too.' })))),
+      );
+    } else {
+      parts.push(h('p', { class: 'local-note', text: 'It’s kept in this browser’s private storage. Back it up now and then: clearing this site’s data in the browser deletes it.' }));
+    }
+    parts.push(
+      h('div', { class: 'local-actions' },
+        h('button', { type: 'button', class: 'btn btn-primary', dataset: { action: 'local-create' } }, icon('plus', 16), h('span', { text: 'Create local vault' })),
+        h('button', { type: 'button', class: 'btn btn-ghost', dataset: { action: 'local-restore' } }, icon('upload', 16), h('span', { text: 'Restore a backup…' }))),
+    );
+  }
+  if (local.error) parts.push(h('p', { class: 'form-error', role: 'alert', text: local.error }));
+  const tool = (action, iconName, title, text) =>
+    h('button', { type: 'button', class: 'local-tool', dataset: { action } }, h('span', { class: 'local-tool-icon' }, icon(iconName, 18)), h('span', {}, h('strong', { text: title }), h('small', { text })));
+  $('#local-setup').replaceChildren(
+    h('div', { class: 'local-setup-inner' },
+      h('section', { class: 'local-card' }, ...parts),
+      h('section', { class: 'local-tools-list', 'aria-label': 'Tools' },
+        h('h3', { text: 'Tools' }),
+        tool('box-encrypt-open', 'lock', 'Encrypt files', 'Turn files or a folder into .sbox files to keep or share'),
+        tool('box-decrypt-open', 'unlock', 'Decrypt .sbox files', 'Open .sbox files made with Secure Box'),
+        tool('text-open', 'note', 'Encrypt text', 'Encrypt a message, or read one you were sent'),
+        tool('export-keyring', 'key', 'Key ring backup', 'Opens your .sbox files even without Google Drive'))),
+  );
 }
 
 // ===========================================================================
@@ -666,7 +1022,7 @@ function startAutoLock() {
     if (document.visibilityState === 'visible' && state.unlocked && Date.now() - state.lastSync > 60_000 && !$('dialog[open]')) syncNow({ quiet: true });
   });
   window.addEventListener('beforeunload', (event) => {
-    if (files?.busy()) event.preventDefault();
+    if (files?.busy() || tools.busy() || local.busy) event.preventDefault();
   });
 }
 
@@ -674,8 +1030,8 @@ function checkAutoLock() {
   if (!state.unlocked) return;
   // Another window locked while this one was asleep or in the back/forward cache.
   if (lockedAt() > state.unlockedAt) return lock('other', { fromOtherWindow: true });
-  // Uploads and playing media count as activity.
-  if (files?.busy() || $$('video, audio').some((m) => !m.paused)) noteActivity();
+  // Uploads, local encryption and playing media count as activity.
+  if (files?.busy() || tools.busy() || local.busy || $$('video, audio').some((m) => !m.paused)) noteActivity();
   if (Date.now() - lastActivity >= idleLimit()) lock('idle');
   else if (Date.now() - state.unlockedAt >= sessionLimit()) lock('expired');
 }
@@ -752,6 +1108,9 @@ function listenToOtherWindows() {
       if (session) channel.postMessage({ type: 'offer', id: data.id, session });
     } else if (data.type === 'lock') {
       if (state.unlocked) lock(data.reason, { fromOtherWindow: true });
+    } else if (data.type === 'local-changed') {
+      // Another window saved to the local vault: pick it up.
+      if (local.store && data.kid === state.master?.kid) local.store.reload().then((changed) => changed && renderAll()).catch(() => {});
     } else if (data.type === 'activity') {
       if (state.unlocked && Number.isFinite(data.at)) lastActivity = Math.max(lastActivity, Math.min(Date.now(), data.at));
     } else if (data.type === 'token') {
@@ -919,12 +1278,13 @@ function markSelection() {
   }
 }
 
-function select(id) {
+function select(id, { push = true } = {}) {
   if (state.selectedId !== id) state.revealed.clear();
   state.selectedId = id;
   markSelection();
   renderDetail();
   if (id) $(`#list .row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+  if (push && id && narrow()) pushNav(); // on phones the item fills the screen: Back closes it
 }
 
 function moveSelection(step) {
@@ -962,7 +1322,7 @@ function renderDetail() {
   pane.replaceChildren(
     h('article', { class: `detail${entering ? ' is-entering' : ''}` },
       h('header', { class: 'detail-head' },
-        h('button', { type: 'button', class: 'icon-btn back-btn', 'aria-label': 'Back to list', onclick: () => select(null) }, icon('back')),
+        h('button', { type: 'button', class: 'icon-btn back-btn', 'aria-label': 'Back to list', onclick: () => closeDetail() }, icon('back')),
         avatar(item, 'lg'),
         h('div', { class: 'detail-heading' }, h('h2', { text: item.title }), h('p', { text: item.type === 'note' ? 'Secure note' : hostnameOf(item.url) || 'Login' })),
         h('div', { class: 'detail-actions' },
@@ -1253,6 +1613,20 @@ async function newEmergencyKit() {
   }
 }
 
+/** A copy of the key ring: with it, .sbox files made with this account open even without Drive. */
+async function exportKeyring() {
+  if (!state.unlocked || !state.keyringDoc) throw new Error('Unlock Secure Box first.');
+  const ok = await confirmDialog({
+    title: 'Export key ring backup?',
+    message:
+      'With this file and your master password or Emergency Kit, .sbox files made with your account open on any device, even without Google Drive. It’s encrypted, but keep it private: it keeps opening with today’s master password and Emergency Kit even after you change them.',
+    confirmLabel: 'Export',
+  });
+  if (!ok) return;
+  downloadFile(`Secure Box Key Ring backup (${state.keyringDoc.kid}).json`, serializeKeyring(state.keyringDoc), 'application/json');
+  toast('Key ring backup downloaded');
+}
+
 // ===========================================================================
 // Events
 // ===========================================================================
@@ -1316,7 +1690,14 @@ const actions = {
   recover: () => recover(),
   'new-vault': () => startNewVault(),
   'new-item': () => openEditor(),
-  primary: () => (state.section === 'files' ? files.upload() : openEditor()),
+  primary: () => (filesMode() ? files.upload() : openEditor()),
+  'local-create': () => createLocal(),
+  'local-allow': () => allowLocalFolder(),
+  'local-forget': () => forgetLocalFolder(),
+  'local-protect': () => protectLocal(),
+  'local-backup': () => backupLocal(),
+  'local-restore': () => restoreLocal(),
+  'local-strays': () => encryptStrays(),
   lock: () => lock('manual'),
   sync: () => syncNow(),
   'import-csv': () => importCsv(),
@@ -1325,6 +1706,8 @@ const actions = {
   'pw-save': () => changePassword(),
   'pw-cancel': () => $('#password-dialog').close(),
   'new-kit': () => newEmergencyKit(),
+  'export-keyring': () => exportKeyring(),
+  ...tools.actions,
   'reconnect-cancel': () => $('#reconnect').close(),
   'editor-save': () => saveEditor(),
   'editor-cancel': () => closeEditor(),
@@ -1337,10 +1720,14 @@ const actions = {
 
 function onEnter(selector, action) {
   $(selector).addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      actions[action]();
-    }
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    Promise.resolve()
+      .then(() => actions[action]())
+      .catch((err) => {
+        console.error(err);
+        toast(err.message || 'Something went wrong.', 'error');
+      });
   });
 }
 
@@ -1351,7 +1738,8 @@ function wireEvents() {
     const run = actions[trigger.dataset.action] || files?.actions[trigger.dataset.action];
     if (!run) return;
     event.preventDefault();
-    if (trigger.closest('#menu')) $('#menu').hidePopover();
+    const menu = trigger.closest('.menu[popover]');
+    if (menu?.matches(':popover-open')) menu.hidePopover();
     Promise.resolve()
       .then(() => run(trigger, event))
       .catch((err) => {
@@ -1371,6 +1759,9 @@ function wireEvents() {
   onEnter('#create-confirm', 'create-account');
   onEnter('#recover-confirm', 'recover');
   onEnter('#pw-confirm', 'pw-save');
+  onEnter('#box-confirm', 'box-encrypt-go');
+  onEnter('#box-open-password', 'box-decrypt-go');
+  onEnter('#box-master', 'box-decrypt-go');
   strengthMeter($('#create-password'), $('#create-strength'));
   strengthMeter($('#recover-password'), $('#recover-strength'));
   strengthMeter($('#pw-new'), $('#pw-strength'));
@@ -1381,14 +1772,14 @@ function wireEvents() {
   // Search
   const search = $('#search');
   search.addEventListener('input', () => {
-    if (state.section === 'files') files.setQuery(search.value);
+    if (filesMode()) files.setQuery(search.value);
     else {
       state.query = search.value;
       renderList();
     }
   });
   search.addEventListener('keydown', (event) => {
-    if (state.section === 'files') return files.searchKey(event);
+    if (filesMode()) return files.searchKey(event);
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
       moveSelection(event.key === 'ArrowDown' ? 1 : -1);
@@ -1426,12 +1817,29 @@ function wireEvents() {
       event.preventDefault();
       openSearch();
       search.select();
-    } else if (state.section === 'files') files.key(event, { typing, plain });
+    } else if (filesMode()) files.key(event, { typing, plain });
+    else if (state.section !== 'passwords') return;
     else if (event.key.toLowerCase() === 'n' && !typing && plain) {
       event.preventDefault();
       openEditor();
     } else if (event.key === 'Escape' && !typing && state.selectedId) select(null);
   });
+
+  // Back and Forward walk through sections, folders and the viewer (see pushNav).
+  window.addEventListener('popstate', onPopState);
+  // The open viewer gets a history entry of its own, so Back closes it (and nothing else).
+  const viewerDialog = $('#viewer');
+  new MutationObserver(() => {
+    if (viewerDialog.open) {
+      if (!viewerEntry && state.unlocked) {
+        history.pushState({ ...navState(), viewer: true }, '');
+        viewerEntry = true;
+      }
+    } else if (viewerEntry) {
+      viewerEntry = false;
+      if (history.state?.viewer) history.back(); // closed in the page: take its entry off again
+    }
+  }).observe(viewerDialog, { attributes: true, attributeFilter: ['open'] });
 
   // Editor
   const dialog = $('#editor');
@@ -1452,11 +1860,19 @@ function wireEvents() {
   $('#confirm-ok').addEventListener('click', () => $('#confirm').close('ok'));
   $('#confirm-cancel').addEventListener('click', () => $('#confirm').close('cancel'));
 
-  const menu = $('#menu');
-  menu.addEventListener('beforetoggle', (event) => {
-    if (event.newState !== 'open') return;
-    const rect = $('#menu-btn').getBoundingClientRect();
-    menu.style.top = `${Math.round(rect.bottom + 8)}px`;
-    menu.style.right = `${Math.round(Math.max(8, window.innerWidth - rect.right))}px`;
-  });
+  // Pop-up menus open under their button: by its right edge, or its left edge with data-align="left".
+  for (const menu of $$('.menu[popover][data-anchor]')) {
+    menu.addEventListener('beforetoggle', (event) => {
+      if (event.newState !== 'open') return;
+      const rect = $(menu.dataset.anchor).getBoundingClientRect();
+      menu.style.top = `${Math.round(rect.bottom + 8)}px`;
+      if (menu.dataset.align === 'left') {
+        menu.style.left = `${Math.round(Math.max(8, rect.left))}px`;
+        menu.style.right = 'auto';
+      } else {
+        menu.style.right = `${Math.round(Math.max(8, window.innerWidth - rect.right))}px`;
+        menu.style.left = 'auto';
+      }
+    });
+  }
 }

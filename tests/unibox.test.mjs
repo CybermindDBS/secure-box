@@ -22,8 +22,10 @@ import {
   withNewPassword,
   withNewRecovery,
 } from '../app/assets/keyring.js';
+import { looksLikeMessage, messageAccess, openMessage, readMessage, sealText } from '../app/assets/textbox.js';
 import { decodeText, extractDocx, extractOdf, extractSheet, extractSlide, looksLikeText, rtfToText } from '../app/assets/readers.js';
 import {
+  LOCAL_INDEX,
   VaultCipher,
   applyChange,
   collectTree,
@@ -41,6 +43,7 @@ import {
 } from '../app/assets/vault.js';
 import { find, parseXml, textOf } from '../app/assets/xml.js';
 import { readZipDirectory, readZipEntry, readZipText, zipStore } from '../app/assets/zip.js';
+import { boxAccess, openContent, readBox, unlockBox, writeBox, zipEntries, zipEntryData, zipFolder } from '../app/assets/localbox.js';
 
 const S = globalThis.UniboxStream;
 const random = (n) => crypto.getRandomValues(new Uint8Array(n));
@@ -457,7 +460,160 @@ test('ZIP downloads: paths that could escape the target folder are refused', () 
   assert.doesNotThrow(() => Z.checkPath('Trips/', true));
 });
 
+// --- Local boxes (.sbox, Tools menu) ------------------------------------------------------
+const masterA = { kid: 'aaaaaaaaaaaaaaaa', key: crypto.getRandomValues(new Uint8Array(32)) };
+const masterB = { kid: 'bbbbbbbbbbbbbbbb', key: crypto.getRandomValues(new Uint8Array(32)) };
+
+async function makeBox(source, meta, keys) {
+  const parts = [];
+  const { size } = await writeBox({ source, meta, ...keys, write: (bytes) => parts.push(bytes.slice()) });
+  const blob = new Blob(parts);
+  assert.equal(blob.size, size, 'the box size is known before writing');
+  return blob;
+}
+
+async function bytesOf(iterable) {
+  const parts = [];
+  for await (const part of iterable) parts.push(part);
+  return new Uint8Array(await new Blob(parts).arrayBuffer());
+}
+
+/** Random test data of any size (getRandomValues fills at most 64 KiB per call). */
+function randomData(length) {
+  const out = new Uint8Array(length);
+  for (let i = 0; i < length; i += 65_536) crypto.getRandomValues(out.subarray(i, i + 65_536));
+  return out;
+}
+
+test('local boxes: the account opens them, names stay hidden, ranges decrypt exactly', async () => {
+  const data = randomData(3 * 1024 * 1024 + 123);
+  const file = new File([data], 'Holiday video.mp4', { type: 'video/mp4', lastModified: 1_700_000_000_000 });
+  const blob = await makeBox(file, { kind: 'file', name: file.name, type: file.type, mtime: file.lastModified }, { master: masterA });
+  assert.ok(!Buffer.from(await blob.arrayBuffer()).includes('Holiday'), 'the real name never appears in the file');
+  const box = await readBox(blob);
+  assert.deepEqual(boxAccess(box, masterA), { mine: true, otherAccount: false, password: false });
+  const unlocked = await unlockBox(box, { master: masterA });
+  assert.deepEqual([unlocked.meta.name, unlocked.meta.type, unlocked.meta.size, unlocked.meta.mtime], ['Holiday video.mp4', 'video/mp4', data.length, 1_700_000_000_000]);
+  const content = await openContent(blob, box, unlocked);
+  assert.deepEqual(await bytesOf(content.stream({ window: 2 })), data);
+  assert.deepEqual(await content.read(1_048_570, 1_048_600), data.subarray(1_048_570, 1_048_601), 'a range across a chunk boundary');
+  await assert.rejects(unlockBox(box, { master: masterB }), (e) => e.code === 'other-account');
+  await assert.rejects(unlockBox(box, {}), (e) => e.code === 'other-account');
+
+  const empty = await makeBox(new File([], 'empty.txt'), { kind: 'file', name: 'empty.txt' }, { master: masterA });
+  const emptyBox = await readBox(empty);
+  assert.equal((await bytesOf((await openContent(empty, emptyBox, await unlockBox(emptyBox, { master: masterA }))).stream())).length, 0);
+});
+
+test('local boxes: a sharing password opens them too, and only that password', async () => {
+  const file = new File(['shared secret notes'], 'notes.txt', { type: 'text/plain' });
+  const meta = { kind: 'file', name: 'notes.txt', type: 'text/plain' };
+  const blob = await makeBox(file, meta, { master: masterA, password: 'correct horse battery staple' });
+  const box = await readBox(blob);
+  assert.deepEqual(boxAccess(box, masterB), { mine: false, otherAccount: true, password: true });
+  await assert.rejects(unlockBox(box, { master: masterB }), (e) => e.code === 'needs-password');
+  await assert.rejects(unlockBox(box, { password: 'wrong horse battery staple' }), (e) => e.code === 'wrong-password');
+  const byPassword = await unlockBox(box, { password: 'correct horse battery staple' });
+  const byAccount = await unlockBox(box, { master: masterA });
+  assert.deepEqual(byPassword.fileKey, byAccount.fileKey, 'both copies hold the same file key');
+  assert.equal(new TextDecoder().decode(await bytesOf((await openContent(blob, box, byPassword)).stream())), 'shared secret notes');
+
+  const passwordOnly = await readBox(await makeBox(file, meta, { password: 'correct horse battery staple' }));
+  assert.deepEqual(boxAccess(passwordOnly, masterA), { mine: false, otherAccount: false, password: true });
+  await assert.rejects(writeBox({ source: file, meta, write: () => {} }), (e) => e.code === 'no-key');
+});
+
+test('local boxes: tampering, cut-off files, extra data and swapped key copies are caught', async () => {
+  const file = new File([randomData(200_000)], 'a.bin');
+  const blob = await makeBox(file, { kind: 'file', name: 'a.bin' }, { master: masterA });
+  const raw = new Uint8Array(await blob.arrayBuffer());
+  const box = await readBox(blob);
+  const readAll = async (b) => {
+    const bx = await readBox(b);
+    return bytesOf((await openContent(b, bx, await unlockBox(bx, { master: masterA }))).stream());
+  };
+
+  const flipped = raw.slice();
+  flipped[flipped.length - 100] ^= 1;
+  await assert.rejects(readAll(new Blob([flipped])), (e) => e.code === 'damaged', 'changed content');
+  await assert.rejects(readAll(new Blob([raw.subarray(0, raw.length - 10)])), (e) => e.code === 'damaged', 'cut off');
+  await assert.rejects(readAll(new Blob([raw, new Uint8Array(5)])), (e) => e.code === 'damaged', 'extra data');
+
+  const other = await readBox(await makeBox(file, { kind: 'file', name: 'b.bin' }, { master: masterA }));
+  await assert.rejects(unlockBox({ ...box, header: { ...box.header, slots: other.header.slots } }, { master: masterA }), (e) => e.code === 'damaged', 'key copy from another box');
+  await assert.rejects(unlockBox({ ...box, header: { ...box.header, meta: other.header.meta } }, { master: masterA }), (e) => e.code === 'damaged', 'metadata from another box');
+  await assert.rejects(unlockBox({ ...box, header: { ...box.header, kind: 'folder' } }, { master: masterA }), (e) => e.code === 'damaged', 'kind changed');
+  await assert.rejects(readBox(new Blob(['hello, this is not a box'])), (e) => e.code === 'not-box');
+});
+
+test('local boxes: a folder packs into one box and unpacks file by file', async () => {
+  const big = randomData(1_500_000);
+  const items = [
+    { path: 'Trips/', dir: true },
+    { path: 'Trips/Japan 2026/', dir: true },
+    { path: 'Trips/Japan 2026/notes ✓.txt', file: new File(['Kyoto in spring'], 'notes ✓.txt') },
+    { path: 'Trips/photo.bin', file: new File([big], 'photo.bin') },
+    { path: 'Trips/empty.txt', file: new File([], 'empty.txt') },
+  ];
+  const blob = await makeBox(await zipFolder(items), { kind: 'folder', name: 'Trips', files: 3 }, { master: masterA });
+  const box = await readBox(blob);
+  const unlocked = await unlockBox(box, { master: masterA });
+  assert.deepEqual([unlocked.meta.kind, unlocked.meta.name, unlocked.meta.files], ['folder', 'Trips', 3]);
+  const content = await openContent(blob, box, unlocked);
+  const entries = await zipEntries(content);
+  assert.deepEqual(entries.map((e) => [e.path, e.dir]), items.map((it) => [it.path, Boolean(it.dir)]));
+  for (const [i, entry] of entries.entries()) {
+    if (!entry.dir) assert.deepEqual(await bytesOf(zipEntryData(content, entry, { window: 300_000 })), new Uint8Array(await items[i].file.arrayBuffer()));
+  }
+  const zip = readZipDirectory(await bytesOf(content.stream()));
+  assert.equal(new TextDecoder().decode(await readZipEntry(zip, 'Trips/Japan 2026/notes ✓.txt')), 'Kyoto in spring', 'the inside is a normal ZIP');
+});
+
 // --- Items, CSV, generator --------------------------------------------------------------
+test('text messages: the account and a sharing password open them; tampering is caught', async () => {
+  const text = 'Gate code 4471 — leave the parcel by the door ✓';
+  const both = await sealText({ text, master: masterA, password: 'correct horse battery staple' });
+  assert.match(both, /^-----BEGIN SECURE BOX MESSAGE-----\n[A-Za-z0-9+/=\n]+\n-----END SECURE BOX MESSAGE-----$/);
+  assert.ok(looksLikeMessage(`Here you go:\n${both}\nbye`));
+  assert.ok(!both.includes('Gate'));
+  const msg = readMessage(`  > ${both.split('\n').join('\n')}  `.replace('  > ', ''));
+  assert.deepEqual(messageAccess(msg, masterA), { mine: true, account: true, password: true });
+  assert.deepEqual(messageAccess(msg, masterB), { mine: false, account: true, password: true });
+  assert.equal(await openMessage(msg, { master: masterA }), text);
+  assert.equal(await openMessage(msg, { password: 'correct horse battery staple' }), text);
+  assert.equal(await openMessage(msg, { master: masterB, password: 'correct horse battery staple' }), text);
+  await assert.rejects(openMessage(msg, { password: 'wrong' }), { code: 'wrong-password' });
+  await assert.rejects(openMessage(msg, {}), { code: 'needs-password' });
+  // Account-only: another account can't open it.
+  const mine = readMessage(await sealText({ text: '', master: masterA }));
+  assert.equal(await openMessage(mine, { master: masterA }), '');
+  await assert.rejects(openMessage(mine, { master: masterB }), { code: 'other-account' });
+  // Any flipped bit in the body, or a stripped key copy, is caught.
+  const raw = both.split('\n').slice(1, -1).join('');
+  const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+  for (const at of [5, 30, bytes.length - 3]) {
+    const bad = bytes.slice();
+    bad[at] ^= 1;
+    const armored = `-----BEGIN SECURE BOX MESSAGE-----\n${btoa(String.fromCharCode(...bad))}\n-----END SECURE BOX MESSAGE-----`;
+    await assert.rejects(async () => openMessage(readMessage(armored), { master: masterA, password: 'correct horse battery staple' }));
+  }
+  assert.throws(() => readMessage('hello'), { code: 'not-message' });
+  assert.throws(() => readMessage(both.slice(0, -10)), { code: 'damaged' });
+  await assert.rejects(sealText({ text: 'x' }), { code: 'no-key' });
+});
+
+test('the local vault index has its own key: it can never pass for the vault, or the other way round', async () => {
+  const vaultCipher = await VaultCipher.create(masterA);
+  const indexCipher = await VaultCipher.create(masterA, LOCAL_INDEX);
+  const sealedIndex = await indexCipher.seal(emptyVault());
+  const sealedVault = await vaultCipher.seal(emptyVault());
+  assert.deepEqual((await indexCipher.open(parseEnvelope(sealedIndex, LOCAL_INDEX.format))).files, []);
+  assert.throws(() => parseEnvelope(sealedIndex), { code: 'bad-vault' });
+  await assert.rejects(vaultCipher.open({ ...JSON.parse(sealedIndex), format: 'unibox-vault' }), { code: 'decrypt-failed' });
+  await assert.rejects(indexCipher.open(JSON.parse(sealedVault)), { code: 'bad-vault' });
+  await assert.rejects(indexCipher.open({ ...JSON.parse(sealedVault), format: LOCAL_INDEX.format }), { code: 'decrypt-failed' });
+});
+
 test('only http(s) links are clickable', () => {
   assert.equal(safeHref('github.com'), 'https://github.com/');
   assert.equal(safeHref('javascript:alert(1)'), null);

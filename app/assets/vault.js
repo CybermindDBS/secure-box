@@ -27,14 +27,14 @@ export class VaultError extends Error {
 // ---------------------------------------------------------------------------
 // Encrypted envelope
 // ---------------------------------------------------------------------------
-export function parseEnvelope(text) {
+export function parseEnvelope(text, format = VAULT_FORMAT) {
   let env;
   try {
     env = JSON.parse(text);
   } catch {
     throw new VaultError('bad-vault', 'The vault file is not valid JSON.');
   }
-  if (!env || env.format !== VAULT_FORMAT) throw new VaultError('bad-vault', 'The file is not a Secure Box vault.');
+  if (!env || env.format !== format) throw new VaultError('bad-vault', 'The file is not a Secure Box vault.');
   if (env.version !== 1 && env.version !== 2) throw new VaultError('bad-vault', 'This vault was written by a newer version of Secure Box.');
   for (const field of ['kid', 'salt', 'iv', 'ct']) {
     if (typeof env[field] !== 'string' || !env[field]) throw new VaultError('bad-vault', 'The vault file is incomplete.');
@@ -42,32 +42,37 @@ export function parseEnvelope(text) {
   return env;
 }
 
-// Binds the header (version, key id, salt) to the ciphertext, so swapping any of it is detected.
-const aadFor = (version, kid, salt) => utf8(`${VAULT_FORMAT}:${version}:${kid}:${salt}`);
+// Binds the header (format, version, key id, salt) to the ciphertext, so swapping any of it is detected.
+const aadFor = (format, version, kid, salt) => utf8(`${format}:${version}:${kid}:${salt}`);
+
+/** The local vault's index (localstore.js) uses its own format and key, so it can't pass for the vault. */
+export const LOCAL_INDEX = { format: 'secure-box-local-index', info: 'secure-box/local-index/v1' };
 
 export class VaultCipher {
   /** Holds only a non-extractable HKDF handle to the master key. */
-  static async create(master) {
-    return new VaultCipher(master.kid, await importHkdfKey(master.key));
+  static async create(master, purpose = { format: VAULT_FORMAT, info: HKDF_INFO }) {
+    return new VaultCipher(master.kid, await importHkdfKey(master.key), purpose);
   }
 
-  constructor(kid, baseKey) {
+  constructor(kid, baseKey, purpose = { format: VAULT_FORMAT, info: HKDF_INFO }) {
     this.kid = kid;
     this.baseKey = baseKey;
+    this.format = purpose.format;
+    this.info = purpose.info;
   }
 
   async seal(data) {
     // Fresh salt => a brand-new AES-256 key for every save, so nonce limits never come into play.
     const salt = randomBytes(16);
-    const key = await deriveAesKey(this.baseKey, salt, HKDF_INFO);
+    const key = await deriveAesKey(this.baseKey, salt, this.info);
     const saltText = toBase64(salt);
     const json = utf8(JSON.stringify(data));
     // Pad with spaces (valid trailing JSON whitespace) to a Padmé length, so the size leaks little.
     const padded = new Uint8Array(padme(json.length)).fill(0x20);
     padded.set(json);
-    const { iv, ciphertext } = await encryptAesGcm(key, padded, aadFor(VAULT_VERSION, this.kid, saltText));
+    const { iv, ciphertext } = await encryptAesGcm(key, padded, aadFor(this.format, VAULT_VERSION, this.kid, saltText));
     return JSON.stringify({
-      format: VAULT_FORMAT,
+      format: this.format,
       version: VAULT_VERSION,
       kid: this.kid,
       salt: saltText,
@@ -77,11 +82,12 @@ export class VaultCipher {
   }
 
   async open(env) {
+    if (env.format !== this.format) throw new VaultError('bad-vault', 'The file is not a Secure Box vault.');
     if (env.kid !== this.kid) throw new VaultError('wrong-key', 'This key does not belong to the vault.');
     let plain;
     try {
-      const key = await deriveAesKey(this.baseKey, fromBase64(env.salt), HKDF_INFO);
-      plain = await decryptAesGcm(key, fromBase64(env.iv), fromBase64(env.ct), aadFor(env.version, env.kid, env.salt));
+      const key = await deriveAesKey(this.baseKey, fromBase64(env.salt), this.info);
+      plain = await decryptAesGcm(key, fromBase64(env.iv), fromBase64(env.ct), aadFor(env.format, env.version, env.kid, env.salt));
     } catch {
       throw new VaultError('decrypt-failed', 'The vault could not be decrypted: the key does not match or the data was altered.');
     }

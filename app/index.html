@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; worker-src 'self'; connect-src 'self' https://www.googleapis.com; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types unibox-sw">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; worker-src 'self'; connect-src 'self' https://www.googleapis.com; manifest-src 'self'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types unibox-sw">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <meta name="color-scheme" content="light dark">
@@ -11,6 +11,11 @@
 <meta name="theme-color" content="#0e0e0d" media="(prefers-color-scheme: dark)">
 <title>Secure Box</title>
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="assets/icon-180.png">
+<meta name="apple-mobile-web-app-title" content="Secure Box">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <link rel="stylesheet" href="assets/styles.css">
 <script type="module" src="assets/app.js"></script>
 </head>
@@ -42,6 +47,10 @@
       <p id="signin-status" class="panel-status" role="status" hidden></p>
       <p id="demo-note" class="panel-note" hidden>Demo mode — sample data that lives only in this tab. Nothing is saved.</p>
       <button id="signin-other" class="link-btn" type="button" data-action="signin-other" hidden>Use a different Google account</button>
+      <div class="gate-links">
+        <button class="link-btn box-open-link" type="button" data-action="box-decrypt-open">Open a .sbox file</button>
+        <button class="link-btn box-open-link" type="button" data-action="text-open">Read a message</button>
+      </div>
     </section>
 
     <section class="panel" data-panel="working" hidden>
@@ -163,9 +172,18 @@
       <span class="brand-name">Secure Box</span>
       <span id="demo-badge" class="badge" hidden>Demo</span>
     </div>
-    <nav class="sections" role="tablist" aria-label="Sections">
-      <button type="button" role="tab" data-section="passwords" aria-selected="true" data-icon="key" data-icon-size="16"><span>Passwords</span></button>
-      <button type="button" role="tab" data-section="files" aria-selected="false" data-icon="folder" data-icon-size="16"><span>Files</span></button>
+    <nav class="sections" aria-label="Sections">
+      <!-- Passwords and Files live in the cloud the label names; Local is this device only. -->
+      <div class="section-group" role="tablist" aria-label="Google Drive">
+        <button id="source-btn" class="source-btn" type="button" popovertarget="source-menu" aria-haspopup="menu" aria-label="Google Drive: where Passwords and Files are stored" title="Passwords and Files are stored in your Google Drive" data-icon="cloud" data-icon-size="16">
+          <span class="source-name">Google Drive</span><span class="source-chevron" data-icon="chevronDown" data-icon-size="14"></span>
+        </button>
+        <button type="button" role="tab" data-section="passwords" aria-selected="true" data-icon="key" data-icon-size="16"><span>Passwords</span></button>
+        <button type="button" role="tab" data-section="files" aria-selected="false" data-icon="folder" data-icon-size="16"><span>Files</span></button>
+      </div>
+      <div class="section-group" role="tablist" aria-label="This device">
+        <button type="button" role="tab" data-section="local" aria-selected="false" data-icon="device" data-icon-size="16" title="Local: encrypted files and tools on this device only"><span>Local</span></button>
+      </div>
     </nav>
     <label class="search" data-icon="search">
       <input id="search" type="search" placeholder="Search" autocomplete="off" spellcheck="false" aria-label="Search">
@@ -174,7 +192,6 @@
     <button class="icon-btn search-close" type="button" data-action="search-close" data-icon="x" aria-label="Close search" title="Close search"></button>
     <div class="top-actions">
       <button class="icon-btn search-open" type="button" data-action="search-open" data-icon="search" aria-label="Search" title="Search"></button>
-      <button id="primary-action" class="btn btn-primary btn-sm new-btn" type="button" data-action="primary"><span>New</span></button>
       <button id="menu-btn" class="icon-btn" type="button" popovertarget="menu" data-icon="more" aria-label="More" title="More"></button>
       <button class="icon-btn" type="button" data-action="lock" data-icon="lock" aria-label="Lock" title="Lock"></button>
     </div>
@@ -185,6 +202,10 @@
       <div class="list-head">
         <span id="count"></span>
         <span class="sync-status" data-sync-status data-state="idle" role="status"></span>
+        <div class="list-tools">
+          <button id="pw-menu-btn" class="icon-btn" type="button" popovertarget="pw-menu" aria-haspopup="menu" data-icon="more" aria-label="Import or export passwords" title="Import or export passwords"></button>
+          <button class="btn btn-primary btn-sm" type="button" data-action="new-item" data-icon="plus" data-icon-size="16" title="New item (N)"><span>New</span></button>
+        </div>
       </div>
       <ul id="list" class="list"></ul>
       <div id="list-empty" class="list-empty" hidden></div>
@@ -196,8 +217,10 @@
     <div class="files-bar">
       <nav id="crumbs" class="crumbs" aria-label="Folder path"></nav>
       <div class="files-tools">
+        <button class="btn btn-primary btn-sm" type="button" data-action="upload-files" data-icon="upload" data-icon-size="16" title="Upload files (U)"><span>Upload</span></button>
+        <button class="btn btn-ghost btn-sm" type="button" data-action="upload-folder" data-icon="folderUp" data-icon-size="16" title="Upload a whole folder"><span>Upload folder</span></button>
         <button class="btn btn-ghost btn-sm" type="button" data-action="new-folder" data-icon="folderPlus" data-icon-size="16" title="New folder (N)"><span>New folder</span></button>
-        <button class="btn btn-ghost btn-sm" type="button" data-action="upload-folder" data-icon="upload" data-icon-size="16" title="Upload a whole folder"><span>Upload folder</span></button>
+        <button id="tools-btn" class="btn btn-ghost btn-sm local-only" type="button" popovertarget="tools-menu" aria-haspopup="menu" data-icon="wrench" data-icon-size="16" title="Tools: .sbox files, text, backups"><span>Tools</span></button>
         <button class="icon-btn view-toggle" type="button" popovertarget="view-options" data-icon="sliders" aria-label="View options" title="View options"></button>
         <!-- Inline on wider screens; on phones a sheet that the View options button opens. -->
         <div id="view-options" class="view-options" popover>
@@ -226,6 +249,7 @@
         </div>
       </div>
     </div>
+    <div id="local-status" class="local-status" hidden></div>
     <div id="selection-bar" class="selection-bar" hidden>
       <span id="selection-count"></span>
       <button class="btn btn-ghost btn-sm" type="button" data-action="sel-download" data-icon="download" data-icon-size="16" title="Download (several items download as one .zip that keeps their folders)"><span>Download</span></button>
@@ -239,19 +263,53 @@
       <span class="sync-status" data-sync-status data-state="idle" role="status"></span>
     </div>
     <div id="drop-overlay" class="drop-overlay" hidden>
-      <div class="drop-card"><span data-icon="upload" data-icon-size="28"></span><p>Drop to encrypt and upload to <strong id="drop-target"></strong></p></div>
+      <div class="drop-card"><span data-icon="upload" data-icon-size="28"></span><p>Drop to encrypt and <span id="drop-verb">upload to</span> <strong id="drop-target"></strong></p></div>
     </div>
   </section>
+
+  <!-- Local tab before its vault is open: set it up, or use the tools -->
+  <section id="local-setup" class="local-setup" hidden aria-label="Local"></section>
 </div>
 
-<div id="menu" class="menu" popover>
+<div id="source-menu" class="menu source-menu" popover data-anchor="#source-btn" data-align="left">
+  <div class="menu-head">
+    <span class="menu-label">Passwords and Files are stored in</span>
+  </div>
+  <div class="source-option is-current">
+    <span data-icon="cloud" data-icon-size="18"></span>
+    <span class="source-option-text"><strong>Google Drive</strong><small id="source-email"></small></span>
+    <span class="source-check" data-icon="check" data-icon-size="16"></span>
+  </div>
+  <div class="source-option is-soon" aria-disabled="true">
+    <span data-icon="cloud" data-icon-size="18"></span>
+    <span class="source-option-text"><strong>OneDrive</strong><small>Coming soon</small></span>
+  </div>
+  <p class="source-foot">Local keeps things on this device only, with no cloud at all.</p>
+</div>
+
+<div id="pw-menu" class="menu" popover data-anchor="#pw-menu-btn">
+  <button class="menu-item" type="button" data-action="import-csv" data-icon="upload">Import passwords (CSV)…</button>
+  <button class="menu-item" type="button" data-action="export-csv" data-icon="download">Export passwords (CSV)…</button>
+</div>
+
+<div id="tools-menu" class="menu" popover data-anchor="#tools-btn">
+  <button class="menu-item" type="button" data-action="box-encrypt-open" data-icon="lock">Encrypt files to .sbox…</button>
+  <button class="menu-item" type="button" data-action="box-decrypt-open" data-icon="unlock">Decrypt .sbox files…</button>
+  <button class="menu-item" type="button" data-action="text-open" data-icon="note">Encrypt or decrypt text…</button>
+  <div class="menu-sep" role="separator"></div>
+  <button id="tools-backup" class="menu-item" type="button" data-action="local-backup" data-icon="download">Back up the local vault</button>
+  <button class="menu-item" type="button" data-action="local-restore" data-icon="upload">Restore a backup…</button>
+  <button id="tools-forget" class="menu-item" type="button" data-action="local-forget" data-icon="folder" hidden>Stop using this folder…</button>
+  <div class="menu-sep" role="separator"></div>
+  <button class="menu-item" type="button" data-action="export-keyring" data-icon="key">Export key ring backup…</button>
+</div>
+
+<div id="menu" class="menu" popover data-anchor="#menu-btn">
   <div class="menu-head">
     <span class="menu-label">Signed in as</span>
     <span id="account-email" class="menu-email"></span>
   </div>
   <button class="menu-item" type="button" data-action="sync" data-icon="refresh">Sync now</button>
-  <button class="menu-item" type="button" data-action="import-csv" data-icon="upload">Import passwords (CSV)…</button>
-  <button class="menu-item" type="button" data-action="export-csv" data-icon="download">Export passwords (CSV)…</button>
   <div class="menu-sep" role="separator"></div>
   <button class="menu-item" type="button" data-action="change-password" data-icon="key">Change master password…</button>
   <button class="menu-item" type="button" data-action="new-kit" data-icon="shield">New Emergency Kit…</button>
@@ -266,8 +324,13 @@
   <header class="transfers-head">
     <strong id="transfers-title"></strong>
     <button id="transfers-resume" class="btn btn-primary btn-sm" type="button" data-action="transfers-resume" hidden>Reconnect &amp; resume</button>
+    <button class="icon-btn transfers-toggle" type="button" data-action="transfers-toggle" data-icon="chevronDown" aria-expanded="true" aria-label="Show or hide the files" title="Hide files"></button>
     <button class="icon-btn" type="button" data-action="transfers-close" data-icon="x" aria-label="Close uploads" title="Close"></button>
   </header>
+  <div id="transfers-summary" class="transfers-summary" hidden>
+    <div class="transfers-summary-text"><span id="transfers-total"></span><strong id="transfers-percent"></strong></div>
+    <span class="transfer-bar transfer-bar-total"><span id="transfers-total-fill" class="transfer-fill"></span></span>
+  </div>
   <ul id="transfer-list" class="transfer-list"></ul>
 </aside>
 
@@ -421,6 +484,120 @@
   <div class="dialog-foot">
     <button class="btn btn-ghost" type="button" data-close="cancel">Cancel</button>
     <button class="btn btn-primary" type="button" data-close="ok">Move here</button>
+  </div>
+</dialog>
+
+<!-- Tools: encrypt and decrypt on this device (.sbox) -->
+<dialog id="box-encrypt" class="dialog dialog-sm box-dialog" aria-labelledby="box-encrypt-title">
+  <div class="dialog-body">
+    <h2 id="box-encrypt-title">Encrypt on this device</h2>
+    <p class="panel-text">Turns files or a folder into encrypted <span class="mono">.sbox</span> files. Nothing is uploaded.</p>
+    <div class="box-pick">
+      <button class="btn btn-ghost" type="button" data-action="box-pick-files" data-icon="file">Choose files…</button>
+      <button class="btn btn-ghost" type="button" data-action="box-pick-folder" data-icon="folder">Choose a folder…</button>
+    </div>
+    <p id="box-selection" class="box-selection" hidden></p>
+    <label class="check box-check"><input id="box-hide-names" type="checkbox" checked><span>Hide file names<small>The .sbox files get random names. The real names are stored inside, encrypted.</small></span></label>
+    <label class="check box-check"><input id="box-share" type="checkbox"><span>Add a sharing password<small>Lets people without your account open them. Your account always can.</small></span></label>
+    <div id="box-share-fields" class="box-share" hidden>
+      <div class="field">
+        <label for="box-password">Sharing password</label>
+        <div class="input-group">
+          <input id="box-password" class="input mono" type="password" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+          <div class="input-tools">
+            <button class="icon-btn" type="button" data-action="box-generate" data-icon="refresh" aria-label="Generate a strong password" title="Generate a strong password"></button>
+          </div>
+        </div>
+      </div>
+      <div class="field">
+        <label for="box-confirm">Repeat it</label>
+        <input id="box-confirm" class="input mono" type="password" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+      </div>
+      <p class="panel-hint">Send it separately from the files, for example by phone or another app.</p>
+    </div>
+    <p id="box-encrypt-note" class="panel-hint box-note"></p>
+    <p id="box-encrypt-status" class="panel-status box-status" role="status" hidden></p>
+    <p id="box-encrypt-error" class="form-error" role="alert" hidden></p>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn btn-ghost" type="button" data-action="box-encrypt-cancel">Cancel</button>
+    <button class="btn btn-primary" type="button" data-action="box-encrypt-go"><span class="btn-spinner" aria-hidden="true"></span><span>Encrypt</span></button>
+  </div>
+</dialog>
+
+<dialog id="box-decrypt" class="dialog dialog-sm box-dialog" aria-labelledby="box-decrypt-title">
+  <div class="dialog-body">
+    <h2 id="box-decrypt-title">Decrypt .sbox files</h2>
+    <p class="panel-text">Opens <span class="mono">.sbox</span> files made with Secure Box. They’re decrypted on this device.</p>
+    <div class="box-pick">
+      <button class="btn btn-ghost" type="button" data-action="box-pick-boxes" data-icon="file">Choose .sbox files…</button>
+    </div>
+    <ul id="box-list" class="box-list" hidden></ul>
+    <div id="box-password-field" class="field" hidden>
+      <label for="box-open-password">Sharing password</label>
+      <input id="box-open-password" class="input mono" type="password" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+    </div>
+    <div id="box-keyring" class="box-keyring" hidden>
+      <p class="panel-hint">Files made with a Secure Box account open with that account’s key ring backup (⋯ menu → Export key ring backup) and its master password or recovery key.</p>
+      <button class="btn btn-ghost btn-block" type="button" data-action="box-pick-keyring" data-icon="key">Load key ring backup…</button>
+      <p id="box-keyring-name" class="box-selection" hidden></p>
+      <div class="field">
+        <label for="box-master">Its master password or recovery key</label>
+        <input id="box-master" class="input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+      </div>
+    </div>
+    <p id="box-decrypt-note" class="panel-hint box-note"></p>
+    <p id="box-decrypt-status" class="panel-status box-status" role="status" hidden></p>
+    <p id="box-decrypt-error" class="form-error" role="alert" hidden></p>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn btn-ghost" type="button" data-action="box-decrypt-cancel">Cancel</button>
+    <button class="btn btn-primary" type="button" data-action="box-decrypt-go"><span class="btn-spinner" aria-hidden="true"></span><span>Decrypt</span></button>
+  </div>
+</dialog>
+
+<dialog id="text-dialog" class="dialog dialog-sm box-dialog" aria-labelledby="text-title">
+  <div class="dialog-body">
+    <h2 id="text-title">Encrypt or decrypt text</h2>
+    <p class="panel-text">Type or paste text to encrypt it, or paste a Secure Box message to read it. Nothing is uploaded.</p>
+    <textarea id="text-input" class="input textarea text-area" rows="6" maxlength="1000000" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Text or message" placeholder="Text to encrypt, or a message starting with -----BEGIN SECURE BOX MESSAGE-----"></textarea>
+    <p id="text-note" class="panel-hint" hidden></p>
+    <div id="text-encrypt-options">
+      <label class="check box-check"><input id="text-share" type="checkbox"><span>Add a sharing password<small>Lets people without your account read it. Your account always can.</small></span></label>
+      <div id="text-share-fields" class="box-share" hidden>
+        <div class="field">
+          <label for="text-password">Sharing password</label>
+          <div class="input-group">
+            <input id="text-password" class="input mono" type="password" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+            <div class="input-tools">
+              <button class="icon-btn" type="button" data-action="text-generate" data-icon="refresh" aria-label="Generate a strong password" title="Generate a strong password"></button>
+            </div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="text-confirm">Repeat it</label>
+          <input id="text-confirm" class="input mono" type="password" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+        </div>
+        <p class="panel-hint">Send it separately from the message, for example by phone or another app.</p>
+      </div>
+    </div>
+    <div id="text-password-field" class="field text-open-field" hidden>
+      <label for="text-open-password">Sharing password</label>
+      <input id="text-open-password" class="input mono" type="password" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+    </div>
+    <div id="text-result" class="text-result" hidden>
+      <div class="text-result-head">
+        <span id="text-result-label"></span>
+        <button id="text-share-out" class="btn btn-ghost btn-sm" type="button" data-action="text-share-out" data-icon="external" data-icon-size="16"><span>Share</span></button>
+        <button class="btn btn-ghost btn-sm" type="button" data-action="text-copy" data-icon="copy" data-icon-size="16"><span>Copy</span></button>
+      </div>
+      <textarea id="text-output" class="input textarea text-area" rows="7" readonly spellcheck="false" aria-label="Result"></textarea>
+    </div>
+    <p id="text-error" class="form-error" role="alert" hidden></p>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn btn-ghost" type="button" data-action="text-close">Close</button>
+    <button class="btn btn-primary" type="button" data-action="text-go"><span class="btn-spinner" aria-hidden="true"></span><span id="text-go-label">Encrypt</span></button>
   </div>
 </dialog>
 

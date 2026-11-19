@@ -7,6 +7,7 @@ An end-to-end encrypted vault for **passwords, secret notes and files**, with bu
 - **Locked by your master password.** It is never stored or sent anywhere. An offline Emergency Kit lets you reset it if you forget it.
 - **Built-in viewers.** Photos, video, audio, PDF, Word, Excel, PowerPoint, OpenDocument, Markdown, CSV, plain text and code all open inside Secure Box. Files are decrypted as they stream, and nothing is written to disk.
 - **Works on phones and tablets.** The layout adapts to any screen, with finger-sized controls and touch gestures in the viewer.
+- **Local, when you want it.** The **Local** tab keeps encrypted files on your device only, and has tools for `.sbox` files and encrypted messages.
 - **Open source.** The code is public under the GNU AGPL v3, so anyone can check exactly what it does. See [License](#license).
 
 ```
@@ -48,6 +49,16 @@ Then open http://localhost:8080/index.html?demo. The demo master password is `se
 - Each chunk is authenticated, so any tampering, truncation, reordering or swapping of files is detected.
 - Sizes are padded (at most about 12% extra).
 - Photo and video thumbnails are made on your device and encrypted inside the same blob. They stay hidden unless you turn on the **Thumbnails** switch; until then, none are fetched or decrypted.
+
+**Local vault.** The Local tab's vault keeps files on your device only. Each file is encrypted exactly like a Drive file. The list of names, folders and file keys is sealed with its own key, derived from your master key (HKDF, with a purpose of its own, so it can never pass for the Drive vault). It unlocks together with everything else, and nothing in it is ever uploaded.
+
+**Files encrypted on your device (`.sbox`).** **Local → Encrypt files** turns files, or a folder, into `.sbox` files without uploading anything. A folder becomes a single `.sbox` with a ZIP inside.
+- Each `.sbox` gets its own random 256-bit key and uses the same chunked AES-256-GCM format as your Drive files, so tampering and truncation are detected.
+- The file's header keeps that key only in locked copies: one for your account, locked with a key derived from your master key (HKDF), and optionally one for a sharing password (PBKDF2-SHA-256, 600,000 rounds). Your account's copy keeps working after a password change or an Emergency Kit reset.
+- The name, size and date are encrypted inside. With **Hide file names** on, the `.sbox` file itself gets a random name. What shows from outside is the padded size, that it's a Secure Box file, and whether it has a sharing password.
+- A key ring backup (**Local → Key ring backup**) opens your account's `.sbox` files without Google Drive, together with your master password or Emergency Kit.
+
+**Encrypted messages.** **Local → Encrypt text** turns text into a short block starting with `-----BEGIN SECURE BOX MESSAGE-----`, to paste into a chat or an email. It uses the same design as `.sbox` files: a random key, kept in a copy for your account and optionally one for a sharing password. Everything around the text is authenticated, and its length is padded.
 
 **Streaming without disk.** A service worker (`sw.js`), a small background script your browser runs for Secure Box, decrypts each file chunk by chunk as it streams from Drive, using byte ranges so seeking works. Decrypted data is marked `no-store`, and nothing is written to the browser's storage. Only an explicit **Download** saves a file.
 
@@ -199,13 +210,19 @@ Your vault, files and Emergency Kit live in Google Drive, so nothing needs copyi
 
 ## Using Secure Box
 
+The tabs at the top say where things live. **Passwords** and **Files** are kept in the cloud named next to them, **Google Drive** for now; click the name to see your account (OneDrive is planned). **Local** is this device only.
+
+Your browser's **Back** and **Forward** buttons move between tabs and folders, close the viewer, and on phones close an open password.
+
 **Passwords**
-- Logins and secure notes, with a password generator.
+- Logins and secure notes, with a password generator. **New** is at the top of the list.
 - Copy buttons that clear the clipboard after 30 seconds.
-- Import and export CSV from Chrome, Firefox, Bitwarden, 1Password, LastPass and others.
+- Import and export CSV from Chrome, Firefox, Bitwarden, 1Password, LastPass and others, from the **⋯** button at the top of the list.
 
 **Files**
 - **Upload** several files at once with the Upload button, or a whole folder with **Upload folder** (browsers allow one folder per pick). To upload several folders, or folders and files together, drag them onto the window. Their folder structure is kept.
+- While uploading, the panel shows the whole batch at a glance (files done, data done and one progress bar), and the browser tab's title shows the percentage. Fold the file list away with the arrow.
+- Only files uploaded through Secure Box are encrypted. A file you put into the `Secure Box` folder in Google Drive yourself stays as it is, unencrypted. Secure Box can't even see it, because Google only lets it see the files it created. Upload files through Secure Box instead.
 - **Organise** with folders, breadcrumbs, grid or list view, sorting, and search across every folder.
 - **Select** several items with Ctrl/⌘-click or Shift-click, then Download, Move or Delete them together.
 - **Download** a single file as itself. Several items, folders included, download as one **.zip** that keeps their folders, and a folder's ⋯ menu has **Download as .zip**. The ZIP is built and decrypted while it downloads, so it never sits in memory, and your browser shows its real size and progress.
@@ -228,9 +245,38 @@ Your vault, files and Emergency Kit live in Google Drive, so nothing needs copyi
 
 **Menu (⋯)**
 - Sync now
-- Import or export passwords
 - **Change master password** (your Emergency Kit keeps working)
 - **New Emergency Kit** (the old one stops working)
+
+**Local: the local vault**
+
+Encrypted files kept on this device only: nothing goes to Google Drive. It works like Files (folders, upload, viewer, downloads) and unlocks with your master password.
+- **Where it lives.** In Chrome and Edge on a computer you choose:
+  - **In this browser** (the only choice elsewhere): the browser's private storage for Secure Box.
+  - **In a folder you choose**: ordinary encrypted files you can see and copy. It can be a synced folder, such as OneDrive, Dropbox or iCloud Drive. The browser asks once per visit before Secure Box may open it.
+- **Keeping it safe in the browser.** The browser deletes this storage if someone clears this site's data, or uninstalls the browser. It may also clear it by itself when space runs low, unless it grants Secure Box *persistent storage*. Browsers decide that themselves, and usually agree for an installed app (see [Install as an app](#install-as-an-app)). The bar above your files shows whether it's protected, and has **Protect** to ask again.
+- **On iPhone and iPad** the local vault works only in the Secure Box app on your Home Screen. Safari deletes the data of websites you haven't opened for 7 days, and only Home Screen apps are safe from that.
+- **Back up** saves the whole local vault as one `.zip`, exactly as stored and still encrypted, so you can keep it anywhere. The bar reminds you when it's out of date. **Tools → Restore a backup** adds back whatever is missing; it works only with the same account.
+- **Files put in by hand.** If someone copies plain files into a folder vault's `Secure Box` folder, the bar lists them and offers **Encrypt them**. Each one is encrypted into the vault, and then the unencrypted original is deleted.
+
+**Local: tools**
+
+These work on your computer or phone and upload nothing. They sit under **Tools** in the Local tab, and on its first page before you create a local vault.
+- **Encrypt files:** choose files or a folder. Each file becomes its own `.sbox`, and a folder becomes one `.sbox`. Your originals aren't changed: delete them yourself once you've checked the encrypted copies.
+  - In Chrome and Edge on a computer, you pick a folder to save into, and big files are written a piece at a time.
+  - Other browsers save the results as downloads. Each one is put together in memory first, so very large files may not fit, especially on phones.
+- **Hide file names** is on by default and gives each `.sbox` a random name.
+- **Add a sharing password** lets someone without your account open the files: they go to Secure Box, choose **Open a .sbox file** on the sign-in screen, and enter the password. Send the password separately from the files. Your own account can always open them too.
+- **Decrypt .sbox files:** files made with your account open straight away. Others ask for their sharing password, or for the key ring backup of the account that made them. A folder is unpacked into the folder you choose, or downloaded as a `.zip`.
+- **Encrypt text:** type or paste text and press **Encrypt** to get a message block to paste anywhere. Paste a message block instead, and the button turns into **Decrypt**. Add a sharing password, and someone without an account can read it with **Read a message** on the sign-in screen.
+- **Key ring backup:** saves a copy of your key ring. With it and your master password or Emergency Kit, your `.sbox` files open on any device, even without Google Drive. Keep it private: it keeps opening with the master password and Emergency Kit you have on the day you export it, even after you change them.
+
+### Install as an app
+
+Secure Box can be installed like an app. It opens in its own window, and browsers are more willing to keep its local vault safe.
+- **Chrome or Edge on a computer:** the install icon in the address bar, or the browser menu → **Install Secure Box**.
+- **Android:** the Chrome menu → **Add to Home screen** or **Install app**.
+- **iPhone and iPad:** in Safari, **Share → Add to Home Screen**.
 
 ## Recovery
 
@@ -240,6 +286,8 @@ Your vault, files and Emergency Kit live in Google Drive, so nothing needs copyi
 | Lost the Emergency Kit | While unlocked, use **⋯ → New Emergency Kit**. |
 | Deleted a Secure Box file in Drive | Restore it from Google Drive's trash (kept for 30 days). |
 | A bad change to the vault | In Drive, right-click `Secure Box Vault.json` → **Manage versions** and download an earlier version. |
+| No access to Google Drive, but you need your `.sbox` files | On the sign-in screen, choose **Open a .sbox file**, load your key ring backup, and enter your master password or Emergency Kit recovery key. |
+| The local vault is gone (site data cleared, new phone) | Unlock, open **Local**, and choose **Restore a backup…** with your latest local vault backup. |
 | Lost both the master password and the Emergency Kit | The data can't be recovered. That's the point of the encryption. |
 
 ## Troubleshooting
@@ -267,7 +315,7 @@ npm test
 ```
 
 - `npm run dev` serves `app/` at http://localhost:8080. Add `?demo` to the URL for the in-memory demo.
-- `npm test` runs 26 unit tests, covering the key ring, encryption formats, tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection and CSV.
+- `npm test` runs 32 unit tests, covering the key ring, encryption formats, `.sbox` files, encrypted messages, the local vault's index key, tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection and CSV.
 
 ```
 app/
@@ -285,6 +333,10 @@ app/
     backend.js          Google Drive storage (key ring, vault, encrypted files)
     google.js           sign-in, reconnect pop-up, Drive REST calls
     files-view.js       file manager: grid/list, thumbnails, uploads, move, rename, delete
+    localbox.js         .sbox format: account and sharing-password key copies, folder boxes
+    localstore.js       local vault: browser storage or a chosen folder, backups, files put in by hand
+    textbox.js          encrypted text messages
+    local-tools.js      Local tools: .sbox files and messages
     filetypes.js        file types and which viewer opens what
     viewer.js           full-screen viewer and players
     readers.js          Word/Excel/PowerPoint/OpenDocument/RTF/Markdown/CSV/text readers

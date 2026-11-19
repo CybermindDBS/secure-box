@@ -55,7 +55,14 @@ const timeOf = (item) => {
   return Number.isFinite(t) ? t : Date.now();
 };
 
+/**
+ * `ctx.cloud` is the Google Drive store; the local vault's store can be switched in with
+ * useStore(). A store is { kind: 'cloud'|'local', getVault(), commit(change), backend(),
+ * ensure(), fresh(ms) }, and each one keeps its own folder, search and selection.
+ */
 export function createFilesView(ctx) {
+  let store = ctx.cloud;
+  const navs = new WeakMap();
   const view = {
     folder: null,
     query: '',
@@ -68,7 +75,9 @@ export function createFilesView(ctx) {
   };
   const transfers = [];
   let processing = false;
-  const vault = () => ctx.getVault();
+  const vault = () => store.getVault();
+  const isLocal = () => store.kind === 'local';
+  const rootName = () => (isLocal() ? 'Local vault' : 'All files');
   const folderById = (id) => vault().folders.find((f) => f.id === id);
   const fileById = (id) => vault().files.find((f) => f.id === id);
 
@@ -80,7 +89,7 @@ export function createFilesView(ctx) {
   async function decryptHere(file, part = 'content') {
     const plan = layout({ size: file.size, thumbBytes: file.thumbBytes, chunk: file.chunk });
     const end = part === 'thumb' ? plan.contentStart - 1 : plan.total - 1;
-    const stream = await ctx.backend().readRange(file.driveId, 0, end);
+    const stream = await store.backend().readRange(file.driveId, 0, end);
     return decryptFile(stream, file, { part });
   }
 
@@ -137,7 +146,7 @@ export function createFilesView(ctx) {
   }
 
   async function download(file) {
-    await ctx.ensureDrive();
+    await store.ensure();
     // The worker streams the decrypted file straight into the browser's download.
     if (ctx.streaming()) downloadViaWorker(fileUrl(file.id, { download: true }));
     else downloadFile(file.name, new Blob(await decryptHere(file), { type: file.type }), file.type);
@@ -187,7 +196,7 @@ export function createFilesView(ctx) {
     if (!files.length) return toast('Nothing to download: the selected folders are empty.');
     // Without the streaming worker (for example in a private window), fall back to one file each.
     if (!ctx.streaming()) return downloadEach(files.map((e) => fileById(e.fileId)));
-    await ctx.ensureDrive();
+    await store.ensure();
     const single = folderIds.length === 1 && !fileIds.length ? folderById(folderIds[0]) : null;
     const d = new Date();
     const pad = (n) => String(n).padStart(2, '0');
@@ -203,10 +212,10 @@ export function createFilesView(ctx) {
     fetchBytes,
     fetchRange,
     download,
-    ensureDrive: ctx.ensureDrive,
-    driveFresh: ctx.driveFresh,
+    ensureDrive: () => store.ensure(),
+    driveFresh: (ms) => store.fresh(ms),
     releaseUrls,
-    folderPath: (file) => ['All files', ...folderChain(vault(), file.folder).map((f) => f.name)].join(' / '),
+    folderPath: (file) => [rootName(), ...folderChain(vault(), file.folder).map((f) => f.name)].join(' / '),
     rename: (file) => renameEntry(file, false),
     move: (file) => moveEntries([], [file.id]),
     remove: (file) => deleteEntries([], [file.id]),
@@ -291,14 +300,24 @@ export function createFilesView(ctx) {
       dropTarget(b, id);
       return b;
     };
-    const parts = [crumb('All files', null, !view.query && !view.folder)];
+    const parts = [crumb(rootName(), null, !view.query && !view.folder)];
     chain.forEach((folder, i) => {
       parts.push(h('span', { class: 'crumb-sep', 'aria-hidden': 'true' }, icon('chevronRight', 14)));
       parts.push(crumb(folder.name, folder.id, i === chain.length - 1));
     });
     if (view.query) parts.push(h('span', { class: 'crumb-sep', 'aria-hidden': 'true' }, icon('chevronRight', 14)), h('span', { class: 'crumb is-current', text: `Search “${view.query.trim()}”` }));
     nav.replaceChildren(...parts);
-    nav.scrollLeft = nav.scrollWidth; // on narrow screens a long path keeps its current folder in view
+    nav.title = view.query ? `Search “${view.query.trim()}”` : [rootName(), ...chain.map((f) => f.name)].join(' › ');
+    nav.scrollLeft = nav.scrollWidth; // a long path keeps its current folder in view
+    updateCrumbFades();
+  }
+
+  /** Soft fades show that a long path carries on past the left or right edge. */
+  function updateCrumbFades() {
+    const nav = $('#crumbs');
+    const hidden = nav.scrollWidth - nav.clientWidth;
+    nav.classList.toggle('fade-start', hidden > 1 && nav.scrollLeft > 1);
+    nav.classList.toggle('fade-end', hidden > 1 && hidden - nav.scrollLeft > 1);
   }
 
   function art(entry, isFolder, size = 'lg') {
@@ -383,9 +402,15 @@ export function createFilesView(ctx) {
         h('div', { class: 'files-empty' },
           h('div', { class: 'empty-icon' }, icon(view.query ? 'search' : 'upload', 22)),
           h('p', { class: 'empty-title', text: view.query ? 'No matching files' : view.folder ? 'This folder is empty' : 'No files yet' }),
-          h('p', { text: view.query ? 'Try another name.' : 'Drop files or folders here, or use Upload. They are encrypted before they leave this browser.' }),
+          h('p', {
+            text: view.query
+              ? 'Try another name.'
+              : isLocal()
+                ? 'Drop files or folders here, or use Upload. They’re encrypted and kept on this device only.'
+                : 'Drop files or folders here, or use Upload. They are encrypted before they leave this browser.',
+          }),
           view.query ? null : h('div', { class: 'files-empty-actions' },
-            h('button', { type: 'button', class: 'btn btn-primary btn-sm', dataset: { action: 'primary' } }, icon('upload', 16), h('span', { text: 'Upload files' })),
+            h('button', { type: 'button', class: 'btn btn-primary btn-sm', dataset: { action: 'upload-files' } }, icon('upload', 16), h('span', { text: 'Upload files' })),
             h('button', { type: 'button', class: 'btn btn-ghost btn-sm', dataset: { action: 'new-folder' } }, icon('folderPlus', 16), h('span', { text: 'New folder' })))),
       );
       return;
@@ -424,13 +449,16 @@ export function createFilesView(ctx) {
   // ---------------------------------------------------------------------------
   // Navigation & selection
   // ---------------------------------------------------------------------------
-  function openFolder(id) {
+  /** `push: false` when the browser's Back or Forward brought us here (no new history entry). */
+  function openFolder(id, { push = true } = {}) {
+    const moved = view.folder !== id || view.query;
     view.folder = id;
     view.query = '';
     $('#search').value = '';
     view.selected.clear();
     render();
     $('#files-body').scrollTop = 0;
+    if (push && moved) ctx.onNavigate?.();
   }
 
   function openEntry(entry, isFolder) {
@@ -531,7 +559,7 @@ export function createFilesView(ctx) {
           choice = id;
           for (const r of rows) r.classList.toggle('is-selected', r === row);
         },
-      }, icon(folder ? 'folder' : 'home', 16), h('span', { text: folder ? folder.name : 'All files' }));
+      }, icon(folder ? 'folder' : 'home', 16), h('span', { text: folder ? folder.name : rootName() }));
       row.style.setProperty('--depth', String(depth));
       rows.push(row);
       if (blocked) return;
@@ -552,22 +580,22 @@ export function createFilesView(ctx) {
   async function newFolder() {
     const name = await promptDialog({ title: 'New folder', label: 'Folder name', value: 'Untitled folder', confirmLabel: 'Create' });
     if (!name) return;
-    await ctx.ensureDrive();
+    await store.ensure();
     const siblings = vault().folders.filter((f) => f.parent === view.folder).map((f) => f.name);
-    await ctx.commit({ op: 'folder-put', folder: makeFolder({ name: uniqueName(name, siblings, { isFolder: true }), parent: view.folder }) });
+    await store.commit({ op: 'folder-put', folder: makeFolder({ name: uniqueName(name, siblings, { isFolder: true }), parent: view.folder }) });
     render();
   }
 
   async function renameEntry(entry, isFolder) {
     const name = await promptDialog({ title: isFolder ? 'Rename folder' : 'Rename file', label: 'Name', value: entry.name, confirmLabel: 'Rename', selectStem: !isFolder });
     if (!name || name === entry.name) return;
-    await ctx.ensureDrive();
+    await store.ensure();
     if (isFolder) {
       const siblings = vault().folders.filter((f) => f.parent === entry.parent && f.id !== entry.id).map((f) => f.name);
-      await ctx.commit({ op: 'folder-put', folder: makeFolder({ name: uniqueName(name, siblings, { isFolder: true }), parent: entry.parent }, entry) });
+      await store.commit({ op: 'folder-put', folder: makeFolder({ name: uniqueName(name, siblings, { isFolder: true }), parent: entry.parent }, entry) });
     } else {
       const siblings = vault().files.filter((f) => f.folder === entry.folder && f.id !== entry.id).map((f) => f.name);
-      await ctx.commit({ op: 'file-put', file: makeFileEntry({ name: uniqueName(name, siblings), type: guessType(name, entry.type) }, entry) });
+      await store.commit({ op: 'file-put', file: makeFileEntry({ name: uniqueName(name, siblings), type: guessType(name, entry.type) }, entry) });
     }
     ctx.onChange();
   }
@@ -582,7 +610,7 @@ export function createFilesView(ctx) {
       if (target === undefined) return;
     }
     if (target !== null && blocked.has(target)) return toast('A folder can’t be moved into itself.', 'error');
-    await ctx.ensureDrive();
+    await store.ensure();
     const v = vault();
     const changes = [];
     const takenFolders = v.folders.filter((f) => f.parent === target && !folderIds.includes(f.id)).map((f) => f.name);
@@ -602,10 +630,10 @@ export function createFilesView(ctx) {
       changes.push({ op: 'file-put', file: makeFileEntry({ name, folder: target }, file) });
     }
     if (!changes.length) return;
-    await ctx.commit({ op: 'batch', changes });
+    await store.commit({ op: 'batch', changes });
     view.selected.clear();
     ctx.onChange();
-    toast(`Moved to ${target ? folderById(target).name : 'All files'}`);
+    toast(`Moved to ${target ? folderById(target).name : rootName()}`);
   }
 
   async function deleteEntries(folderIds, fileIds) {
@@ -619,17 +647,19 @@ export function createFilesView(ctx) {
     const inside = folderIds.length && allFiles.length ? ` and the ${allFiles.length} ${allFiles.length === 1 ? 'file' : 'files'} inside` : '';
     const ok = await confirmDialog({
       title: `Delete ${label}?`,
-      message: `This removes ${label}${inside} from Secure Box on every device. The encrypted copies go to your Google Drive trash.`,
+      message: isLocal()
+        ? `This deletes ${label}${inside} from the local vault on this device. It can’t be undone.`
+        : `This removes ${label}${inside} from Secure Box on every device. The encrypted copies go to your Google Drive trash.`,
       confirmLabel: 'Delete',
       danger: true,
     });
     if (!ok) return;
-    await ctx.ensureDrive();
-    await ctx.commit({ op: 'remove', folders: allFolders, files: allFiles.map((f) => f.id) });
+    await store.ensure();
+    await store.commit({ op: 'remove', folders: allFolders, files: allFiles.map((f) => f.id) });
     view.selected.clear();
     ctx.onChange();
     toast(allFiles.length + allFolders.length === 1 ? 'Deleted' : `Deleted ${allFiles.length + allFolders.length} items`);
-    for (const file of allFiles) await ctx.backend().trash(file.driveId).catch(() => {});
+    for (const file of allFiles) await store.backend().trash(file.driveId).catch(() => {});
   }
 
   function deleteSelectionOr(entry, isFolder) {
@@ -657,8 +687,8 @@ export function createFilesView(ctx) {
   }
 
   async function upload({ directory = false } = {}) {
-    if (!ctx.driveFresh(10 * 60_000)) {
-      await ctx.ensureDrive(); // reconnect first; the file picker needs a fresh click
+    if (!store.fresh(10 * 60_000)) {
+      await store.ensure(); // reconnect first; the file picker needs a fresh click
       return toast('Reconnected — choose Upload again.');
     }
     const target = view.folder;
@@ -689,25 +719,36 @@ export function createFilesView(ctx) {
     })().catch((err) => toast(err.message, 'error'));
   }
 
-  function enqueue(items, target) {
-    if (!items.length) return;
-    for (const { file, path } of items) {
-      transfers.push({ id: crypto.randomUUID(), file, path, target, progress: 0, status: 'queued', error: '', abort: new AbortController() });
-    }
+  /**
+   * Queues files for store `s` (the one showing, by default). An item may carry `after()`, run
+   * once it's encrypted and saved. Resolves when every item has finished, failed or stopped.
+   */
+  function enqueue(items, target, s = store) {
+    if (!items.length) return Promise.resolve([]);
+    const added = items.map(({ file, path, after }) => {
+      const task = { id: crypto.randomUUID(), file, path, target, store: s, after, progress: 0, status: 'queued', error: '', abort: new AbortController() };
+      task.finished = new Promise((resolve) => {
+        task.settle = resolve;
+      });
+      return task;
+    });
+    transfers.push(...added);
     renderTransfers();
     processQueue();
+    return Promise.all(added.map((t) => t.finished));
   }
 
   const folderCache = new Map();
-  async function ensurePath(target, path) {
+  async function ensurePath(s, target, path) {
     let parent = target;
     for (const name of path) {
-      const key = `${parent}/${name.toLowerCase()}`;
-      let folder = vault().folders.find((f) => f.parent === parent && f.name.toLowerCase() === name.toLowerCase());
-      if (!folder && folderCache.has(key)) folder = folderById(folderCache.get(key));
+      const key = `${s.kind}:${parent}/${name.toLowerCase()}`;
+      const folders = () => s.getVault().folders;
+      let folder = folders().find((f) => f.parent === parent && f.name.toLowerCase() === name.toLowerCase());
+      if (!folder && folderCache.has(key)) folder = folders().find((f) => f.id === folderCache.get(key));
       if (!folder) {
         folder = makeFolder({ name, parent });
-        await ctx.commit({ op: 'folder-put', folder });
+        await s.commit({ op: 'folder-put', folder });
         folderCache.set(key, folder.id);
       }
       parent = folder.id;
@@ -716,9 +757,9 @@ export function createFilesView(ctx) {
   }
 
   async function uploadOne(task) {
-    const { file } = task;
+    const { file, store: s } = task;
     if (file.size > MAX_FILE_SIZE) throw new Error(`Files up to ${formatBytes(MAX_FILE_SIZE)} are supported.`);
-    const folder = await ensurePath(task.target, task.path);
+    const folder = await ensurePath(s, task.target, task.path);
     const id = crypto.randomUUID();
     const type = guessType(file.name, file.type);
     task.status = 'preparing';
@@ -726,7 +767,7 @@ export function createFilesView(ctx) {
     const thumbnail = canThumbnail({ name: file.name, type }) ? await makeThumbnail(file, type) : null;
     const plan = layout({ size: file.size, thumbBytes: thumbnail?.length || 0 });
     task.status = 'uploading';
-    const send = await ctx.backend().openUpload({ fid: id, size: plan.total });
+    const send = await s.backend().openUpload({ fid: id, size: plan.total });
     const writer = createPieceWriter({
       total: plan.total,
       send,
@@ -735,14 +776,20 @@ export function createFilesView(ctx) {
         updateTransfer(task);
       },
     });
-    const meta = await encryptFile({ file, fileId: id, thumbnail, write: (bytes) => writer.write(bytes), signal: task.abort.signal });
+    let meta;
+    try {
+      meta = await encryptFile({ file, fileId: id, thumbnail, write: (bytes) => writer.write(bytes), signal: task.abort.signal });
+    } catch (err) {
+      await send.abort?.(); // the local vault drops its half-written file
+      throw err;
+    }
     const driveId = writer.result;
-    const siblings = vault().files.filter((f) => f.folder === folder).map((f) => f.name);
+    const siblings = s.getVault().files.filter((f) => f.folder === folder).map((f) => f.name);
     const entry = makeFileEntry({ id, name: uniqueName(file.name, siblings), type, size: file.size, folder, driveId, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes });
     try {
-      await ctx.commit({ op: 'file-put', file: entry });
+      await s.commit({ op: 'file-put', file: entry });
     } catch (err) {
-      ctx.backend().trash(driveId).catch(() => {});
+      s.backend().trash(driveId).catch(() => {});
       throw err;
     }
   }
@@ -752,10 +799,10 @@ export function createFilesView(ctx) {
     processing = true;
     try {
       for (let task = transfers.find((t) => t.status === 'queued'); task; task = transfers.find((t) => t.status === 'queued')) {
-        if (!ctx.driveFresh(2 * 60_000)) {
-          for (const t of transfers) if (t.status === 'queued') t.status = 'paused';
+        if (!task.store.fresh(2 * 60_000)) {
+          for (const t of transfers) if (t.status === 'queued' && t.store === task.store) t.status = 'paused';
           renderTransfers();
-          break;
+          continue;
         }
         try {
           await uploadOne(task);
@@ -765,6 +812,8 @@ export function createFilesView(ctx) {
           task.status = err?.name === 'AbortError' ? 'cancelled' : 'error';
           task.error = err?.name === 'AbortError' ? '' : err.message;
         }
+        if (task.status === 'done' && task.after) await Promise.resolve().then(task.after).catch((err) => console.warn('After saving:', err));
+        task.settle?.(task.status);
         renderTransfers();
         ctx.onChange();
       }
@@ -777,11 +826,13 @@ export function createFilesView(ctx) {
   }
 
   function clearFinished() {
+    if (transfers.some((t) => ['queued', 'preparing', 'uploading', 'paused'].includes(t.status))) return;
     for (let i = transfers.length - 1; i >= 0; i--) if (['done', 'cancelled'].includes(transfers[i].status)) transfers.splice(i, 1);
     renderTransfers();
   }
 
   const STATUS = { queued: 'Waiting', preparing: 'Preparing…', uploading: 'Encrypting & uploading', done: 'Encrypted & saved', error: 'Failed', cancelled: 'Cancelled', paused: 'Paused — Google access expired' };
+  const statusText = (task) => (task.status === 'uploading' && task.store.kind === 'local' ? 'Encrypting & saving' : STATUS[task.status]);
 
   function transferRow(task) {
     const kind = kindOf({ name: task.file.name, type: guessType(task.file.name, task.file.type) });
@@ -795,7 +846,7 @@ export function createFilesView(ctx) {
       h('span', { class: `file-art kind-${kind} art-sm` }, icon(KIND_ICON[kind], 16)),
       h('div', { class: 'transfer-main' },
         h('span', { class: 'transfer-name', text: task.file.name }),
-        h('span', { class: 'transfer-status', text: task.error || `${STATUS[task.status]}${task.status === 'uploading' ? ` · ${Math.round(task.progress * 100)}%` : ''} · ${formatBytes(task.file.size)}` }),
+        h('span', { class: 'transfer-status', text: task.error || `${statusText(task)}${task.status === 'uploading' ? ` · ${Math.round(task.progress * 100)}%` : ''} · ${formatBytes(task.file.size)}` }),
         h('span', { class: 'transfer-bar' }, h('span', { class: 'transfer-fill' }))),
       action);
   }
@@ -804,7 +855,23 @@ export function createFilesView(ctx) {
     const row = $(`#transfer-list [data-id="${task.id}"]`);
     if (!row) return renderTransfers();
     row.querySelector('.transfer-fill').style.setProperty('--progress', String(task.progress));
-    row.querySelector('.transfer-status').textContent = `${STATUS[task.status]} · ${Math.round(task.progress * 100)}% · ${formatBytes(task.file.size)}`;
+    row.querySelector('.transfer-status').textContent = `${statusText(task)} · ${Math.round(task.progress * 100)}% · ${formatBytes(task.file.size)}`;
+    renderTotal();
+  }
+
+  /** The whole batch at a glance: files done, bytes done, and one bar (also in the tab's title). */
+  function renderTotal() {
+    const counted = transfers.filter((t) => t.status !== 'cancelled');
+    const bytes = counted.reduce((n, t) => n + t.file.size, 0);
+    const done = counted.reduce((n, t) => n + t.file.size * (t.status === 'done' ? 1 : t.progress), 0);
+    const finished = counted.filter((t) => t.status === 'done').length;
+    const share = bytes ? done / bytes : counted.length ? finished / counted.length : 0;
+    const active = counted.some((t) => ['queued', 'preparing', 'uploading'].includes(t.status));
+    $('#transfers-summary').hidden = counted.length < 2 && !active;
+    $('#transfers-total').textContent = `${finished} of ${counted.length} ${counted.length === 1 ? 'file' : 'files'} · ${formatBytes(Math.round(done))} of ${formatBytes(bytes)}`;
+    $('#transfers-percent').textContent = `${Math.floor(share * 100)}%`;
+    $('#transfers-total-fill').style.setProperty('--progress', String(share));
+    document.title = active ? `${Math.floor(share * 100)}% · Secure Box` : 'Secure Box';
   }
 
   function renderTransfers() {
@@ -813,10 +880,14 @@ export function createFilesView(ctx) {
     const active = transfers.filter((t) => ['queued', 'preparing', 'uploading'].includes(t.status)).length;
     const failed = transfers.filter((t) => t.status === 'error').length;
     const paused = transfers.some((t) => t.status === 'paused');
-    $('#transfers-title').textContent = active ? `Uploading ${active} ${active === 1 ? 'file' : 'files'}` : paused ? 'Uploads paused' : failed ? `${failed} upload${failed === 1 ? '' : 's'} failed` : 'Uploads complete';
+    const saving = transfers.length > 0 && transfers.every((t) => t.store.kind === 'local');
+    $('#transfers-title').textContent = active
+      ? `${saving ? 'Saving' : 'Uploading'} ${active} ${active === 1 ? 'file' : 'files'}`
+      : paused ? 'Uploads paused' : failed ? `${failed} ${failed === 1 ? 'file' : 'files'} failed` : saving ? 'All saved' : 'Uploads complete';
     $('#transfers-resume').hidden = !paused;
     $('#transfer-list').replaceChildren(...transfers.map(transferRow));
     for (const task of transfers) $(`#transfer-list [data-id="${task.id}"] .transfer-fill`)?.style.setProperty('--progress', String(task.progress));
+    renderTotal();
   }
 
   function retryTask(task) {
@@ -827,18 +898,35 @@ export function createFilesView(ctx) {
 
   function cancelTask(task) {
     task.abort.abort();
-    if (['queued', 'paused'].includes(task.status)) task.status = 'cancelled';
+    if (['queued', 'paused'].includes(task.status)) {
+      task.status = 'cancelled';
+      task.settle?.('cancelled');
+    }
     renderTransfers();
   }
 
   // ---------------------------------------------------------------------------
   // Wiring
   // ---------------------------------------------------------------------------
+  // The path bar scrolls sideways with its scrollbar hidden: keep its fades current, and let a
+  // mouse wheel scroll it (most mice only scroll up and down).
+  const crumbsNav = $('#crumbs');
+  crumbsNav.addEventListener('scroll', updateCrumbFades, { passive: true });
+  new ResizeObserver(updateCrumbFades).observe(crumbsNav);
+  crumbsNav.addEventListener('wheel', (event) => {
+    if (crumbsNav.scrollWidth <= crumbsNav.clientWidth || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+    const step = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? crumbsNav.clientWidth : 1;
+    crumbsNav.scrollLeft += event.deltaY * step;
+    updateCrumbFades();
+    event.preventDefault();
+  }, { passive: false });
+
   const filesView = $('#files-view');
   filesView.addEventListener('dragover', (event) => {
     if (![...event.dataTransfer.types].includes('Files')) return;
     event.preventDefault();
-    $('#drop-target').textContent = view.folder ? folderById(view.folder)?.name : 'All files';
+    $('#drop-verb').textContent = isLocal() ? 'save to' : 'upload to';
+    $('#drop-target').textContent = view.folder ? folderById(view.folder)?.name : rootName();
     $('#drop-overlay').hidden = false;
   });
   filesView.addEventListener('dragleave', (event) => {
@@ -890,16 +978,25 @@ export function createFilesView(ctx) {
       return downloadZip(s.folders, s.files);
     },
     'transfers-close': () => {
-      for (const t of transfers) if (['queued', 'paused', 'preparing', 'uploading'].includes(t.status)) t.abort.abort();
+      for (const t of transfers) {
+        if (['queued', 'paused', 'preparing', 'uploading'].includes(t.status)) t.abort.abort();
+        t.settle?.('cancelled');
+      }
       transfers.length = 0;
       renderTransfers();
     },
     'transfers-resume': async () => {
-      await ctx.ensureDrive();
+      await ctx.cloud.ensure(); // only Google Drive uploads pause (its access lasts an hour)
       for (const t of transfers) if (t.status === 'paused') t.status = 'queued';
       renderTransfers();
       processQueue();
     },
+    'transfers-toggle': (button) => {
+      const collapsed = $('#transfers').classList.toggle('is-collapsed');
+      button.setAttribute('aria-expanded', String(!collapsed));
+      button.title = collapsed ? 'Show files' : 'Hide files';
+    },
+    'upload-files': () => upload(),
     ...viewer.actions,
   };
 
@@ -909,10 +1006,26 @@ export function createFilesView(ctx) {
     get query() {
       return view.query;
     },
+    get folder() {
+      return view.folder;
+    },
+    get store() {
+      return store;
+    },
     setQuery(q) {
       view.query = q;
       render();
     },
+    /** Shows another store's files (Google Drive or the local vault), each where it was left. */
+    useStore(next) {
+      if (next === store) return;
+      navs.set(store, { folder: view.folder, query: view.query, selected: view.selected, anchor: view.anchor });
+      releaseUrls();
+      store = next;
+      Object.assign(view, navs.get(next) || { folder: null, query: '', selected: new Set(), anchor: null });
+    },
+    goTo: (folder, options) => openFolder(folder && folderById(folder) ? folder : null, options),
+    enqueue: (items, target, s) => enqueue(items, target, s),
     upload: () => upload(),
     busy: () => transfers.some((t) => ['queued', 'preparing', 'uploading'].includes(t.status)),
     searchKey(event) {

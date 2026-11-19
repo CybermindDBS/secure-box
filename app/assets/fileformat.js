@@ -78,10 +78,10 @@ export function layout({ size, thumbBytes = 0, chunk = CHUNK_SIZE }) {
 
 /**
  * Encrypts a Blob/File chunk by chunk and passes the ciphertext, in order, to `write`.
- * Returns the per-file key (base64url) and layout facts the vault index needs.
+ * Returns the per-file key (base64url) and layout facts the vault index needs. `rawKey` is
+ * only passed when the caller must know the key up front (local .sbox boxes).
  */
-export async function encryptFile({ file, fileId, thumbnail = null, write, onProgress, signal }) {
-  const rawKey = randomBytes(32);
+export async function encryptFile({ file, fileId, thumbnail = null, rawKey = randomBytes(32), write, onProgress, signal }) {
   const key = await importAesKey(rawKey, ['encrypt']);
   const prefix = randomBytes(7);
   const chunk = CHUNK_SIZE;
