@@ -53,7 +53,7 @@ export function createViewer(ctx) {
 
   function failed(err) {
     if (!ctx.driveFresh(30_000)) {
-      return message('Google access expired', 'Reconnect to keep viewing your files.',
+      return message('Your sign-in expired', 'Reconnect to keep viewing your files.',
         h('button', { type: 'button', class: 'btn btn-primary btn-sm', onclick: () => ctx.ensureDrive().then(show).catch(() => {}) }, icon('refresh', 16), h('span', { text: 'Reconnect' })));
     }
     return message('Can’t show this file', err?.message || 'Something went wrong while decrypting it.', downloadButton());
@@ -245,15 +245,31 @@ export function createViewer(ctx) {
   // ---------------------------------------------------------------------------
   // Media
   // ---------------------------------------------------------------------------
+  /** Why the first byte of a streamed file can't be read, or '' if it can. */
+  async function readProblem(src) {
+    if (!src || src.startsWith('blob:')) return ''; // already decrypted in this page
+    try {
+      const res = await fetch(src, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' });
+      const text = await res.text();
+      return res.ok ? '' : text.slice(0, 300) || `The file couldn’t be read (${res.status}).`;
+    } catch (err) {
+      return err?.message || 'The file couldn’t be read.';
+    }
+  }
+
   async function showMedia(file, my, tag) {
     const media = h(tag, { controls: true, autoplay: true, playsinline: true, preload: 'metadata' });
-    media.addEventListener('error', () => {
+    media.addEventListener('error', async () => {
+      if (my !== token) return;
+      // A file that couldn't be read fails just like one the browser can't play: read its
+      // first byte to tell which.
+      const problem = await readProblem(media.currentSrc || media.src);
       if (my !== token) return;
       const ext = extOf(file.name);
       stage.replaceChildren(
-        ctx.driveFresh(30_000)
-          ? message(`Can’t play this ${tag}`, `This browser doesn’t support ${ext ? `.${ext}` : 'this'} ${tag} files. Download it to play it in another app.`, downloadButton())
-          : failed(),
+        problem || !ctx.driveFresh(30_000)
+          ? failed(problem ? new Error(problem) : undefined)
+          : message(`Can’t play this ${tag}`, `This browser doesn’t support ${ext ? `.${ext}` : 'this'} ${tag} files. Download it to play it in another app.`, downloadButton()),
       );
     });
     media.src = await ctx.sourceUrl(file);
@@ -359,7 +375,7 @@ export function createViewer(ctx) {
       row('Modified', formatDate(file.updated)),
       h('div', { class: 'info-secure' },
         icon('shield', 16),
-        h('p', { text: `Encrypted in this browser with its own AES-256-GCM key${canThumbnail(file) && file.thumbBytes ? ' (thumbnail included)' : ''}. Google Drive stores only an unnamed encrypted blob; it is decrypted while it streams and never saved to disk.` })),
+        h('p', { text: `Encrypted in this browser with its own AES-256-GCM key${canThumbnail(file) && file.thumbBytes ? ' (thumbnail included)' : ''}. Your cloud drive stores only an unnamed encrypted blob; it is decrypted while it streams and never saved to disk.` })),
     );
   }
 

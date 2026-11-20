@@ -19,11 +19,16 @@
 .EXAMPLE
   .\deploy-firebase.ps1
   Re-deploys with the remembered settings.
+
+.EXAMPLE
+  .\deploy-firebase.ps1 -MicrosoftClientId 00000000-0000-0000-0000-000000000000
+  Adds Microsoft sign-in (OneDrive): the Application (client) ID of your Microsoft app registration.
 #>
 [CmdletBinding()]
 param(
   [string]$Project,
   [string]$GoogleClientId,
+  [string]$MicrosoftClientId,
   [int]$AutoLockMinutes,
   [int]$SessionHours
 )
@@ -57,6 +62,7 @@ function Select-Setting($Value, [string]$Name, $Default) {
 
 $Project         = Select-Setting $Project 'FirebaseProject' ''
 $GoogleClientId  = Select-Setting $GoogleClientId 'GoogleClientId' ''
+$MicrosoftClientId = Select-Setting $MicrosoftClientId 'MicrosoftClientId' ''
 $AutoLockMinutes = [int](Select-Setting $AutoLockMinutes 'AutoLockMinutes' 10)
 $SessionHours    = [int](Select-Setting $SessionHours 'SessionHours' 8)
 
@@ -66,6 +72,10 @@ if (-not $Project) {
 if ($Project -notmatch '^[a-z][a-z0-9-]{4,29}$') { Stop-Deploy "'$Project' does not look like a Firebase project ID." }
 if ($GoogleClientId -notmatch '^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$') {
   Stop-Deploy "Pass -GoogleClientId with your Google OAuth client ID (NNNN-xxxx.apps.googleusercontent.com)."
+}
+
+if ($MicrosoftClientId -and $MicrosoftClientId -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+  Stop-Deploy 'Pass -MicrosoftClientId with the Application (client) ID of your Microsoft app registration (a GUID).'
 }
 
 $firebase = Get-Command firebase.cmd -ErrorAction SilentlyContinue
@@ -79,12 +89,16 @@ if (-not $firebase) {
 # --- Config + deploy -----------------------------------------------------------------
 $saved['FirebaseProject'] = $Project
 $saved['GoogleClientId'] = $GoogleClientId
+if ($MicrosoftClientId) { $saved['MicrosoftClientId'] = $MicrosoftClientId }
 $saved['AutoLockMinutes'] = $AutoLockMinutes
 $saved['SessionHours'] = $SessionHours
 [System.IO.File]::WriteAllText($SettingsPath, ($saved | ConvertTo-Json) + "`n", $Utf8NoBom)
 
 Write-Step 'Writing app/assets/config.json'
-$config = [ordered]@{ googleClientId = $GoogleClientId; autoLockMinutes = $AutoLockMinutes; sessionHours = $SessionHours }
+$config = [ordered]@{ googleClientId = $GoogleClientId }
+if ($MicrosoftClientId) { $config['microsoftClientId'] = $MicrosoftClientId }
+$config['autoLockMinutes'] = $AutoLockMinutes
+$config['sessionHours'] = $SessionHours
 [System.IO.File]::WriteAllText($ConfigPath, ($config | ConvertTo-Json) + "`n", $Utf8NoBom)
 
 Write-Step "Deploying to Firebase Hosting (project $Project)"

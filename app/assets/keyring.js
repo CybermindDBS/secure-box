@@ -1,13 +1,17 @@
 /**
  * The key ring protects an account's master key ("p1": 32 random bytes).
  *
- * p1 is stored in Google Drive only in wrapped (encrypted) form, twice:
+ * p1 is stored (in each vault: Google Drive, OneDrive, this device) only in wrapped form, twice:
  *   password slot  AES-256-GCM key from the master password via PBKDF2-SHA-256 (600,000 rounds)
  *   recovery slot  AES-256-GCM key from the Emergency Kit's recovery key (256 random bits, HKDF)
  * Neither the master password nor the recovery key is ever stored anywhere.
  * Making a new Emergency Kit replaces the recovery slot, so an old kit stops working.
+ *
+ * All of a person's vaults share one master key, so each keeps a copy of the same key ring. Every
+ * change (new password, new kit) bumps its revision, and the newest copy replaces older ones. The
+ * revision is signed with the master key itself, so an old copy can't be passed off as newer.
  */
-import { decryptAesGcm, deriveAesKey, encryptAesGcm, fromBase64, importHkdfKey, randomBytes, toBase64, toHex, utf8 } from './crypto.js';
+import { decryptAesGcm, deriveAesKey, encryptAesGcm, fromBase64, hmacSha256, importHkdfKey, randomBytes, toBase64, toBase64Url, toHex, utf8 } from './crypto.js';
 
 export const KEYRING_FILE_NAME = 'Secure Box Key Ring.json';
 export const PBKDF2_ITERATIONS = 600_000;
@@ -123,7 +127,7 @@ export async function createKeyring(password, master = { kid: toHex(randomBytes(
     password: await passwordSlot(master, password),
     recovery: await recoverySlot(master, recovery),
   };
-  return { doc, master, recovery };
+  return { doc: await signRevision(doc, master, 1), master, recovery };
 }
 
 export function parseKeyring(text) {
@@ -131,11 +135,11 @@ export function parseKeyring(text) {
   try {
     doc = JSON.parse(text);
   } catch {
-    throw new KeyringError('bad-keyring', 'The key ring file in your Drive is damaged.');
+    throw new KeyringError('bad-keyring', 'The key ring file is damaged.');
   }
   const slotOk = (s) => s && typeof s.salt === 'string' && typeof s.iv === 'string' && typeof s.wrapped === 'string';
   if (!doc || doc.format !== FORMAT || typeof doc.kid !== 'string' || !slotOk(doc.password) || !slotOk(doc.recovery)) {
-    throw new KeyringError('bad-keyring', 'The key ring file in your Drive is damaged.');
+    throw new KeyringError('bad-keyring', 'The key ring file is damaged.');
   }
   if (doc.version !== 1) throw new KeyringError('bad-keyring', 'This key ring was written by a newer version of Secure Box.');
   return doc;
@@ -161,13 +165,46 @@ export async function unlockWithRecovery(doc, recoveryText) {
 }
 
 export async function withNewPassword(doc, master, password) {
-  return { ...doc, password: await passwordSlot(master, password) };
+  return signRevision({ ...doc, password: await passwordSlot(master, password) }, master, trustedRevision(doc) + 1);
 }
 
 export async function withNewRecovery(doc, master) {
   const recovery = newRecoveryKey();
-  return { doc: { ...doc, recovery: await recoverySlot(master, recovery) }, recovery };
+  return { doc: await signRevision({ ...doc, recovery: await recoverySlot(master, recovery) }, master, trustedRevision(doc) + 1), recovery };
 }
+
+// ---------------------------------------------------------------------------
+// Revisions: which copy of a key ring is the newest
+// ---------------------------------------------------------------------------
+async function revisionKey(master) {
+  const base = await crypto.subtle.importKey('raw', master.key, 'HKDF', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: utf8('secure-box/keyring-revision/v1') }, base, 256));
+}
+const revisionData = (doc, revision) => utf8(JSON.stringify([FORMAT, doc.kid, revision, doc.password, doc.recovery]));
+
+/** Stamps `doc` with `revision`, signed with the master key (HMAC over the key slots). */
+export async function signRevision(doc, master, revision) {
+  const mac = toBase64Url(await hmacSha256(await revisionKey(master), revisionData(doc, revision)));
+  const signed = { ...doc, revision, updated: new Date().toISOString(), revisionMac: mac };
+  checked.set(signed, revision);
+  return signed;
+}
+
+const checked = new WeakMap(); // doc -> revision, once verified with the master key
+
+/** Verifies a copy's revision with the master key; an unsigned or altered one counts as 0. */
+export async function verifyRevision(doc, master) {
+  let revision = 0;
+  if (Number.isSafeInteger(doc.revision) && doc.revision > 0 && typeof doc.revisionMac === 'string' && doc.kid === master.kid) {
+    const expected = toBase64Url(await hmacSha256(await revisionKey(master), revisionData(doc, doc.revision)));
+    if (expected === doc.revisionMac) revision = doc.revision;
+  }
+  checked.set(doc, revision);
+  return revision;
+}
+
+/** A copy's revision after verifyRevision() (0 before, or when it didn't check out). */
+export const trustedRevision = (doc) => checked.get(doc) ?? 0;
 
 // ---------------------------------------------------------------------------
 // Emergency Kit file and password strength
@@ -178,7 +215,7 @@ export function emergencyKitText({ email, recovery }) {
     'SECURE BOX EMERGENCY KIT',
     '========================',
     '',
-    `Account:          ${email || '(your Google account)'}`,
+    `Vault:            ${email || 'This device'}`,
     `Created:          ${date}`,
     `Recovery key ID:  ${recovery.id}`,
     '',
@@ -188,12 +225,13 @@ export function emergencyKitText({ email, recovery }) {
     '',
     'What it is for',
     '  If you forget your Secure Box master password, this key lets you set a new one:',
-    '  open Secure Box, continue with Google, choose "Forgot master password?" and load this file.',
+    '  open Secure Box and your vault, choose "Forgot master password?" and load this file.',
     '',
     'Keep it safe',
     '  * Print it, or keep it on a USB stick, somewhere only you can reach.',
-    '  * Never store it in Google Drive or send it by email: together with your Google',
-    '    account it unlocks everything in your vault.',
+    '  * Never store it in your cloud drive (Google Drive, OneDrive) or send it by email:',
+    '    together with access to your vaults it unlocks everything in them.',
+    '  * It works for all your Secure Box vaults: they share one master key.',
     '  * Making a new Emergency Kit (Secure Box menu) cancels this one.',
     '',
   ].join('\r\n');

@@ -17,12 +17,16 @@ import {
   passwordProblem,
   recoveryKeyFromKit,
   serializeKeyring,
+  trustedRevision,
   unlockWithPassword,
   unlockWithRecovery,
+  verifyRevision,
   withNewPassword,
   withNewRecovery,
 } from '../app/assets/keyring.js';
 import { looksLikeMessage, messageAccess, openMessage, readMessage, sealText } from '../app/assets/textbox.js';
+import { OneDrive } from '../app/assets/microsoft.js';
+import { createOneDriveBackend } from '../app/assets/backend.js';
 import { decodeText, extractDocx, extractOdf, extractSheet, extractSlide, looksLikeText, rtfToText } from '../app/assets/readers.js';
 import {
   LOCAL_INDEX,
@@ -602,6 +606,30 @@ test('text messages: the account and a sharing password open them; tampering is 
   await assert.rejects(sealText({ text: 'x' }), { code: 'no-key' });
 });
 
+test('key ring revisions: every change counts up, and an old copy can’t pose as newer', async () => {
+  const { doc, master } = await createKeyring('correct horse battery staple');
+  assert.equal(trustedRevision(doc), 1);
+  const changed = await withNewPassword(doc, master, 'another long master password');
+  assert.equal(trustedRevision(changed), 2);
+  const { doc: kitted } = await withNewRecovery(changed, master);
+  assert.equal(trustedRevision(kitted), 3);
+  // A copy read back from storage is trusted only after checking its signature.
+  const stored = parseKeyring(serializeKeyring(kitted));
+  assert.equal(trustedRevision(stored), 0);
+  assert.equal(await verifyRevision(stored, master), 3);
+  // Replaying the old copy with a bigger number fails the check, and counts as 0.
+  const replay = parseKeyring(serializeKeyring({ ...doc, revision: 99 }));
+  assert.equal(await verifyRevision(replay, master), 0);
+  // Another account's key can't vouch for it either; an unsigned (older) key ring is 0.
+  const other = await createKeyring('a different master password');
+  assert.equal(await verifyRevision(parseKeyring(serializeKeyring(kitted)), other.master), 0);
+  const { revision, revisionMac, ...unsigned } = kitted;
+  assert.equal(await verifyRevision(parseKeyring(serializeKeyring(unsigned)), master), 0);
+  // The new password still opens it; the old one doesn't.
+  assert.deepEqual((await unlockWithPassword(stored, 'another long master password')).key, master.key);
+  await assert.rejects(unlockWithPassword(stored, 'correct horse battery staple'));
+});
+
 test('the local vault index has its own key: it can never pass for the vault, or the other way round', async () => {
   const vaultCipher = await VaultCipher.create(masterA);
   const indexCipher = await VaultCipher.create(masterA, LOCAL_INDEX);
@@ -637,3 +665,240 @@ test('generated passwords honour length and character sets', () => {
   }
   assert.ok(passwordEntropyBits({ length: 20 }) > 110);
 });
+
+/** Runs `body` with a fake fetch answering from `routes` ([url part, handler], first match wins), recording each call. */
+async function withFakeFetch(routes, body) {
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  const realWarn = console.warn;
+  globalThis.fetch = async (url, init = {}) => {
+    const headers = init.headers || {};
+    calls.push({ url, headers, method: init.method || 'GET', body: init.body });
+    const route = routes.find(([part]) => url.includes(part));
+    if (!route) throw new TypeError('Failed to fetch'); // how a blocked or unreachable request looks
+    return route[1](headers, url);
+  };
+  console.warn = () => {};
+  try {
+    await body(calls);
+  } finally {
+    globalThis.fetch = realFetch;
+    console.warn = realWarn;
+  }
+}
+const graphFailure = (status) => new Response(JSON.stringify({ error: { code: 'x', message: `status ${status}` } }), { status });
+const jsonReply = (value) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
+const bytesReply = (headers, data) => {
+  const range = /bytes=(d+)-(d+)/.exec(headers.Range || '');
+  return range ? new Response(data.slice(Number(range[1]), Number(range[2]) + 1), { status: 206 }) : new Response(data);
+};
+const bodyText = async (res) => new TextDecoder().decode(await res.arrayBuffer());
+
+test('OneDrive reads go straight to Graph with the token, ranges included', async () => {
+  const data = new TextEncoder().encode('0123456789');
+  await withFakeFetch([['/beta/me/drive/items/F1/contentStream', (h) => bytesReply(h, data)]], async (calls) => {
+    const od = new OneDrive(() => 'token-1');
+    assert.equal(await od.readText('F1'), '0123456789');
+    assert.equal(await bodyText(await od.readRange('F1', 2, 5)), '2345');
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every((c) => c.headers.Authorization === 'Bearer token-1'));
+    assert.equal(calls[1].headers.Range, 'bytes=2-5');
+    assert.equal(od.way, 'stream');
+  });
+});
+
+test('OneDrive reads fall back to the download link (sent without the token), then to /content, and remember what works', async () => {
+  const data = new TextEncoder().encode('secret bytes');
+  const link = 'https://public.example.1drv.com/F2';
+  await withFakeFetch(
+    [
+      ['/contentStream', () => graphFailure(400)],
+      ['/v1.0/me/drive/items/F2', () => jsonReply({ id: 'F2', '@microsoft.graph.downloadUrl': link })],
+      [link, (h) => bytesReply(h, data)],
+    ],
+    async (calls) => {
+      const od = new OneDrive(() => 'token-2');
+      assert.equal(await od.readText('F2'), 'secret bytes');
+      assert.equal(od.way, 'link');
+      assert.ok(!calls.some((c) => c.url.includes('$select')), 'the whole item is asked for: a selected one often lacks the link');
+      assert.deepEqual(calls.filter((c) => c.url === link).map((c) => c.headers.Authorization), [undefined]);
+      calls.length = 0;
+      assert.equal(await bodyText(await od.readRange('F2', 0, 5)), 'secret');
+      assert.deepEqual(calls.map((c) => c.url), [link]); // the remembered way first, and its link reused
+    },
+  );
+  await withFakeFetch(
+    [
+      ['/contentStream', () => graphFailure(404)],
+      ['/v1.0/me/drive/items/F3/content', (h) => bytesReply(h, data)],
+      ['/v1.0/me/drive/items/F3', () => jsonReply({ id: 'F3' })], // no link offered
+    ],
+    async () => {
+      const od = new OneDrive(() => 'token-3');
+      assert.equal(await od.readText('F3'), 'secret bytes');
+      assert.equal(od.way, 'redirect');
+    },
+  );
+});
+
+test('OneDrive reads: an expired sign-in stops at once, and a browser that can’t ask for a range reads whole files', async () => {
+  await withFakeFetch([['/contentStream', () => graphFailure(401)]], async (calls) => {
+    await assert.rejects(new OneDrive(() => 'old').readText('F4'), (err) => err.code === 'expired');
+    assert.equal(calls.length, 1);
+  });
+  const data = new TextEncoder().encode('abcdefgh');
+  const noRanges = (h) => {
+    if (h.Range) throw new TypeError('Failed to fetch');
+    return new Response(data);
+  };
+  await withFakeFetch([['/contentStream', noRanges]], async () => {
+    const od = new OneDrive(() => 'token-5');
+    assert.equal(await bodyText(await od.readRange('F5', 2, 4)), 'cde');
+    assert.equal(od.wholeOnly, true);
+    assert.equal(await bodyText(await od.readRange('F5', 6, 7)), 'gh');
+  });
+  // A download link OneDrive refuses, even fresh, moves on to /content: it doesn't ask to sign in again.
+  const refused = 'https://public.example.1drv.com/F6';
+  await withFakeFetch(
+    [
+      ['/contentStream', () => graphFailure(400)],
+      [refused, () => graphFailure(403)],
+      ['/v1.0/me/drive/items/F6/content', (h) => bytesReply(h, data)],
+      ['/v1.0/me/drive/items/F6', () => jsonReply({ id: 'F6', '@microsoft.graph.downloadUrl': refused })],
+    ],
+    async (calls) => {
+      const od = new OneDrive(() => 'token-6');
+      assert.equal(await od.readText('F6'), 'abcdefgh');
+      assert.equal(od.way, 'redirect');
+      assert.equal(calls.filter((c) => c.url === refused).length, 2);
+    },
+  );
+});
+
+test('OneDrive folders are found or made safely: by the folder id, never replaced, and one made meanwhile is found', async () => {
+  let made = false;
+  await withFakeFetch(
+    [
+      ['/special/approot/children?', () => jsonReply({ value: made ? [{ id: 'D1', name: 'Encrypted files', folder: {} }] : [] })],
+      ['/me/drive/special/approot', () => jsonReply({ id: 'ROOT!1', name: 'Secure Box', folder: {} })],
+      [
+        '/me/drive/items/ROOT!1/children',
+        () => {
+          made = true; // another device got there first
+          return graphFailure(409);
+        },
+      ],
+    ],
+    async (calls) => {
+      assert.equal(await new OneDrive(() => 't').folder('Encrypted files'), 'D1');
+      const post = calls.find((c) => c.method === 'POST');
+      assert.ok(post.url.endsWith('/me/drive/items/ROOT!1/children'), 'made inside the folder id, not the approot alias');
+      assert.deepEqual(JSON.parse(post.body), { name: 'Encrypted files', folder: {} }); // no 'replace', ever
+    },
+  );
+  await withFakeFetch(
+    [
+      ['/special/approot/children?', () => jsonReply({ value: [{ id: 'F', name: 'Encrypted files', file: {} }] })], // a file, not a folder
+      ['/me/drive/special/approot', () => jsonReply({ id: 'ROOT!1' })],
+      ['/me/drive/items/ROOT!1/children', () => jsonReply({ id: 'D2', name: 'Encrypted files 1', folder: {} })],
+    ],
+    async () => assert.equal(await new OneDrive(() => 't').folder('Encrypted files'), 'D2'),
+  );
+});
+
+test('OneDrive: if making the files folder is refused, the first upload goes in by the folder name', async () => {
+  const link = 'https://my.microsoftpersonalcontent.com/personal/abc/_api/v2.0/uploadSession?guid=2&tempauth=K';
+  await withFakeFetch(
+    [
+      ['/special/approot/children?', () => jsonReply({ value: [] })],
+      ['/special/approot:/Encrypted%20files/abc:/createUploadSession', () => jsonReply({ uploadUrl: link })],
+      ['/me/drive/special/approot', () => jsonReply({ id: 'ROOT!1' })],
+      ['/me/drive/items/ROOT!1/children', () => new Response(JSON.stringify({ error: { code: 'invalidRequest', message: 'Invalid request' } }), { status: 400 })],
+      [link, () => jsonReply({ id: 'NEW' })],
+    ],
+    async (calls) => {
+      const backend = createOneDriveBackend({ accessToken: 't' });
+      const send = await backend.openUpload({ fid: 'abc', size: 4 });
+      assert.equal(await send(new Uint8Array(4), 0, 4), 'NEW');
+      const session = calls.find((c) => c.url.includes('createUploadSession'));
+      assert.deepEqual(JSON.parse(session.body), { item: { '@microsoft.graph.conflictBehavior': 'fail', name: 'abc' } });
+    },
+  );
+});
+
+test('OneDrive uploads: the session names the file, pieces go without the token, and errors say which request failed', async () => {
+  const link = 'https://my.microsoftpersonalcontent.com/personal/abc/_api/v2.0/uploadSession?guid=1&tempauth=SECRET';
+  await withFakeFetch(
+    [
+      [':/createUploadSession', () => jsonReply({ uploadUrl: link })],
+      [link, (h) => (h['Content-Range'] === 'bytes 10-19/20' ? jsonReply({ id: 'NEW' }) : new Response('{}', { status: 202 }))],
+    ],
+    async (calls) => {
+      const send = await new OneDrive(() => 't').startUpload({ parentId: 'P!1', name: 'file-id' });
+      assert.equal(await send(new Uint8Array(10), 0, 20), null);
+      assert.equal(await send(new Uint8Array(10), 10, 20), 'NEW');
+      const session = calls.find((c) => c.url.includes('createUploadSession'));
+      assert.deepEqual(JSON.parse(session.body), { item: { '@microsoft.graph.conflictBehavior': 'fail', name: 'file-id' } });
+      const pieces = calls.filter((c) => c.url === link);
+      assert.deepEqual(pieces.map((c) => c.headers['Content-Range']), ['bytes 0-9/20', 'bytes 10-19/20']);
+      assert.ok(pieces.every((c) => !c.headers.Authorization));
+    },
+  );
+  const invalid = () => new Response(JSON.stringify({ error: { code: 'invalidRequest', message: 'Invalid request' } }), { status: 400 });
+  await withFakeFetch([[':/createUploadSession', invalid]], async () => {
+    await assert.rejects(new OneDrive(() => 't').startUpload({ parentId: 'P!1', name: 'f' }), {
+      message: 'Invalid request (OneDrive: POST createUploadSession, 400 invalidRequest)',
+    });
+  });
+  await withFakeFetch(
+    [
+      ['_api/v2.0/uploadSession', invalid],
+      [':/createUploadSession', () => jsonReply({ uploadUrl: link })],
+    ],
+    async () => {
+      const send = await new OneDrive(() => 't').startUpload({ parentId: 'P!1', name: 'f' });
+      // Only the host: the link's key never shows up in a message.
+      await assert.rejects(send(new Uint8Array(4), 0, 4), { message: 'Invalid request (OneDrive: PUT my.microsoftpersonalcontent.com, 400 invalidRequest)' });
+    },
+  );
+});
+
+test('OneDrive streaming addresses: the download address first (via /content when not listed), then contentStream with the token', async () => {
+  const stream = (id) => ({ url: `https://graph.microsoft.com/beta/me/drive/items/${id}/contentStream`, token: 'tok' });
+  await withFakeFetch([['/v1.0/me/drive/items/S1', () => jsonReply({ id: 'S1', '@microsoft.graph.downloadUrl': 'https://dl.example.1drv.com/S1' })]], async () => {
+    assert.deepEqual(await new OneDrive(() => 'tok').streamSources('S1'), [{ url: 'https://dl.example.1drv.com/S1' }, stream('S1')]);
+  });
+  const final = 'https://my.microsoftpersonalcontent.com/personal/x/_layouts/15/download.aspx?UniqueId=1&tempauth=T';
+  await withFakeFetch(
+    [
+      ['/v1.0/me/drive/items/S2/content', () => ({ ok: true, status: 206, url: final, headers: new Headers(), body: { cancel: async () => {} } })],
+      ['/v1.0/me/drive/items/S2', () => jsonReply({ id: 'S2' })], // no link listed
+    ],
+    async (calls) => {
+      const od = new OneDrive(() => 'tok');
+      assert.deepEqual(await od.streamSources('S2'), [{ url: final }, stream('S2')]);
+      assert.equal(calls.find((c) => c.url.endsWith('/content')).headers.Range, 'bytes=0-0'); // one byte, not the file
+      calls.length = 0;
+      assert.equal((await od.streamSources('S2'))[0].url, final);
+      assert.equal(calls.length, 0, 'the address is kept for a while');
+      assert.equal((await od.streamSources('S2', { fresh: true }))[0].url, final);
+      assert.ok(calls.length > 0, 'fresh asks OneDrive again');
+    },
+  );
+  // No link, and /content can't be followed (the fake fetch throws for it, as a blocked redirect does).
+  await withFakeFetch([['/v1.0/me/drive/items/S3', (h, url) => (url.endsWith('/content') ? Promise.reject(new TypeError('Failed to fetch')) : jsonReply({ id: 'S3' }))]], async () => {
+    assert.deepEqual(await new OneDrive(() => 'tok').streamSources('S3'), [stream('S3')]);
+  });
+});
+
+test('OneDrive pieces: when OneDrive sends the whole file instead of a range, it is fetched once, not for every piece', async () => {
+  const data = new TextEncoder().encode('0123456789abcdef');
+  await withFakeFetch([['/contentStream', () => new Response(data)]], async (calls) => {
+    const od = new OneDrive(() => 't');
+    assert.equal(await bodyText(await od.readRange('W1', 0, 3)), '0123');
+    assert.equal(await bodyText(await od.readRange('W1', 4, 7)), '4567');
+    assert.equal(await bodyText(await od.readRange('W1', 12, 15)), 'cdef');
+    assert.equal(calls.length, 1);
+  });
+});
+

@@ -10,8 +10,88 @@
  */
 import { Drive } from './google.js';
 import { KEYRING_FILE_NAME } from './keyring.js';
+import { OneDrive } from './microsoft.js';
 
 export const VAULT_FILE_NAME = 'Secure Box Vault.json';
+const FILES_FOLDER = 'Encrypted files';
+
+/**
+ * OneDrive: everything lives in Secure Box's own folder, which OneDrive shows as
+ * "Apps/Secure Box" (Secure Box can't see anything else):
+ *   Secure Box Key Ring.json, Secure Box Vault.json, Encrypted files/<random id>
+ * The vault is only ever replaced if it's still the version this device last read (If-Match).
+ */
+export function createOneDriveBackend(auth) {
+  const od = new OneDrive(() => auth.accessToken);
+  const ids = { files: null, keyring: null, vault: null };
+  return {
+    kind: 'cloud',
+    provider: 'microsoft',
+    get identity() {
+      return auth.identity;
+    },
+    tokenExpiresAt: () => auth.expiresAt,
+    // The streaming worker fetches files itself, in one request each (as with Google Drive), from
+    // these addresses. Where it can't, it asks this page for the bytes.
+    describe: async (entry, { fresh = false } = {}) => {
+      const links = await od.streamSources(entry.driveId, { fresh }).catch(() => []);
+      return links.length ? { source: 'link', links } : { source: 'page' };
+    },
+
+    async load() {
+      const items = await od.listRoot();
+      const file = (name) => items.find((i) => i.name === name && i.file);
+      const keyring = file(KEYRING_FILE_NAME);
+      const vault = file(VAULT_FILE_NAME);
+      ids.keyring = keyring?.id || null;
+      ids.vault = vault?.id || null;
+      ids.files = items.find((i) => i.name === FILES_FOLDER && i.folder)?.id || null;
+      const [keyringText, vaultText] = await Promise.all([keyring && od.readText(keyring.id), vault && od.readText(vault.id)]);
+      return { keyring: keyringText || null, vault: vault ? { text: vaultText, rev: vault.eTag } : null };
+    },
+
+    async create({ keyringText, vaultText, kid }) {
+      ids.keyring = (await od.createText(KEYRING_FILE_NAME, keyringText)).id;
+      return this.createVault(vaultText, kid);
+    },
+
+    async createVault(vaultText) {
+      const item = await od.createText(VAULT_FILE_NAME, vaultText);
+      ids.vault = item.id;
+      return item.eTag;
+    },
+
+    saveKeyring: (text) => od.updateText(ids.keyring, text),
+    vaultRevision: () => od.revision(ids.vault),
+    writeVault: (text, rev) => od.updateText(ids.vault, text, rev),
+
+    async readVault() {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const before = await od.revision(ids.vault);
+        const text = await od.readText(ids.vault);
+        if ((await od.revision(ids.vault)) === before) return { text, rev: before };
+      }
+      throw new Error('The vault keeps changing on another device. Try again in a moment.');
+    },
+
+    async openUpload({ fid, signal }) {
+      if (!ids.files) {
+        try {
+          ids.files = await od.folder(FILES_FOLDER);
+        } catch (err) {
+          // Some OneDrives refuse to make a folder outright: uploading into it by name makes it.
+          if (err.code !== 'drive') throw err;
+          return od.startUpload({ folderName: FILES_FOLDER, name: fid, signal });
+        }
+      }
+      return od.startUpload({ parentId: ids.files, name: fid, signal });
+    },
+
+    trash: (id) => od.remove(id),
+    readRange: async (id, start, end) => (await od.readRange(id, start, end)).body,
+    readBytes: async (id, start, end) => (await od.readRange(id, start, end)).arrayBuffer(),
+  };
+}
 
 export function createCloudBackend(auth) {
   const drive = new Drive(() => auth.accessToken);
@@ -24,6 +104,7 @@ export function createCloudBackend(auth) {
 
   return {
     kind: 'cloud',
+    provider: 'google',
     get identity() {
       return auth.identity;
     },
@@ -88,9 +169,9 @@ export function createCloudBackend(auth) {
       throw new Error('The vault keeps changing on another device. Try again in a moment.');
     },
 
-    async openUpload({ fid, size }) {
+    async openUpload({ fid, size, signal }) {
       ids.files ??= await drive.createFolder('Encrypted files', await rootFolder(), 'files');
-      return drive.startUpload({ name: fid, parentId: ids.files, size, appProperties: { unibox: 'file' } });
+      return drive.startUpload({ name: fid, parentId: ids.files, size, appProperties: { unibox: 'file' }, signal });
     },
 
     trash: (driveId) => drive.trash(driveId),

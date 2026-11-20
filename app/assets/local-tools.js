@@ -2,9 +2,9 @@
  * Tools menu: encrypt files and folders on this device into .sbox boxes (localbox.js), and
  * decrypt them again. Nothing is uploaded.
  *
- * Where the browser allows it (Chrome and Edge on computers), results are written straight into
- * a folder you pick, a piece at a time. Elsewhere they are saved as downloads, which means each
- * result is assembled in memory first.
+ * Where the browser allows it (Chrome and Edge on computers, Chrome on Android), results are
+ * written straight into a folder you pick, a piece at a time. Elsewhere they are saved as
+ * downloads, which means each result is assembled in memory first.
  */
 import { generatePassword } from './crypto.js';
 import { formatBytes } from './filetypes.js';

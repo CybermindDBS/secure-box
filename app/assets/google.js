@@ -211,7 +211,8 @@ export class Drive {
         cache: 'no-store',
         credentials: 'omit',
       });
-    } catch {
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err; // cancelled, not offline
       throw new GoogleError('network', 'Could not reach Google Drive. Check your connection and try again.');
     }
     if (!res.ok && !(raw && res.status === 308)) throw await driveError(res);
@@ -279,7 +280,7 @@ export class Drive {
   }
 
   /** Starts a resumable upload of `size` encrypted bytes; returns a function that sends pieces. */
-  async startUpload({ name, parentId, size, appProperties }) {
+  async startUpload({ name, parentId, size, appProperties, signal }) {
     const res = await this.call(`${UPLOAD}/files?uploadType=resumable&fields=id`, {
       method: 'POST',
       headers: {
@@ -294,7 +295,7 @@ export class Drive {
     return async (piece, offset, total) => {
       const put = await this.call(
         session,
-        { method: 'PUT', headers: { 'Content-Range': `bytes ${offset}-${offset + piece.length - 1}/${total}` }, body: piece },
+        { method: 'PUT', headers: { 'Content-Range': `bytes ${offset}-${offset + piece.length - 1}/${total}` }, body: piece, signal },
         { raw: true },
       );
       return put.status === 308 ? null : (await put.json()).id;

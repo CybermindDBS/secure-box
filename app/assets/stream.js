@@ -18,7 +18,8 @@ function trustedScriptUrl(url) {
 }
 
 /**
- * `describe(fileId)` -> { entry, source: 'drive'|'page', token? } or null when locked.
+ * `describe(fileId, { fresh })` -> { entry, source: 'drive'|'link'|'page', token?, links? } or null when
+ * locked; `fresh` asks for new addresses when the old ones stopped working.
  * `read(driveId, start, end)` -> ArrayBuffer (demo mode only).
  */
 export async function startStreaming({ describe, read }) {
@@ -29,7 +30,7 @@ export async function startStreaming({ describe, read }) {
     if (!port || !msg) return;
     try {
       if (msg.type === 'unibox-describe') {
-        port.postMessage((await describe(msg.fileId)) || { error: 'locked' });
+        port.postMessage((await describe(msg.fileId, { fresh: Boolean(msg.fresh) })) || { error: 'locked' });
       } else if (msg.type === 'unibox-zip') {
         const hit = zipJobs.get(msg.jobId);
         port.postMessage(hit && hit.expires > Date.now() ? hit.job : { error: 'expired' });

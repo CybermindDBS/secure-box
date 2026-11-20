@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; worker-src 'self'; connect-src 'self' https://www.googleapis.com; manifest-src 'self'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types unibox-sw">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; worker-src 'self'; connect-src 'self' https://www.googleapis.com https://login.microsoftonline.com https://graph.microsoft.com https://*.microsoftpersonalcontent.com https://*.1drv.com https://api.onedrive.com https://*.livefilestore.com https://*.sharepoint.com; manifest-src 'self'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types unibox-sw">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <meta name="color-scheme" content="light dark">
@@ -35,6 +35,9 @@
     </section>
 
     <section class="panel" data-panel="signin" hidden>
+      <!-- The first screen: where the vault lives. The clouds come first; this device is the quiet option. -->
+      <h2 id="welcome-title">Where should your vault live?</h2>
+      <p class="welcome-lead"><span class="welcome-badge">Recommended</span> In your cloud: on all your devices, and safe if you lose one.</p>
       <button class="btn btn-google btn-block" type="button" data-action="signin">
         <svg id="google-logo" class="g-logo" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
           <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1z"/>
@@ -44,13 +47,66 @@
         </svg>
         <span id="signin-label">Continue with Google</span>
       </button>
+      <button id="signin-microsoft" class="btn btn-google btn-block btn-microsoft" type="button" data-action="signin-microsoft" hidden>
+        <svg class="g-logo" viewBox="0 0 21 21" width="18" height="18" aria-hidden="true">
+          <path fill="#f25022" d="M1 1h9v9H1z"/>
+          <path fill="#7fba00" d="M11 1h9v9h-9z"/>
+          <path fill="#00a4ef" d="M1 11h9v9H1z"/>
+          <path fill="#ffb900" d="M11 11h9v9h-9z"/>
+        </svg>
+        <span>Continue with Microsoft</span>
+      </button>
       <p id="signin-status" class="panel-status" role="status" hidden></p>
       <p id="demo-note" class="panel-note" hidden>Demo mode — sample data that lives only in this tab. Nothing is saved.</p>
       <button id="signin-other" class="link-btn" type="button" data-action="signin-other" hidden>Use a different Google account</button>
+      <div id="welcome-device" class="welcome-device">
+        <span class="welcome-or" aria-hidden="true">or</span>
+        <button class="btn btn-ghost btn-block" type="button" data-action="open-device" data-icon="device"><span>Keep it only on this device</span></button>
+        <p class="panel-note">No account needed. Not synced: you back it up yourself.</p>
+      </div>
       <div class="gate-links">
         <button class="link-btn box-open-link" type="button" data-action="box-decrypt-open">Open a .sbox file</button>
         <button class="link-btn box-open-link" type="button" data-action="text-open">Read a message</button>
       </div>
+    </section>
+
+    <section class="panel" data-panel="device-new" hidden>
+      <h2>A vault on this device</h2>
+      <p class="panel-text">Passwords and files kept here only. Nothing is uploaded, so nothing syncs: back it up now and then, and keep the backup somewhere else.</p>
+      <div id="device-new-choice" class="local-where-choice" role="radiogroup" aria-label="Where to keep it">
+        <label class="local-option">
+          <input type="radio" name="device-new-where" value="browser" checked>
+          <span><strong>In this browser</strong><small>Nothing to set up. Clearing this site’s data in the browser deletes it.</small></span>
+        </label>
+        <label class="local-option">
+          <input type="radio" name="device-new-where" value="folder">
+          <span><strong>In a folder you choose</strong><small>Ordinary encrypted files you can see, copy and back up. A synced folder (OneDrive, Dropbox, iCloud Drive) works too.</small></span>
+        </label>
+      </div>
+      <p id="device-new-browser-note" class="panel-hint">It’s kept in this browser’s private storage. Clearing this site’s data in the browser deletes it.</p>
+      <p id="device-new-error" class="form-error" role="alert" hidden></p>
+      <button class="btn btn-primary btn-block" type="button" data-action="device-create">Continue</button>
+      <button class="btn btn-ghost btn-block device-restore" type="button" data-action="device-restore-new" data-icon="upload"><span>Restore a backup…</span></button>
+      <button class="link-btn" type="button" data-action="show-welcome">Back</button>
+    </section>
+
+    <section class="panel" data-panel="device-allow" hidden>
+      <h2>Open your vault</h2>
+      <p class="panel-text">Your vault on this device is in the folder “<span id="device-allow-name"></span>”. Your browser asks once per visit before Secure Box may open it.</p>
+      <p id="device-allow-error" class="form-error" role="alert" hidden></p>
+      <button class="btn btn-primary btn-block" type="button" data-action="device-allow" data-icon="folder"><span>Open the folder</span></button>
+      <button class="link-btn" type="button" data-action="device-forget-gate">Forget this folder</button>
+      <button class="link-btn" type="button" data-action="show-welcome">Back</button>
+    </section>
+
+    <section class="panel" data-panel="device-ios" hidden>
+      <h2>Use the Home Screen app</h2>
+      <p class="panel-text">On iPhone and iPad, keep a vault on this device only in the Secure Box app on your Home Screen. Safari deletes the data of websites you haven’t opened for 7 days, and only Home Screen apps are safe from that.</p>
+      <ol class="local-steps">
+        <li>In Safari, tap Share, then Add to Home Screen.</li>
+        <li>Open Secure Box from your Home Screen.</li>
+      </ol>
+      <button class="link-btn" type="button" data-action="show-welcome">Back</button>
     </section>
 
     <section class="panel" data-panel="working" hidden>
@@ -69,10 +125,27 @@
         <label for="create-confirm">Repeat it</label>
         <input id="create-confirm" class="input" type="password" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
       </div>
-      <p class="panel-hint">Use 12+ characters — a short sentence only you would think of works well. Don't save it in your browser or Google account.</p>
+      <p class="panel-hint">Use 12+ characters — a short sentence only you would think of works well. Don't save it in your browser or online account.</p>
       <p id="create-error" class="form-error" role="alert" hidden></p>
       <button class="btn btn-primary btn-block" type="button" data-action="create-account"><span class="btn-spinner" aria-hidden="true"></span><span>Create vault</span></button>
+      <button id="create-adopt" class="link-btn" type="button" data-action="adopt-show">Already have a Secure Box vault? Use the same master password</button>
       <p id="create-who" class="panel-foot" hidden></p>
+    </section>
+
+    <section class="panel" data-panel="adopt" hidden>
+      <h2>Keep your master password</h2>
+      <p class="panel-text">Your new <span data-provider-name>OneDrive</span> vault starts empty, but opens with the master password and Emergency Kit you already have. Your <span class="mono">.sbox</span> files and local vault keep working too.</p>
+      <button id="adopt-pick" class="btn btn-ghost btn-block" type="button" data-action="adopt-pick" data-icon="key">Load your key ring backup…</button>
+      <p id="adopt-file" class="panel-status" hidden></p>
+      <div class="field">
+        <label for="adopt-password">Master password</label>
+        <input id="adopt-password" class="input" type="password" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+      </div>
+      <p class="panel-hint">No key ring backup? In your other vault: Local → Key ring backup.</p>
+      <p id="adopt-error" class="form-error" role="alert" hidden></p>
+      <button class="btn btn-primary btn-block" type="button" data-action="adopt"><span class="btn-spinner" aria-hidden="true"></span><span>Open my new vault</span></button>
+      <button class="link-btn" type="button" data-action="adopt-cancel">Create a new master password instead</button>
+      <p id="adopt-who" class="panel-foot" hidden></p>
     </section>
 
     <section class="panel" data-panel="kit" hidden>
@@ -80,7 +153,7 @@
       <p class="panel-text">If you ever forget your master password, this kit's recovery key is the only way back in.</p>
       <ul class="facts">
         <li data-icon="download" data-icon-size="16">Print it or keep it on a USB stick</li>
-        <li data-icon="alert" data-icon-size="16">Never store it in Google Drive or email</li>
+        <li data-icon="alert" data-icon-size="16">Never store it in your cloud drive or email</li>
         <li data-icon="refresh" data-icon-size="16">Make a new one any time from the ⋯ menu</li>
       </ul>
       <button id="kit-download" class="btn btn-ghost btn-block" type="button" data-action="download-kit" data-icon="download">Download Emergency Kit</button>
@@ -101,7 +174,8 @@
       <button class="btn btn-primary btn-block" type="button" data-action="unlock"><span class="btn-spinner" aria-hidden="true"></span><span>Unlock</span></button>
       <button class="link-btn" type="button" data-action="show-recover">Forgot master password?</button>
       <p id="unlock-who" class="panel-foot" hidden></p>
-      <button id="unlock-other" class="link-btn unlock-other" type="button" data-action="signin-other" hidden>Use a different Google account</button>
+      <button id="unlock-other" class="link-btn unlock-other" type="button" data-action="signin-other-current" hidden>Use a different <span data-company-name>Google</span> account</button>
+      <button id="unlock-switch" class="link-btn" type="button" data-action="show-welcome" hidden>Open another vault</button>
     </section>
 
     <section class="panel" data-panel="recover" hidden>
@@ -129,15 +203,15 @@
 
     <section class="panel" data-panel="missing-keyring" hidden>
       <h2>Key ring not found</h2>
-      <p class="panel-text">Your vault is in Google Drive, but its key ring file (<span class="mono">Secure Box Key Ring.json</span>) is missing. Restore it from Google Drive's trash, then try again.</p>
+      <p class="panel-text">Your vault is in <span data-provider-name>Google Drive</span>, but its key ring file (<span class="mono">Secure Box Key Ring.json</span>) is missing. Restore it from the trash (recycle bin) in <span data-provider-name>Google Drive</span>, then try again.</p>
       <button class="btn btn-primary btn-block" type="button" data-action="retry">Try again</button>
       <p id="missing-keyring-who" class="panel-foot" hidden></p>
-      <button class="link-btn" type="button" data-action="signin-other">Use a different Google account</button>
+      <button class="link-btn" type="button" data-action="signin-other-current">Use a different <span data-company-name>Google</span> account</button>
     </section>
 
     <section class="panel" data-panel="missing-vault" hidden>
       <h2>Vault file not found</h2>
-      <p class="panel-text">Your key ring is fine, but <span class="mono">Secure Box Vault.json</span> is missing from your Drive. Restore it from Google Drive's trash and try again — or start over with an empty vault.</p>
+      <p class="panel-text">Your key ring is fine, but <span class="mono">Secure Box Vault.json</span> is missing from your <span data-provider-name>Google Drive</span>. Restore it from the trash (recycle bin) there and try again — or start over with an empty vault.</p>
       <div class="btn-stack">
         <button class="btn btn-primary btn-block" type="button" data-action="retry">Try again</button>
         <button class="btn btn-ghost btn-block" type="button" data-action="new-vault">Start a new, empty vault</button>
@@ -160,7 +234,7 @@
   </div>
 
   <footer class="gate-foot">
-    <span>Encrypted in your browser</span><span aria-hidden="true">·</span><span>Stored in your own Google Drive</span><span aria-hidden="true">·</span><span>Master password never leaves you</span>
+    <span>Encrypted in your browser</span><span aria-hidden="true">·</span><span>Stored in your own cloud or on your device</span><span aria-hidden="true">·</span><span>Master password never leaves you</span>
   </footer>
 </main>
 
@@ -173,16 +247,13 @@
       <span id="demo-badge" class="badge" hidden>Demo</span>
     </div>
     <nav class="sections" aria-label="Sections">
-      <!-- Passwords and Files live in the cloud the label names; Local is this device only. -->
+      <!-- Passwords and Files of the vault the label names: Google Drive, OneDrive or this device. -->
       <div class="section-group" role="tablist" aria-label="Google Drive">
         <button id="source-btn" class="source-btn" type="button" popovertarget="source-menu" aria-haspopup="menu" aria-label="Google Drive: where Passwords and Files are stored" title="Passwords and Files are stored in your Google Drive" data-icon="cloud" data-icon-size="16">
           <span class="source-name">Google Drive</span><span class="source-chevron" data-icon="chevronDown" data-icon-size="14"></span>
         </button>
         <button type="button" role="tab" data-section="passwords" aria-selected="true" data-icon="key" data-icon-size="16"><span>Passwords</span></button>
         <button type="button" role="tab" data-section="files" aria-selected="false" data-icon="folder" data-icon-size="16"><span>Files</span></button>
-      </div>
-      <div class="section-group" role="tablist" aria-label="This device">
-        <button type="button" role="tab" data-section="local" aria-selected="false" data-icon="device" data-icon-size="16" title="Local: encrypted files and tools on this device only"><span>Local</span></button>
       </div>
     </nav>
     <label class="search" data-icon="search">
@@ -196,6 +267,10 @@
       <button class="icon-btn" type="button" data-action="lock" data-icon="lock" aria-label="Lock" title="Lock"></button>
     </div>
   </header>
+
+  <!-- This device's vault: where it's kept, whether the browser protects it, backups -->
+  <div id="vault-status" class="local-status vault-status" hidden></div>
+  <div id="vault-switching" class="vault-switching" role="status" hidden></div>
 
   <div id="passwords-view" class="layout">
     <section class="list-pane" aria-label="Vault items">
@@ -220,7 +295,6 @@
         <button class="btn btn-primary btn-sm" type="button" data-action="upload-files" data-icon="upload" data-icon-size="16" title="Upload files (U)"><span>Upload</span></button>
         <button class="btn btn-ghost btn-sm" type="button" data-action="upload-folder" data-icon="folderUp" data-icon-size="16" title="Upload a whole folder"><span>Upload folder</span></button>
         <button class="btn btn-ghost btn-sm" type="button" data-action="new-folder" data-icon="folderPlus" data-icon-size="16" title="New folder (N)"><span>New folder</span></button>
-        <button id="tools-btn" class="btn btn-ghost btn-sm local-only" type="button" popovertarget="tools-menu" aria-haspopup="menu" data-icon="wrench" data-icon-size="16" title="Tools: .sbox files, text, backups"><span>Tools</span></button>
         <button class="icon-btn view-toggle" type="button" popovertarget="view-options" data-icon="sliders" aria-label="View options" title="View options"></button>
         <!-- Inline on wider screens; on phones a sheet that the View options button opens. -->
         <div id="view-options" class="view-options" popover>
@@ -249,7 +323,6 @@
         </div>
       </div>
     </div>
-    <div id="local-status" class="local-status" hidden></div>
     <div id="selection-bar" class="selection-bar" hidden>
       <span id="selection-count"></span>
       <button class="btn btn-ghost btn-sm" type="button" data-action="sel-download" data-icon="download" data-icon-size="16" title="Download (several items download as one .zip that keeps their folders)"><span>Download</span></button>
@@ -266,25 +339,28 @@
       <div class="drop-card"><span data-icon="upload" data-icon-size="28"></span><p>Drop to encrypt and <span id="drop-verb">upload to</span> <strong id="drop-target"></strong></p></div>
     </div>
   </section>
-
-  <!-- Local tab before its vault is open: set it up, or use the tools -->
-  <section id="local-setup" class="local-setup" hidden aria-label="Local"></section>
 </div>
 
 <div id="source-menu" class="menu source-menu" popover data-anchor="#source-btn" data-align="left">
   <div class="menu-head">
-    <span class="menu-label">Passwords and Files are stored in</span>
+    <span class="menu-label">Your vaults: one master password opens them all</span>
   </div>
-  <div class="source-option is-current">
+  <button class="source-option" type="button" data-action="source-switch" data-provider="google">
     <span data-icon="cloud" data-icon-size="18"></span>
-    <span class="source-option-text"><strong>Google Drive</strong><small id="source-email"></small></span>
+    <span class="source-option-text"><strong>Google Drive</strong><small></small></span>
     <span class="source-check" data-icon="check" data-icon-size="16"></span>
-  </div>
-  <div class="source-option is-soon" aria-disabled="true">
+  </button>
+  <button class="source-option" type="button" data-action="source-switch" data-provider="microsoft">
     <span data-icon="cloud" data-icon-size="18"></span>
-    <span class="source-option-text"><strong>OneDrive</strong><small>Coming soon</small></span>
-  </div>
-  <p class="source-foot">Local keeps things on this device only, with no cloud at all.</p>
+    <span class="source-option-text"><strong>OneDrive</strong><small></small></span>
+    <span class="source-check" data-icon="check" data-icon-size="16"></span>
+  </button>
+  <button class="source-option" type="button" data-action="source-switch" data-provider="local">
+    <span data-icon="device" data-icon-size="18"></span>
+    <span class="source-option-text"><strong>This device</strong><small></small></span>
+    <span class="source-check" data-icon="check" data-icon-size="16"></span>
+  </button>
+  <p class="source-foot">Each keeps its own passwords and files. The clouds sync across your devices; This device keeps them here only.</p>
 </div>
 
 <div id="pw-menu" class="menu" popover data-anchor="#pw-menu-btn">
@@ -292,27 +368,26 @@
   <button class="menu-item" type="button" data-action="export-csv" data-icon="download">Export passwords (CSV)…</button>
 </div>
 
-<div id="tools-menu" class="menu" popover data-anchor="#tools-btn">
-  <button class="menu-item" type="button" data-action="box-encrypt-open" data-icon="lock">Encrypt files to .sbox…</button>
-  <button class="menu-item" type="button" data-action="box-decrypt-open" data-icon="unlock">Decrypt .sbox files…</button>
-  <button class="menu-item" type="button" data-action="text-open" data-icon="note">Encrypt or decrypt text…</button>
-  <div class="menu-sep" role="separator"></div>
-  <button id="tools-backup" class="menu-item" type="button" data-action="local-backup" data-icon="download">Back up the local vault</button>
-  <button class="menu-item" type="button" data-action="local-restore" data-icon="upload">Restore a backup…</button>
-  <button id="tools-forget" class="menu-item" type="button" data-action="local-forget" data-icon="folder" hidden>Stop using this folder…</button>
-  <div class="menu-sep" role="separator"></div>
-  <button class="menu-item" type="button" data-action="export-keyring" data-icon="key">Export key ring backup…</button>
-</div>
-
 <div id="menu" class="menu" popover data-anchor="#menu-btn">
   <div class="menu-head">
-    <span class="menu-label">Signed in as</span>
+    <span class="menu-label">Open vault</span>
     <span id="account-email" class="menu-email"></span>
   </div>
   <button class="menu-item" type="button" data-action="sync" data-icon="refresh">Sync now</button>
+  <div id="menu-device" hidden>
+    <button id="menu-device-backup" class="menu-item" type="button" data-action="device-backup" data-icon="download">Back up this vault</button>
+    <button class="menu-item" type="button" data-action="device-restore" data-icon="upload">Restore a backup…</button>
+    <button id="menu-device-forget" class="menu-item" type="button" data-action="device-forget" data-icon="folder">Stop using this folder…</button>
+  </div>
   <div class="menu-sep" role="separator"></div>
   <button class="menu-item" type="button" data-action="change-password" data-icon="key">Change master password…</button>
   <button class="menu-item" type="button" data-action="new-kit" data-icon="shield">New Emergency Kit…</button>
+  <button class="menu-item" type="button" data-action="export-keyring" data-icon="archive">Key ring backup…</button>
+  <div class="menu-sep" role="separator"></div>
+  <span class="menu-group" aria-hidden="true">Tools</span>
+  <button class="menu-item" type="button" data-action="box-encrypt-open" data-icon="lock">Encrypt files to .sbox…</button>
+  <button class="menu-item" type="button" data-action="box-decrypt-open" data-icon="unlock">Decrypt .sbox files…</button>
+  <button class="menu-item" type="button" data-action="text-open" data-icon="note">Encrypt or decrypt text…</button>
   <div class="menu-sep" role="separator"></div>
   <a class="menu-item" href="https://github.com/CybermindDBS/secure-box" target="_blank" rel="noopener noreferrer" data-icon="code">Source code (AGPL-3.0)</a>
   <button class="menu-item" type="button" data-action="lock" data-icon="lock">Lock</button>
@@ -453,7 +528,7 @@
 <dialog id="reconnect" class="dialog dialog-sm" aria-labelledby="reconnect-title">
   <div class="dialog-body">
     <h2 id="reconnect-title">Reconnect Google Drive</h2>
-    <p class="panel-text">For your security, Google's access lasts one hour. Reconnect to keep working — your vault stays unlocked.</p>
+    <p id="reconnect-text" class="panel-text">For your security, Google's access lasts one hour. Reconnect to keep working — your vault stays unlocked.</p>
     <p id="reconnect-status" class="panel-status" role="status" hidden></p>
   </div>
   <div class="dialog-foot">
@@ -538,7 +613,7 @@
       <input id="box-open-password" class="input mono" type="password" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
     </div>
     <div id="box-keyring" class="box-keyring" hidden>
-      <p class="panel-hint">Files made with a Secure Box account open with that account’s key ring backup (⋯ menu → Export key ring backup) and its master password or recovery key.</p>
+      <p class="panel-hint">Files made with a Secure Box vault open with its key ring backup (in an open vault: ⋯ → Key ring backup) and its master password or recovery key.</p>
       <button class="btn btn-ghost btn-block" type="button" data-action="box-pick-keyring" data-icon="key">Load key ring backup…</button>
       <p id="box-keyring-name" class="box-selection" hidden></p>
       <div class="field">
@@ -598,6 +673,27 @@
   <div class="dialog-foot">
     <button class="btn btn-ghost" type="button" data-action="text-close">Close</button>
     <button class="btn btn-primary" type="button" data-action="text-go"><span class="btn-spinner" aria-hidden="true"></span><span id="text-go-label">Encrypt</span></button>
+  </div>
+</dialog>
+
+<dialog id="device-where" class="dialog dialog-sm" aria-labelledby="device-where-title">
+  <div class="dialog-body">
+    <h2 id="device-where-title">Where on this device?</h2>
+    <p class="panel-text">Your vault on this device opens with your current master password. Nothing in it is uploaded.</p>
+    <div class="local-where-choice" role="radiogroup" aria-label="Where to keep it">
+      <label class="local-option">
+        <input type="radio" name="device-where" value="browser" checked>
+        <span><strong>In this browser</strong><small>Nothing to set up. Clearing this site’s data in the browser deletes it.</small></span>
+      </label>
+      <label class="local-option">
+        <input type="radio" name="device-where" value="folder">
+        <span><strong>In a folder you choose</strong><small>Ordinary encrypted files you can see, copy and back up. A synced folder works too.</small></span>
+      </label>
+    </div>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn btn-ghost" type="button" data-close="cancel">Cancel</button>
+    <button class="btn btn-primary" type="button" data-close="ok">Continue</button>
   </div>
 </dialog>
 

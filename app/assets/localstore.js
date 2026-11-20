@@ -1,24 +1,29 @@
 /**
- * Local vault: encrypted files kept on this device only. Nothing here is uploaded, and it
- * unlocks together with the account (its index is sealed with a key derived from the master key).
+ * The "This device" vault: passwords and files kept on this device only. It works like the cloud
+ * vaults (same key ring, same encryption, same app), but nothing in it is ever uploaded.
  *
  * Where it lives
  *   browser  the browser's private storage for Secure Box (the "origin private file system").
  *            Works in every modern browser, phones included, but isn't visible as files and goes
  *            away if someone clears this site's data, so we ask for persistent storage (the
  *            browser then never clears it on its own) and make backups easy.
- *   folder   a folder you choose (Chrome and Edge on computers): ordinary encrypted files you can
- *            see, copy or keep in a synced folder. The browser asks once per visit to allow it.
+ *   folder   a folder you choose (Chrome and Edge on computers, Chrome on Android): ordinary
+ *            encrypted files you can see, copy or keep in a synced folder. The browser asks once
+ *            per visit to allow it.
  *
- * Layout, in either place:   index.json   folders, files and their keys, encrypted (LOCAL_INDEX)
- *                             files/<id>   one encrypted blob per file (fileformat.js)
- * In a chosen folder, these sit in a "Secure Box" subfolder. Anything else found there is a file
- * someone put in by hand: still unencrypted, so the app offers to encrypt it (see strays()).
+ * Layout, in either place:   keyring.json   the key ring (your master key, locked)
+ *                             index.json     the vault: passwords, folders, files and their keys,
+ *                                            encrypted with a key of its own (LOCAL_INDEX)
+ *                             files/<id>     one encrypted blob per file (fileformat.js)
+ * In the browser, each vault has a folder named after its master key's id. In a chosen folder,
+ * the vault sits in a "Secure Box" subfolder; anything else found there was put in by hand and is
+ * still unencrypted, so the app offers to encrypt it (strays()).
  */
 import { zipEntries, zipEntryData, zipFolder } from './localbox.js';
-import { LOCAL_INDEX, VaultCipher, applyChange, parseEnvelope } from './vault.js';
+import { LOCAL_INDEX } from './vault.js';
 
 const VAULT_DIR = 'Secure Box';
+const KEYRING = 'keyring.json';
 const INDEX = 'index.json';
 const FILES = 'files';
 const ID_PREFIX = 'local:';
@@ -27,6 +32,14 @@ const DB_NAME = 'secure-box-local';
 const IGNORED = /^(\..*|desktop\.ini|thumbs\.db|.*\.crswap)$/i; // hidden files, OS clutter, a browser's half-written files
 
 export const isLocalId = (driveId) => typeof driveId === 'string' && driveId.startsWith(ID_PREFIX);
+
+export class LocalError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'LocalError';
+    this.code = code;
+  }
+}
 
 /** What this browser can do. On iPhone and iPad, only Home Screen apps are safe from Safari's 7-day clean-up. */
 export function localSupport() {
@@ -41,7 +54,7 @@ export function localSupport() {
 }
 
 // ---------------------------------------------------------------------------
-// A chosen folder is remembered per account in IndexedDB (a handle, no secrets)
+// Chosen folders are remembered per master key id in IndexedDB (a handle, no secrets)
 // ---------------------------------------------------------------------------
 function idb(mode, run) {
   return new Promise((resolve, reject) => {
@@ -66,10 +79,9 @@ function idb(mode, run) {
 
 const spaceKey = (kid, demo) => (demo ? `demo:${kid}` : kid);
 
-async function browserRoot(kid, demo, create) {
+async function browserBase(demo, create) {
   const opfs = await navigator.storage.getDirectory();
-  const base = await opfs.getDirectoryHandle(demo ? 'secure-box-demo' : 'secure-box', { create });
-  return base.getDirectoryHandle(kid, { create });
+  return opfs.getDirectoryHandle(demo ? 'secure-box-demo' : 'secure-box', { create });
 }
 
 async function has(dir, name, kind = 'file') {
@@ -83,33 +95,44 @@ async function has(dir, name, kind = 'file') {
 
 /** The vault's own folder inside a chosen folder (or the chosen folder itself, if that's the one). */
 async function folderRoot(picked, create) {
-  if (await has(picked, INDEX)) return picked;
+  if ((await has(picked, INDEX)) || (await has(picked, KEYRING))) return picked;
   return picked.getDirectoryHandle(VAULT_DIR, { create });
 }
 
-/** Where this account's local vault is on this device: { where, handle?, name?, ready } or null. */
-export async function findLocalVault(kid, { demo = false } = {}) {
+/**
+ * The local vaults on this device: [{ kid, where, handle?, name, ready, complete }]. `ready` is
+ * false for a folder that needs permission again; `complete` is false for a vault from before
+ * vaults kept their own key ring (it gets one the next time it's opened while unlocked).
+ */
+export async function findLocalVaults({ demo = false } = {}) {
   const support = localSupport();
+  const found = [];
   if (support.folder && !demo) {
-    const handle = await idb('readonly', (s) => s.get(spaceKey(kid, demo))).catch(() => null);
-    if (handle) {
+    const keys = await idb('readonly', (s) => s.getAllKeys()).catch(() => []);
+    for (const kid of keys || []) {
+      const handle = await idb('readonly', (s) => s.get(kid)).catch(() => null);
+      if (!handle) continue;
       let permission = 'prompt';
       try {
         permission = await handle.queryPermission({ mode: 'readwrite' });
       } catch {
         /* treated as "ask again" */
       }
-      return { where: 'folder', handle, name: handle.name, ready: permission === 'granted' };
+      found.push({ kid, where: 'folder', handle, name: handle.name, ready: permission === 'granted', complete: true });
     }
   }
   if (support.browser) {
     try {
-      if (await has(await browserRoot(kid, demo, false), INDEX)) return { where: 'browser', ready: true };
+      const base = await browserBase(demo, false);
+      for await (const [kid, dir] of base.entries()) {
+        if (dir.kind !== 'directory' || !(await has(dir, INDEX))) continue;
+        found.push({ kid, where: 'browser', name: 'This browser', ready: true, complete: await has(dir, KEYRING) });
+      }
     } catch {
       /* no local vault in this browser */
     }
   }
-  return null;
+  return found;
 }
 
 /** Asks for access to a remembered folder again; needs a click. */
@@ -122,128 +145,178 @@ export async function forgetFolder(kid, { demo = false } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// The store
+// The backend (same calls as the cloud ones in backend.js)
 // ---------------------------------------------------------------------------
 /**
- * Opens (or with `create`, makes) this account's local vault. `notify()` is called after each
- * save so other windows can reload. Errors: 'other-account' when a folder's vault belongs to
- * another account.
+ * `kid` names an existing vault in the browser (or comes with create()); `handle` is a chosen
+ * folder. `notify()` runs after each save, so other windows can reload.
  */
-export async function openLocalVault({ master, where, handle = null, create = false, demo = false, notify = () => {} }) {
-  const cipher = await VaultCipher.create(master, LOCAL_INDEX);
-  const root = where === 'folder' ? await folderRoot(handle, create) : await browserRoot(master.kid, demo, create);
-  const filesDir = await root.getDirectoryHandle(FILES, { create: true });
-  const lockName = `secure-box-local:${where}:${spaceKey(master.kid, demo)}`;
-  const withLock = (run) => (navigator.locks ? navigator.locks.request(lockName, run) : run());
-  let index = null;
+export function createLocalBackend({ where = 'browser', handle = null, kid = null, demo = false, notify = () => {} }) {
+  let root = null;
+  let filesDir = null;
   let stamp = '';
+  let currentKid = kid;
 
-  async function readIndex() {
-    let file;
+  const lockName = () => `secure-box-local:${where}:${spaceKey(currentKid || handle?.name || 'new', demo)}`;
+  const withLock = (run) => (navigator.locks ? navigator.locks.request(lockName(), run) : run());
+
+  async function open(create = false) {
+    if (root) return root;
+    if (where === 'folder') root = await folderRoot(handle, create);
+    else {
+      if (!currentKid) throw new LocalError('missing', 'There is no vault on this device yet.');
+      root = await (await browserBase(demo, create)).getDirectoryHandle(currentKid, { create });
+    }
+    filesDir = await root.getDirectoryHandle(FILES, { create: true });
+    return root;
+  }
+
+  async function readFile(name) {
     try {
-      file = await (await root.getFileHandle(INDEX)).getFile();
+      return await (await (await open()).getFileHandle(name)).getFile();
     } catch (err) {
       if (err.name === 'NotFoundError') return null;
       throw err;
     }
-    const nextStamp = `${file.lastModified}:${file.size}`;
-    if (index && nextStamp === stamp) return index;
-    const env = parseEnvelope(await file.text(), LOCAL_INDEX.format);
-    if (env.kid !== master.kid) {
-      const err = new Error('This folder holds the local vault of a different Secure Box account.');
-      err.code = 'other-account';
-      throw err;
-    }
-    index = await cipher.open(env);
-    stamp = nextStamp;
-    return index;
   }
 
-  async function writeIndex(data) {
-    const handle = await root.getFileHandle(INDEX, { create: true });
-    const writable = await handle.createWritable(); // replaces the old index in one step, on close()
-    await writable.write(await cipher.seal(data));
+  async function writeFile(name, text) {
+    const handleOf = await (await open(true)).getFileHandle(name, { create: true });
+    const writable = await handleOf.createWritable(); // replaces the old file in one step, on close()
+    await writable.write(text);
     await writable.close();
-    const file = await handle.getFile();
-    index = data;
-    stamp = `${file.lastModified}:${file.size}`;
+    return handleOf.getFile();
   }
 
-  await withLock(async () => {
-    if (!(await readIndex())) {
-      if (!create) throw new Error('The local vault on this device is missing.');
-      await writeIndex({ schema: 2, items: [], folders: [], files: [], created: Date.now(), changedAt: 0, backupAt: 0 });
-    }
-  });
-  if (where === 'folder') await idb('readwrite', (s) => s.put(handle, spaceKey(master.kid, demo)));
+  const stampOf = (file) => (file ? `${file.lastModified}:${file.size}` : '');
+
+  async function remember() {
+    if (where === 'folder' && currentKid) await idb('readwrite', (s) => s.put(handle, spaceKey(currentKid, demo))).catch(() => {});
+  }
 
   const fid = (driveId) => {
     const id = isLocalId(driveId) ? driveId.slice(ID_PREFIX.length) : '';
-    if (!/^[0-9a-f-]{36}$/i.test(id)) throw new Error('Not a file of the local vault.');
+    if (!/^[0-9a-f-]{36}$/i.test(id)) throw new Error('Not a file of this device’s vault.');
     return id;
   };
+
   async function blobOf(driveId) {
+    await open();
     try {
       return await (await filesDir.getFileHandle(fid(driveId))).getFile();
     } catch (err) {
-      if (err.name === 'NotFoundError') throw new Error('This file is missing from the local vault on this device.');
+      if (err.name === 'NotFoundError') throw new Error('This file is missing from the vault on this device.');
       throw err;
     }
   }
 
-  const store = {
+  const backend = {
     kind: 'local',
+    provider: 'local',
     where,
-    name: where === 'folder' ? handle.name : 'This browser',
-    getVault: () => index,
+    vaultPurpose: LOCAL_INDEX,
+    get kid() {
+      return currentKid;
+    },
+    get name() {
+      return where === 'folder' ? handle.name : 'This browser';
+    },
+    get identity() {
+      return { sub: `local:${currentKid || ''}`, email: '' };
+    },
+    tokenExpiresAt: () => Infinity,
+    describe: () => ({ source: 'page' }), // the streaming worker asks this page for the bytes
 
-    /** Applies a change to the latest index (another window may have saved first). */
-    commit(change) {
+    async load() {
+      if (where === 'browser' && !currentKid) return { keyring: null, vault: null }; // a new vault, not made yet
+      try {
+        await open(where === 'folder');
+      } catch (err) {
+        if (err.name === 'NotFoundError' && where === 'browser') return { keyring: null, vault: null };
+        throw err;
+      }
+      const [keyringFile, indexFile] = await Promise.all([readFile(KEYRING), readFile(INDEX)]);
+      const keyring = keyringFile ? await keyringFile.text() : null;
+      if (keyring && !currentKid) {
+        try {
+          currentKid = JSON.parse(keyring).kid;
+        } catch {
+          /* the app reports a damaged key ring */
+        }
+      }
+      await remember();
+      stamp = stampOf(indexFile);
+      return { keyring, vault: indexFile ? { text: await indexFile.text(), rev: stamp } : null };
+    },
+
+    async create({ keyringText, vaultText, kid: newKid }) {
+      currentKid ||= newKid;
+      await open(true);
+      await writeFile(KEYRING, keyringText);
+      const rev = await this.createVault(vaultText);
+      await remember();
+      return rev;
+    },
+
+    async createVault(vaultText) {
       return withLock(async () => {
-        const latest = await readIndex();
-        const next = change.op === 'set' ? { ...latest, ...change.fields } : { ...applyChange(latest, change), changedAt: Date.now() };
-        await writeIndex(next);
+        stamp = stampOf(await writeFile(INDEX, vaultText));
         notify();
-        return next;
+        return stamp;
       });
     },
 
-    /** Picks up another window's changes; true when something changed. */
-    async reload() {
-      const before = index;
-      await withLock(readIndex);
-      return index !== before;
+    async saveKeyring(text) {
+      await writeFile(KEYRING, text);
     },
 
-    backend: {
-      async readRange(driveId, start, end) {
-        return (await blobOf(driveId)).slice(start, end + 1).stream();
-      },
-      async readBytes(driveId, start, end) {
-        return (await blobOf(driveId)).slice(start, end + 1).arrayBuffer();
-      },
-      async openUpload({ fid: id }) {
-        const handle = await filesDir.getFileHandle(id, { create: true });
-        const writable = await handle.createWritable();
-        const send = async (piece, offset, total) => {
-          await writable.write(piece);
-          if (offset + piece.length < total) return null;
-          await writable.close();
-          return `${ID_PREFIX}${id}`;
-        };
-        send.abort = async () => {
-          await writable.abort().catch(() => {});
-          await filesDir.removeEntry(id).catch(() => {});
-        };
-        return send;
-      },
-      async trash(driveId) {
-        await filesDir.removeEntry(fid(driveId)).catch((err) => {
-          if (err.name !== 'NotFoundError') throw err;
-        });
-      },
+    vaultRevision: async () => stampOf(await readFile(INDEX)),
+
+    /** Replaces the vault, but only if it's still the version this window last read. */
+    writeVault(text, rev) {
+      return withLock(async () => {
+        const now = stampOf(await readFile(INDEX));
+        if (rev && now !== rev) throw new LocalError('conflict', 'The vault changed in another window.');
+        stamp = stampOf(await writeFile(INDEX, text));
+        notify();
+        return stamp;
+      });
     },
 
+    async readVault() {
+      const file = await readFile(INDEX);
+      if (!file) throw new LocalError('missing', 'The vault on this device is missing.');
+      return { text: await file.text(), rev: stampOf(file) };
+    },
+
+    async openUpload({ fid: id }) {
+      await open(true);
+      const fileHandle = await filesDir.getFileHandle(id, { create: true });
+      const writable = await fileHandle.createWritable();
+      const send = async (piece, offset, total) => {
+        await writable.write(piece);
+        if (offset + piece.length < total) return null;
+        await writable.close();
+        return `${ID_PREFIX}${id}`;
+      };
+      send.abort = async () => {
+        await writable.abort().catch(() => {});
+        await filesDir.removeEntry(id).catch(() => {});
+      };
+      return send;
+    },
+
+    async trash(driveId) {
+      await open();
+      await filesDir.removeEntry(fid(driveId)).catch((err) => {
+        if (err.name !== 'NotFoundError') throw err;
+      });
+    },
+
+    readRange: async (driveId, start, end) => (await blobOf(driveId)).slice(start, end + 1).stream(),
+    readBytes: async (driveId, start, end) => (await blobOf(driveId)).slice(start, end + 1).arrayBuffer(),
+
+    // ---- Keeping it safe --------------------------------------------------
     /** 'files' (a real folder), 'protected' (the browser won't clear it by itself) or 'unprotected'. */
     async protection() {
       if (where === 'folder') return 'files';
@@ -253,58 +326,56 @@ export async function openLocalVault({ master, where, handle = null, create = fa
     async protect() {
       return Boolean(await navigator.storage?.persist?.());
     },
-    async usage() {
-      return where === 'browser' && navigator.storage?.estimate ? navigator.storage.estimate() : null;
-    },
 
-    /** Unencrypted files someone put into the vault's folder by hand (folder vaults only). */
+    /** Unencrypted files someone put into a folder vault by hand. */
     async strays() {
       if (where !== 'folder') return [];
+      const top = await open();
       const found = [];
       const walk = async (dir, path) => {
         for await (const [name, entry] of dir.entries()) {
-          if (IGNORED.test(name) || (dir === root && (name === INDEX || name === FILES))) continue;
+          if (IGNORED.test(name) || (dir === top && [KEYRING, INDEX, FILES].includes(name))) continue;
           if (entry.kind === 'file') found.push({ name, path, parent: dir, file: await entry.getFile() });
           else await walk(entry, [...path, name]);
         }
       };
-      await walk(root, []);
+      await walk(top, []);
       return found;
     },
-    /** Removes an original after it was encrypted, then any folders that are left empty. */
     async removeStray(stray) {
       await stray.parent.removeEntry(stray.name);
     },
     async pruneEmptyFolders() {
+      const top = await open();
       const prune = async (dir) => {
         let empty = true;
         for await (const [name, entry] of dir.entries()) {
-          if (entry.kind === 'directory' && !(dir === root && name === FILES) && (await prune(entry))) await dir.removeEntry(name).catch(() => {});
+          if (entry.kind === 'directory' && !(dir === top && name === FILES) && (await prune(entry))) await dir.removeEntry(name).catch(() => {});
           else empty = false;
         }
         return empty;
       };
-      await prune(root);
+      await prune(top);
     },
 
+    // ---- Backups ----------------------------------------------------------
     /**
-     * One ZIP of the vault exactly as stored: the encrypted index and blobs, nothing decrypted.
-     * It opens only with this account, so it can be kept anywhere.
+     * One ZIP of the vault exactly as stored: key ring, vault and file blobs, nothing decrypted.
+     * It opens only with your master password or Emergency Kit, so it can be kept anywhere.
      */
-    async backup({ onProgress, signal } = {}) {
-      const { indexText, files } = await withLock(async () => {
-        await readIndex();
-        const text = await (await (await root.getFileHandle(INDEX)).getFile()).text();
-        return { indexText: text, files: index.files };
-      });
+    async backup(fileEntries, { onProgress, signal } = {}) {
+      const [keyringFile, indexFile] = await Promise.all([readFile(KEYRING), readFile(INDEX)]);
+      if (!keyringFile || !indexFile) throw new LocalError('missing', 'The vault on this device is incomplete.');
       const now = Date.now();
-      const manifest = { format: BACKUP_FORMAT, version: 1, kid: master.kid, created: new Date(now).toISOString(), files: files.length };
+      const manifest = { format: BACKUP_FORMAT, version: 2, kid: currentKid, created: new Date(now).toISOString(), files: fileEntries.length };
+      const text = (name, value) => ({ path: name, file: new File([value], name, { lastModified: now }) });
       const items = [
-        { path: 'backup.json', file: new File([JSON.stringify(manifest, null, 2)], 'backup.json', { lastModified: now }) },
-        { path: 'index.json', file: new File([indexText], 'index.json', { lastModified: now }) },
+        text('backup.json', JSON.stringify(manifest, null, 2)),
+        text(KEYRING, await keyringFile.text()),
+        text(INDEX, await indexFile.text()),
         { path: `${FILES}/`, dir: true, mtime: now },
       ];
-      for (const entry of files) {
+      for (const entry of fileEntries) {
         try {
           items.push({ path: `${FILES}/${fid(entry.driveId)}`, file: await blobOf(entry.driveId) });
         } catch {
@@ -312,67 +383,76 @@ export async function openLocalVault({ master, where, handle = null, create = fa
         }
       }
       const blob = await zipFolder(items, { onProgress, signal });
-      await store.commit({ op: 'set', fields: { backupAt: now } });
-      return { blob, name: `Secure Box local vault backup ${new Date(now).toISOString().slice(0, 10)}.zip` };
+      return { blob, name: `Secure Box backup (this device) ${new Date(now).toISOString().slice(0, 10)}.zip` };
     },
 
-    /** Adds what's in a backup and not here yet. Returns how many files were added. */
-    async restore(file, { onProgress, signal } = {}) {
-      const content = { size: file.size, read: async (from, to) => new Uint8Array(await file.slice(from, to + 1).arrayBuffer()) };
-      const notBackup = () => new Error('That isn’t a Secure Box local vault backup, or it’s damaged.');
-      let entries;
+    /** Copies one file's encrypted blob out of a backup (see readBackup) into this vault. */
+    async restoreBlob(backup, driveId, onBytes) {
+      await open(true);
+      const id = fid(driveId);
+      const entry = backup.blob(id);
+      if (!entry) return false;
+      const writable = await (await filesDir.getFileHandle(id, { create: true })).createWritable();
       try {
-        entries = await zipEntries(content);
-      } catch {
-        throw notBackup();
-      }
-      const byPath = new Map(entries.map((e) => [e.path, e]));
-      const readText = async (path) => {
-        const entry = byPath.get(path);
-        if (!entry || entry.size > 64 * 1024 * 1024) throw notBackup();
-        const parts = [];
-        for await (const bytes of zipEntryData(content, entry)) parts.push(bytes);
-        return new Blob(parts).text();
-      };
-      let manifest;
-      try {
-        manifest = JSON.parse(await readText('backup.json'));
-      } catch {
-        throw notBackup();
-      }
-      if (manifest?.format !== BACKUP_FORMAT) throw notBackup();
-      if (manifest.version !== 1) throw new Error('That backup was made by a newer version of Secure Box.');
-      if (manifest.kid !== master.kid) throw new Error('That backup belongs to a different Secure Box account.');
-      const saved = await cipher.open(parseEnvelope(await readText('index.json'), LOCAL_INDEX.format));
-      const current = await withLock(readIndex);
-      const haveFiles = new Set(current.files.map((f) => f.id));
-      const haveFolders = new Set(current.folders.map((f) => f.id));
-      const todo = saved.files.filter((f) => !haveFiles.has(f.id) && byPath.has(`${FILES}/${fid(f.driveId)}`));
-      const total = todo.reduce((n, f) => n + byPath.get(`${FILES}/${fid(f.driveId)}`).size, 0) || 1;
-      let copied = 0;
-      const changes = saved.folders.filter((f) => !haveFolders.has(f.id)).map((folder) => ({ op: 'folder-put', folder }));
-      for (const entry of todo) {
-        signal?.throwIfAborted();
-        const id = fid(entry.driveId);
-        const writable = await (await filesDir.getFileHandle(id, { create: true })).createWritable();
-        try {
-          for await (const bytes of zipEntryData(content, byPath.get(`${FILES}/${id}`))) {
-            signal?.throwIfAborted();
-            await writable.write(bytes);
-            copied += bytes.length;
-            onProgress?.(copied / total);
-          }
-          await writable.close();
-        } catch (err) {
-          await writable.abort().catch(() => {});
-          await filesDir.removeEntry(id).catch(() => {});
-          throw err;
+        for await (const bytes of zipEntryData(backup.content, entry)) {
+          await writable.write(bytes);
+          onBytes?.(bytes.length);
         }
-        changes.push({ op: 'file-put', file: entry });
+        await writable.close();
+        return true;
+      } catch (err) {
+        await writable.abort().catch(() => {});
+        await filesDir.removeEntry(id).catch(() => {});
+        throw err;
       }
-      if (changes.length) await store.commit({ op: 'batch', changes });
-      return todo.length;
     },
   };
-  return store;
+  return backend;
+}
+
+/**
+ * Reads a backup ZIP: { manifest, keyring, index, blob(id) -> zip entry, content, size(id) }.
+ * Older backups (version 1) have no key ring: they can only be added to a vault that's open.
+ */
+export async function readBackup(file) {
+  const content = { size: file.size, read: async (from, to) => new Uint8Array(await file.slice(from, to + 1).arrayBuffer()) };
+  const notBackup = () => new LocalError('not-backup', 'That isn’t a Secure Box backup, or it’s damaged.');
+  let entries;
+  try {
+    entries = await zipEntries(content);
+  } catch {
+    throw notBackup();
+  }
+  const byPath = new Map(entries.map((e) => [e.path, e]));
+  const readText = async (path, optional = false) => {
+    const entry = byPath.get(path);
+    if (!entry) {
+      if (optional) return null;
+      throw notBackup();
+    }
+    if (entry.size > 64 * 1024 * 1024) throw notBackup();
+    const parts = [];
+    for await (const bytes of zipEntryData(content, entry)) parts.push(bytes);
+    return new Blob(parts).text();
+  };
+  let manifest;
+  try {
+    manifest = JSON.parse(await readText('backup.json'));
+  } catch {
+    throw notBackup();
+  }
+  if (manifest?.format !== BACKUP_FORMAT) throw notBackup();
+  if (manifest.version !== 1 && manifest.version !== 2) throw new LocalError('newer', 'That backup was made by a newer version of Secure Box.');
+  return {
+    manifest,
+    keyring: await readText(KEYRING, true),
+    index: await readText(INDEX),
+    content,
+    blob: (id) => byPath.get(`${FILES}/${id}`) || null,
+    blobIds: () =>
+      entries
+        .filter((e) => !e.dir && e.path.startsWith(`${FILES}/`))
+        .map((e) => e.path.slice(FILES.length + 1))
+        .filter((id) => /^[0-9a-f-]{36}$/i.test(id)),
+  };
 }

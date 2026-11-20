@@ -1,6 +1,6 @@
 /**
  * Files section: a file manager over the encrypted index in the vault. File names and folders
- * only exist inside the vault; Google Drive just holds opaque, randomly named blobs.
+ * only exist inside the vault; the cloud drive just holds opaque, randomly named blobs.
  */
 import { MAX_FILE_SIZE, createPieceWriter, decryptFile, encryptFile, layout } from './fileformat.js';
 import { canThumbnail, formatBytes, guessType, kindOf, typeLabel } from './filetypes.js';
@@ -56,7 +56,7 @@ const timeOf = (item) => {
 };
 
 /**
- * `ctx.cloud` is the Google Drive store; the local vault's store can be switched in with
+ * `ctx.cloud` is the cloud store (Google Drive or OneDrive); the local vault's store can be switched in with
  * useStore(). A store is { kind: 'cloud'|'local', getVault(), commit(change), backend(),
  * ensure(), fresh(ms) }, and each one keeps its own folder, search and selection.
  */
@@ -77,7 +77,7 @@ export function createFilesView(ctx) {
   let processing = false;
   const vault = () => store.getVault();
   const isLocal = () => store.kind === 'local';
-  const rootName = () => (isLocal() ? 'Local vault' : 'All files');
+  const rootName = () => 'All files';
   const folderById = (id) => vault().folders.find((f) => f.id === id);
   const fileById = (id) => vault().files.find((f) => f.id === id);
 
@@ -102,7 +102,7 @@ export function createFilesView(ctx) {
   async function fetchBytes(file) {
     if (ctx.streaming()) {
       const res = await fetch(fileUrl(file.id), { cache: 'no-store' });
-      if (!res.ok) throw new Error(res.status === 401 ? 'Google access expired. Reconnect and try again.' : await res.text());
+      if (!res.ok) throw new Error(res.status === 401 ? 'Access to your cloud drive expired. Reconnect and try again.' : await res.text());
       return res.arrayBuffer();
     }
     return new Blob(await decryptHere(file)).arrayBuffer();
@@ -112,7 +112,7 @@ export function createFilesView(ctx) {
   async function fetchRange(file, start, end) {
     if (ctx.streaming()) {
       const res = await fetch(fileUrl(file.id), { headers: { Range: `bytes=${start}-${end}` }, cache: 'no-store' });
-      if (!res.ok) throw new Error(res.status === 401 ? 'Google access expired. Reconnect and try again.' : await res.text());
+      if (!res.ok) throw new Error(res.status === 401 ? 'Access to your cloud drive expired. Reconnect and try again.' : await res.text());
       return new Uint8Array(await res.arrayBuffer());
     }
     return new Uint8Array(await new Blob(await decryptHere(file)).arrayBuffer()).subarray(start, end + 1);
@@ -649,7 +649,7 @@ export function createFilesView(ctx) {
       title: `Delete ${label}?`,
       message: isLocal()
         ? `This deletes ${label}${inside} from the local vault on this device. It can’t be undone.`
-        : `This removes ${label}${inside} from Secure Box on every device. The encrypted copies go to your Google Drive trash.`,
+        : `This removes ${label}${inside} from Secure Box on every device. ${ctx.cloud.trashNote()}`,
       confirmLabel: 'Delete',
       danger: true,
     });
@@ -767,10 +767,11 @@ export function createFilesView(ctx) {
     const thumbnail = canThumbnail({ name: file.name, type }) ? await makeThumbnail(file, type) : null;
     const plan = layout({ size: file.size, thumbBytes: thumbnail?.length || 0 });
     task.status = 'uploading';
-    const send = await s.backend().openUpload({ fid: id, size: plan.total });
+    const send = await s.backend().openUpload({ fid: id, size: plan.total, signal: task.abort.signal });
     const writer = createPieceWriter({
       total: plan.total,
       send,
+      pieceSize: send.pieceSize, // OneDrive wants multiples of 320 KiB
       onProgress: (p) => {
         task.progress = p;
         updateTransfer(task);
@@ -831,7 +832,7 @@ export function createFilesView(ctx) {
     renderTransfers();
   }
 
-  const STATUS = { queued: 'Waiting', preparing: 'Preparing…', uploading: 'Encrypting & uploading', done: 'Encrypted & saved', error: 'Failed', cancelled: 'Cancelled', paused: 'Paused — Google access expired' };
+  const STATUS = { queued: 'Waiting', preparing: 'Preparing…', uploading: 'Encrypting & uploading', done: 'Encrypted & saved', error: 'Failed', cancelled: 'Cancelled', paused: 'Paused — sign-in expired' };
   const statusText = (task) => (task.status === 'uploading' && task.store.kind === 'local' ? 'Encrypting & saving' : STATUS[task.status]);
 
   function transferRow(task) {
@@ -881,9 +882,13 @@ export function createFilesView(ctx) {
     const failed = transfers.filter((t) => t.status === 'error').length;
     const paused = transfers.some((t) => t.status === 'paused');
     const saving = transfers.length > 0 && transfers.every((t) => t.store.kind === 'local');
+    const stopped = transfers.filter((t) => t.status === 'cancelled').length;
     $('#transfers-title').textContent = active
       ? `${saving ? 'Saving' : 'Uploading'} ${active} ${active === 1 ? 'file' : 'files'}`
-      : paused ? 'Uploads paused' : failed ? `${failed} ${failed === 1 ? 'file' : 'files'} failed` : saving ? 'All saved' : 'Uploads complete';
+      : paused ? 'Uploads paused'
+      : failed ? `${failed} ${failed === 1 ? 'file' : 'files'} failed`
+      : stopped ? `${stopped} ${stopped === 1 ? 'upload' : 'uploads'} stopped`
+      : saving ? 'All saved' : 'Uploads complete';
     $('#transfers-resume').hidden = !paused;
     $('#transfer-list').replaceChildren(...transfers.map(transferRow));
     for (const task of transfers) $(`#transfer-list [data-id="${task.id}"] .transfer-fill`)?.style.setProperty('--progress', String(task.progress));
@@ -986,7 +991,7 @@ export function createFilesView(ctx) {
       renderTransfers();
     },
     'transfers-resume': async () => {
-      await ctx.cloud.ensure(); // only Google Drive uploads pause (its access lasts an hour)
+      await ctx.cloud.ensure(); // only cloud uploads pause, when the sign-in runs out
       for (const t of transfers) if (t.status === 'paused') t.status = 'queued';
       renderTransfers();
       processQueue();
@@ -1025,9 +1030,28 @@ export function createFilesView(ctx) {
       Object.assign(view, navs.get(next) || { folder: null, query: '', selected: new Set(), anchor: null });
     },
     goTo: (folder, options) => openFolder(folder && folderById(folder) ? folder : null, options),
+    /** Another vault was opened: start at the top, nothing selected. */
+    reset() {
+      Object.assign(view, { folder: null, query: '', selected: new Set(), anchor: null });
+      releaseUrls();
+    },
     enqueue: (items, target, s) => enqueue(items, target, s),
+    /** Another vault opened: its uploads (done, stopped or failed) aren't this vault's to retry. */
+    clearTransfers() {
+      if (transfers.some((t) => ['queued', 'preparing', 'uploading', 'paused'].includes(t.status))) return;
+      transfers.length = 0;
+      renderTransfers();
+    },
+    /** Stops every upload, and resolves once all of them have stopped. */
+    async stopAll() {
+      const running = transfers.filter((t) => ['queued', 'preparing', 'uploading', 'paused'].includes(t.status));
+      for (const task of running) cancelTask(task);
+      await Promise.all(running.map((t) => t.finished));
+    },
     upload: () => upload(),
     busy: () => transfers.some((t) => ['queued', 'preparing', 'uploading'].includes(t.status)),
+    /** Uploads still to finish, counting ones paused until the sign-in is renewed. */
+    unfinished: () => transfers.some((t) => ['queued', 'preparing', 'uploading', 'paused'].includes(t.status)),
     searchKey(event) {
       if (event.key === 'Escape' && view.query) {
         event.preventDefault();

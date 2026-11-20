@@ -212,6 +212,10 @@ strong {
   border-color: var(--text-3);
 }
 
+.btn-google + .btn-google {
+  margin-top: 10px;
+}
+
 .btn-spinner {
   display: none;
   width: 14px;
@@ -469,7 +473,25 @@ strong {
   height: 100dvh;
   display: grid;
   grid-template-columns: minmax(0, 1fr); /* never wider than the screen */
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+/* Fixed rows: the status bars are often hidden, and the open section keeps the stretchy row. */
+.app > .topbar {
+  grid-row: 1;
+}
+
+.app > .vault-status {
+  grid-row: 2;
+}
+
+.app > .vault-switching {
+  grid-row: 3;
+}
+
+.app > #passwords-view,
+.app > #files-view {
+  grid-row: 4;
 }
 
 .topbar {
@@ -1565,14 +1587,34 @@ a.menu-item {
   display: flex;
   align-items: center;
   gap: 10px;
+  width: 100%;
   padding: 9px 10px;
+  border: 0;
   border-radius: 8px;
+  background: none;
   color: var(--text-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.source-option:hover:not(:disabled),
+.source-option:focus-visible {
+  outline: none;
+  background: var(--hover);
+}
+
+.source-option:disabled {
+  cursor: default;
 }
 
 .source-option.is-current {
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+.source-option:not(.is-current) .source-check {
+  visibility: hidden;
 }
 
 .source-option.is-soon {
@@ -3687,6 +3729,84 @@ a.menu-item {
   display: block;
   color: var(--text-2);
   font-size: 12.5px;
+}
+
+/* First screen: the clouds first, this device as the quiet option */
+.welcome-lead {
+  margin: -2px 0 14px;
+  color: var(--text-2);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.welcome-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.welcome-device {
+  margin-top: 18px;
+}
+
+.welcome-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.welcome-or::before,
+.welcome-or::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.welcome-device .btn {
+  color: var(--text-2);
+  font-weight: 520;
+}
+
+.welcome-device .panel-note {
+  margin-top: 8px;
+}
+
+.device-restore {
+  margin-top: 8px;
+}
+
+.panel .local-where-choice {
+  margin-bottom: 14px;
+}
+
+/* This device's vault: the bar under the top bar */
+.app > .vault-status {
+  margin: 8px 20px 0;
+}
+
+.vault-switching {
+  margin: 8px 20px 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+}
+
+@media (max-width: 760px) {
+  .app > .vault-status,
+  .vault-switching {
+    margin: 6px 8px 0;
+  }
 }
 
 /* Upload totals */

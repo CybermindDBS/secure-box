@@ -5,7 +5,7 @@
  * (PBKDF2) unwraps the master key -> vault decrypted in this browser. Nothing is stored anywhere
  * else; the app itself is only static files.
  */
-import { createCloudBackend } from './backend.js';
+import { createCloudBackend, createOneDriveBackend } from './backend.js';
 import { generatePassword, passwordEntropyBits } from './crypto.js';
 import { DEMO_PASSWORD, createDemoBackend } from './demo.js';
 import { createFilesView } from './files-view.js';
@@ -20,13 +20,16 @@ import {
   passwordStrength,
   recoveryKeyFromKit,
   serializeKeyring,
+  trustedRevision,
   unlockWithPassword,
   unlockWithRecovery,
+  verifyRevision,
   withNewPassword,
   withNewRecovery,
 } from './keyring.js';
 import { createLocalTools } from './local-tools.js';
-import { allowFolder, findLocalVault, forgetFolder, isLocalId, localSupport, openLocalVault } from './localstore.js';
+import { MicrosoftError, beginMicrosoftSignIn, reconnectMicrosoftWithPopup, refreshMicrosoft, takeMicrosoftRedirect } from './microsoft.js';
+import { allowFolder, createLocalBackend, findLocalVaults, forgetFolder, localSupport, readBackup } from './localstore.js';
 import { forgetStreams, startStreaming } from './stream.js';
 import { $, $$, avatar, confirmDialog, copyText, downloadFile, formatDate, h, icon, pickFile, relativeTime, toast } from './ui.js';
 import { VaultCipher, VaultError, applyChange, emptyVault, hostnameOf, itemsFromCsv, itemsToCsv, makeItem, parseEnvelope, safeHref } from './vault.js';
@@ -49,6 +52,10 @@ const SECTION_KEY = 'unibox.section';
 const GENERATOR_KEY = 'unibox.generator';
 const LOCKED_AT_KEY = DEMO ? 'unibox.demo.lockedAt' : 'unibox.lockedAt'; // last lock in any window (no secrets)
 const SILENT_KEY = 'unibox.silentSignIn';
+// The demo keeps its own: trying it never changes which vault the real app opens.
+const PROVIDER_KEY = DEMO ? 'unibox.demo.provider' : 'unibox.provider'; // the vault used last: 'google', 'microsoft' or 'local'
+const DEVICE_KEY = DEMO ? 'unibox.demo.deviceVault' : 'unibox.deviceVault'; // which vault on this device, and where ({ kid, where }; no secrets)
+const BACKUP_KEY = DEMO ? 'unibox.demo.deviceBackupAt' : 'unibox.deviceBackupAt'; // when this device's vault was last backed up, per key id
 // Secure Box windows of this browser talk over this channel: an unlocked window hands its session
 // to a new one, and locking locks them all. Only pages from Secure Box's own address can join it,
 // and demo windows use a channel of their own.
@@ -63,6 +70,8 @@ const state = {
   identity: null,
   loaded: null, // { keyring, vault } as found in Drive
   keyringDoc: null,
+  provider: null, // the open vault: 'google', 'microsoft' or 'local'
+  auths: {}, // cloud sign-ins of this session, by provider
   master: null,
   cipher: null,
   vault: null,
@@ -76,6 +85,7 @@ const state = {
   revealed: new Set(),
   pendingApp: null,
   pendingKit: null,
+  adoptDoc: null, // a key ring brought from the other cloud, for a new vault with the same master password
   recoveryText: '',
   streaming: false,
   lockMessage: '', // why this window is locked, shown once on the unlock screen
@@ -88,17 +98,25 @@ let files = null;
 let streamingStarted = Promise.resolve();
 // File and text tools (.sbox files, messages). Opening them also works while locked, with a sharing password.
 const tools = createLocalTools({ master: () => (state.unlocked ? state.master : null) });
-// The local vault on this device (the Local tab): found when the tab first opens.
-const local = { store: null, found: undefined, error: '', busy: '', strays: [] };
+// What the files view works on: the open vault, wherever it lives.
 const cloudStore = {
-  kind: 'cloud',
+  get kind() {
+    return state.backend?.kind === 'local' ? 'local' : 'cloud';
+  },
   getVault: () => state.vault,
   commit: (change) => commit(change),
   backend: () => state.backend,
   ensure: () => ensureDrive(),
   fresh: (ms) => driveFresh(ms),
+  trashNote: () =>
+    state.provider === 'microsoft'
+      ? 'The encrypted copies go to your OneDrive recycle bin.'
+      : state.provider === 'local'
+        ? 'They’re deleted from this device for good.'
+        : 'The encrypted copies go to your Google Drive trash.',
 };
-let localFiles = null; // the local vault as the files view sees it
+// The This device vault's status bar: protection, backups, files put in by hand.
+const device = { busy: '', strays: [], protection: '' };
 
 start().catch((err) => {
   console.error(err);
@@ -120,8 +138,7 @@ async function start() {
   }[reason] || '';
   state.lockMessage = lockMessage;
 
-  const read = (id, a, b) => (isLocalId(id) ? local.store.backend.readBytes(id, a, b) : state.backend.readBytes(id, a, b));
-  const streaming = startStreaming({ describe: describeForStream, read }).then((ok) => {
+  const streaming = startStreaming({ describe: describeForStream, read: (id, a, b) => state.backend.readBytes(id, a, b) }).then((ok) => {
     state.streaming = ok;
   });
   streamingStarted = streaming;
@@ -129,12 +146,14 @@ async function start() {
   if (DEMO) {
     showWorking('Preparing the demo vault…');
     state.backend = await createDemoBackend();
+    state.demoBackend = state.backend; // the demo's stand-in for Google Drive
     state.identity = state.backend.identity;
+    state.provider = 'google';
     state.config = { autoLockMinutes: 10, sessionHours: 8 };
     await streaming;
     listenToOtherWindows();
     if (!reason && (await joinOtherWindow())) return;
-    showSignIn({ message: lockMessage });
+    showWelcome({ message: lockMessage });
     return;
   }
 
@@ -144,38 +163,378 @@ async function start() {
     return;
   }
   listenToOtherWindows();
+  renderSource();
   let auth;
   try {
-    auth = takeGoogleRedirect(state.config.googleClientId);
+    if (new URLSearchParams(location.hash.slice(1)).has('state')) showWorking('Signing in…');
+    auth = (await takeMicrosoftRedirect(state.config.microsoftClientId)) || takeGoogleRedirect(state.config.googleClientId);
   } catch (err) {
-    // A background sign-in that needs the person (signed out, another account…) just shows the button.
-    showSignIn(err.silent ? { message: lockMessage } : { message: err.message, tone: 'error' });
+    // A background sign-in that needs the person (signed out, another account…) just shows the choices.
+    showWelcome(err.silent ? { message: lockMessage } : { message: err.message, tone: 'error' });
     return;
   }
   // Another unlocked Secure Box window in this browser can hand over its session: no sign-in,
   // no password. Not right after a lock, which locks every window anyway.
   if (!reason && (await joinOtherWindow(auth))) return;
   if (!auth) {
-    // Signed in here before: ask Google in the background, so only the master password is left.
-    if (silentSignInAllowed()) silentSignIn(reason);
-    else showSignIn({ message: lockMessage });
+    // Back to the vault used last: this device's straight away, a cloud's after a background sign-in.
+    await streaming;
+    if (lastProvider() === 'local' && (await openDeviceVault({ quiet: true }))) return;
+    if (lastProvider() !== 'local' && silentSignInAllowed()) silentSignIn(reason);
+    else showWelcome({ message: lockMessage });
     return;
   }
-  state.auth = auth;
-  state.identity = auth.identity;
-  saveHint(auth.identity.email);
+  useAuth(auth);
   if (!auth.driveGranted) {
+    const microsoft = auth.provider === 'microsoft';
     showError({
-      title: 'Google Drive access is needed',
-      message: 'Secure Box stores your encrypted vault and files in your own Google Drive. Continue with Google again and leave the Drive permission ticked.',
+      title: `${providerName()} access is needed`,
+      message: microsoft
+        ? 'Secure Box keeps your encrypted vault and files in its own folder in your OneDrive. Continue with Microsoft again and allow access to that folder.'
+        : 'Secure Box stores your encrypted vault and files in your own Google Drive. Continue with Google again and leave the Drive permission ticked.',
       action: 'signin-consent',
-      actionLabel: 'Continue with Google',
+      actionLabel: `Continue with ${microsoft ? 'Microsoft' : 'Google'}`,
     });
     return;
   }
-  state.backend = createCloudBackend(auth);
+  state.backend = backendFor(auth);
   await streaming;
   await openAccount();
+}
+
+// ---------------------------------------------------------------------------
+// Vaults: Google Drive, OneDrive or this device. They share one master key.
+// ---------------------------------------------------------------------------
+const PROVIDERS = ['google', 'microsoft', 'local'];
+const microsoftReady = () => Boolean(state.config?.microsoftClientId) && !DEMO;
+const currentProvider = () => state.provider || lastProvider();
+const providerName = (provider = currentProvider()) => ({ microsoft: 'OneDrive', local: 'This device' })[provider] || 'Google Drive';
+const companyName = (provider = currentProvider()) => (provider === 'microsoft' ? 'Microsoft' : 'Google');
+const isDevice = () => state.backend?.kind === 'local';
+
+function lastProvider() {
+  try {
+    const saved = localStorage.getItem(PROVIDER_KEY);
+    return PROVIDERS.includes(saved) ? saved : 'google';
+  } catch {
+    return 'google';
+  }
+}
+
+function rememberProvider(provider) {
+  try {
+    localStorage.setItem(PROVIDER_KEY, provider);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Which vault on this device was used last (its key id and where it lives; nothing secret). */
+function deviceChoice() {
+  try {
+    return JSON.parse(localStorage.getItem(DEVICE_KEY) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function rememberDeviceChoice(choice) {
+  try {
+    localStorage.setItem(DEVICE_KEY, JSON.stringify(choice));
+  } catch {
+    /* ignore */
+  }
+}
+
+const backendFor = (auth) => (auth.provider === 'microsoft' ? createOneDriveBackend(auth) : createCloudBackend(auth));
+const notifyVaultChanged = () => channel?.postMessage({ type: 'vault-changed', provider: 'local', kid: state.master?.kid });
+const cipherFor = (master, backend = state.backend) => VaultCipher.create(master, backend?.vaultPurpose);
+
+function useAuth(auth) {
+  auth.provider ||= 'google';
+  state.auth = auth;
+  state.auths[auth.provider] = auth;
+  state.provider = auth.provider;
+  state.identity = auth.identity;
+  saveHint(auth.identity.email, auth.provider);
+  rememberProvider(auth.provider);
+  renderSource();
+}
+
+/** Who and where, for the unlock screen and the vault menu: "Google Drive · you@example.com". */
+function vaultLabel() {
+  const where = isDevice() ? state.backend.name : state.identity?.email || '';
+  return where ? `${providerName()} · ${where}` : providerName();
+}
+
+/** The vault's name wherever the page shows it, and the vault menu. */
+function renderSource() {
+  const provider = currentProvider();
+  const name = providerName(provider);
+  const button = $('#source-btn');
+  button.querySelector('.source-name').textContent = name;
+  button.firstElementChild.replaceWith(icon(provider === 'local' ? 'device' : 'cloud', 16));
+  button.title = provider === 'local' ? 'Passwords and Files are kept on this device only' : `Passwords and Files are stored in your ${name}`;
+  button.setAttribute('aria-label', `${name}: where Passwords and Files are kept`);
+  button.closest('.section-group').setAttribute('aria-label', name);
+  for (const el of $$('[data-provider-name]')) el.textContent = name;
+  for (const el of $$('[data-company-name]')) el.textContent = companyName(provider === 'local' ? 'google' : provider);
+  for (const option of $$('.source-option[data-provider]')) {
+    const { provider: p } = option.dataset;
+    const current = state.unlocked && p === provider;
+    const available = p !== 'microsoft' || microsoftReady();
+    option.classList.toggle('is-current', current);
+    option.classList.toggle('is-soon', !available);
+    option.disabled = current || !available;
+    const sub = current
+      ? p === 'local' ? state.backend?.name || '' : state.identity?.email || ''
+      : !available ? 'Coming soon'
+      : p === 'local' ? 'Only on this device, not synced'
+      : state.auths[p] ? `Open · ${state.auths[p].identity.email}` : `Sign in with ${companyName(p)}`;
+    option.querySelector('small').textContent = sub;
+  }
+}
+
+/** A cloud sign-in in a pop-up, while Secure Box stays unlocked. Must come from a click. */
+async function signInPopup(provider) {
+  if (provider === 'microsoft') return reconnectMicrosoftWithPopup({ clientId: state.config.microsoftClientId, loginHint: readHint('microsoft') });
+  return { ...(await reconnectWithPopup({ clientId: state.config.googleClientId, loginHint: readHint('google') })), provider: 'google' };
+}
+
+/**
+ * Opens another vault without locking: the master key stays in memory, so a vault with the same
+ * key opens without a password, and a place without a vault gets one, with the same password.
+ */
+async function switchVault(provider) {
+  if (!PROVIDERS.includes(provider) || provider === state.provider || !state.unlocked) return;
+  if (tools.busy()) return toast('Finish or cancel the open tool first.', 'error');
+  if (files?.unfinished()) {
+    // Unfinished uploads (paused ones too) belong to this vault: stop them before another one opens.
+    const ok = await confirmDialog({
+      title: 'Stop the uploads?',
+      message: state.provider === 'local'
+        ? 'Some files haven’t finished saving to your vault on this device. Stop them and switch? They won’t be saved.'
+        : `Some files haven’t finished uploading to your ${providerName()} vault. Stop them and switch? They won’t be saved.`,
+      confirmLabel: 'Stop and switch',
+    });
+    if (!ok) return;
+    await files.stopAll();
+  }
+  try {
+    let backend;
+    let auth = null;
+    if (provider === 'local') {
+      backend = await deviceBackendForSession();
+      if (!backend) return;
+    } else if (DEMO) {
+      backend = state.demoBackend;
+    } else {
+      auth = state.auths[provider];
+      if (!auth || auth.expiresAt - Date.now() < 2 * 60_000) auth = await signInPopup(provider);
+      if (!auth.driveGranted) throw new Error(`Secure Box needs access to ${providerName(provider)}. Try again and allow it.`);
+      auth.provider = provider;
+      saveHint(auth.identity.email, provider);
+      backend = backendFor(auth);
+    }
+    showSwitching(provider);
+    const loaded = await backend.load();
+    let doc = loaded.keyring ? parseKeyring(loaded.keyring) : null;
+    if (!doc && loaded.vault) {
+      // A vault from before vaults kept their own key ring: give it ours, if it's ours.
+      const env = parseEnvelope(loaded.vault.text, backend.vaultPurpose?.format);
+      if (env.kid !== state.master.kid) throw new Error(`The vault in ${providerName(provider)} belongs to a different Secure Box key.`);
+      await backend.saveKeyring(serializeKeyring(state.keyringDoc));
+      doc = state.keyringDoc;
+    }
+    if (doc && doc.kid !== state.master.kid) {
+      const ok = await confirmDialog({
+        title: 'A different master password',
+        message: `The vault in ${providerName(provider)} was made with another master password. Secure Box locks, and you can open it with that one.`,
+        confirmLabel: 'Lock and open it',
+      });
+      if (!ok) return;
+      if (auth) state.auths[provider] = auth;
+      rememberProvider(provider);
+      return lock('manual');
+    }
+    const cipher = await cipherFor(state.master, backend);
+    let vault;
+    let rev;
+    if (!doc) {
+      // Nothing there yet: set up a vault with the same master password.
+      const ok = await confirmDialog({
+        title: `Set up ${providerName(provider)}?`,
+        message:
+          provider === 'local'
+            ? 'Your vault on this device starts empty and opens with your current master password and Emergency Kit. Nothing in it is uploaded.'
+            : `Your new ${providerName(provider)} vault starts empty and opens with your current master password and Emergency Kit.`,
+        confirmLabel: 'Set it up',
+      });
+      if (!ok) return;
+      vault = emptyVault();
+      rev = await backend.create({ keyringText: serializeKeyring(state.keyringDoc), vaultText: await cipher.seal(vault), kid: state.master.kid });
+      doc = state.keyringDoc;
+    } else {
+      doc = await syncKeyring(doc, backend);
+      if (loaded.vault) {
+        const env = parseEnvelope(loaded.vault.text, cipher.format);
+        vault = await cipher.open(env);
+        rev = loaded.vault.rev;
+      } else {
+        vault = emptyVault();
+        rev = await backend.createVault(await cipher.seal(vault), state.master.kid);
+      }
+    }
+    enterVault({ provider, backend, auth, keyringDoc: doc, cipher, vault, rev });
+    toast(`Opened ${provider === 'local' ? 'your vault on this device' : `your ${providerName(provider)} vault`}`);
+  } catch (err) {
+    console.error(err);
+    if (err?.code !== 'cancelled') toast(err.message || 'Couldn’t open that vault.', 'error');
+  } finally {
+    hideSwitching();
+  }
+}
+
+/** This device's vault for the unlocked key: found, or (after asking where) a new one. */
+async function deviceBackendForSession() {
+  const support = localSupport();
+  if (support.ios && !support.standalone) {
+    await confirmDialog({
+      title: 'Use the Home Screen app',
+      message: 'On iPhone and iPad, keep a vault on this device only in the Secure Box app on your Home Screen: Safari deletes the data of websites you haven’t opened for 7 days. Tap Share → Add to Home Screen, then open Secure Box from there.',
+      confirmLabel: 'OK',
+    });
+    return null;
+  }
+  if (!support.browser && !support.folder) throw new Error('This browser can’t keep a vault on this device. Use an up-to-date Chrome, Edge, Firefox or Safari.');
+  const vaults = await findLocalVaults({ demo: DEMO });
+  let pick = vaults.find((v) => v.kid === state.master.kid);
+  if (!pick) {
+    const choice = await chooseDeviceWhere();
+    if (!choice) return null;
+    pick = { kid: state.master.kid, ...choice, ready: true };
+  }
+  if (pick.where === 'folder' && !pick.ready && !(await allowFolder(pick.handle))) throw new Error('Secure Box wasn’t allowed to open the folder.');
+  return createLocalBackend({ where: pick.where, handle: pick.handle || null, kid: pick.kid, demo: DEMO, notify: notifyVaultChanged });
+}
+
+/** Where a new vault on this device goes: the browser's storage, or a folder (Chrome and Edge on computers, Chrome on Android). */
+async function chooseDeviceWhere() {
+  if (!localSupport().folder || DEMO) return { where: 'browser' };
+  const dialog = $('#device-where');
+  dialog.returnValue = '';
+  dialog.querySelector('input[value="browser"]').checked = true;
+  const result = await new Promise((resolve) => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true });
+    dialog.showModal();
+  });
+  if (result !== 'ok') return null;
+  if (dialog.querySelector('input[value="folder"]').checked) {
+    try {
+      return { where: 'folder', handle: await window.showDirectoryPicker({ id: 'secure-box-local', mode: 'readwrite' }) };
+    } catch (err) {
+      if (err.name === 'AbortError') return null;
+      throw err;
+    }
+  }
+  navigator.storage?.persist?.().catch(() => {}); // ask the browser to keep it (Firefox asks the person)
+  return { where: 'browser' };
+}
+
+function showSwitching(provider) {
+  const bar = $('#vault-switching');
+  bar.textContent = `Opening ${providerName(provider)}…`;
+  bar.hidden = false;
+}
+
+function hideSwitching() {
+  $('#vault-switching').hidden = true;
+}
+
+/** Makes another vault the open one (no reload, no password: same master key). */
+function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev }) {
+  if (auth) {
+    state.auths[provider] = auth;
+    state.auth = auth;
+    state.identity = auth.identity;
+  } else {
+    state.auth = null;
+    state.identity = backend.identity;
+  }
+  Object.assign(state, { provider, backend, keyringDoc, cipher, vault, rev, lastSync: Date.now(), selectedId: null, query: '' });
+  state.loaded = null;
+  state.revealed.clear();
+  rememberProvider(provider);
+  if (provider === 'local') rememberDeviceChoice({ kid: state.master.kid, where: backend.where });
+  forgetStreams();
+  files.reset();
+  files.clearTransfers();
+  $('#search').value = '';
+  $('#account-email').textContent = vaultLabel();
+  renderSource();
+  setSection(state.section, { push: false });
+  history.replaceState(navState(), '');
+  setSyncStatus('idle');
+  renderDeviceStatus();
+  if (provider === 'local') checkStrays();
+}
+
+/** Keeps every copy of the key ring at the newest revision. `doc` was just read from `backend`. */
+async function syncKeyring(doc, backend) {
+  const theirs = await verifyRevision(doc, state.master);
+  const ours = trustedRevision(state.keyringDoc);
+  if (theirs > ours) {
+    state.keyringDoc = doc;
+    spreadKeyring(backend).catch((err) => console.warn('Key ring update:', err));
+    return doc;
+  }
+  if (ours > theirs) await backend.saveKeyring(serializeKeyring(state.keyringDoc)).catch((err) => console.warn('Key ring update:', err));
+  return state.keyringDoc;
+}
+
+/**
+ * Brings every vault Secure Box can reach right now up to the newest key ring: the open one, the
+ * one on this device and the clouds signed in this session. The newest copy anywhere wins.
+ */
+async function spreadKeyring(alreadyDone = null) {
+  if (!state.unlocked && !state.master) return;
+  const kid = state.master.kid;
+  const reach = [];
+  if (state.backend && state.backend !== alreadyDone) reach.push(state.backend);
+  const here = (await findLocalVaults({ demo: DEMO }).catch(() => [])).find((v) => v.kid === kid && v.ready && v.complete);
+  if (here && !(isDevice() && state.backend.where === here.where)) reach.push(createLocalBackend({ where: here.where, handle: here.handle || null, kid, demo: DEMO }));
+  for (const [provider, auth] of Object.entries(state.auths)) {
+    if (auth && provider !== state.provider && auth.expiresAt - Date.now() > 60_000) reach.push(backendFor(auth));
+  }
+  const copies = [];
+  for (const backend of reach) {
+    try {
+      const { keyring } = await backend.load();
+      const copy = keyring ? parseKeyring(keyring) : null;
+      if (copy?.kid === kid) copies.push({ backend, copy, revision: await verifyRevision(copy, state.master) });
+    } catch (err) {
+      console.warn('Key ring check:', err);
+    }
+  }
+  const newest = copies.reduce((best, c) => (c.revision > trustedRevision(best) ? c.copy : best), state.keyringDoc);
+  state.keyringDoc = newest;
+  const revision = trustedRevision(newest);
+  for (const { backend, copy, revision: theirs } of copies) {
+    if (theirs < revision && copy !== newest) await backend.saveKeyring(serializeKeyring(newest)).catch((err) => console.warn('Key ring update:', err));
+  }
+}
+
+/** The key ring kept by this device's vault for `kid`, if it's newer than `than`: a fallback at unlock. */
+async function newerKeyringHere(than) {
+  const here = (await findLocalVaults({ demo: DEMO }).catch(() => [])).find((v) => v.kid === than.kid && v.ready && v.complete);
+  if (!here || (isDevice() && state.backend.where === here.where)) return null;
+  try {
+    const { keyring } = await createLocalBackend({ where: here.where, handle: here.handle || null, kid: than.kid, demo: DEMO }).load();
+    const copy = keyring ? parseKeyring(keyring) : null;
+    return copy && serializeKeyring(copy) !== serializeKeyring(than) ? copy : null;
+  } catch {
+    return null;
+  }
 }
 
 async function loadConfig() {
@@ -191,13 +550,11 @@ async function loadConfig() {
 }
 
 /** Answers the streaming service worker: key + Drive token for one file, only while unlocked. */
-function describeForStream(fileId) {
+/** What the streaming worker needs for a file: its entry, and where to get the bytes (`fresh`: new addresses). */
+async function describeForStream(fileId, options) {
   if (!state.unlocked) return null;
   const entry = state.vault.files.find((f) => f.id === fileId);
-  if (entry) return { entry, ...state.backend.describe() };
-  // Local vault files: the worker asks this page for their (encrypted) bytes.
-  const localEntry = local.store?.getVault().files.find((f) => f.id === fileId);
-  return localEntry ? { entry: localEntry, source: 'page' } : null;
+  return entry ? { entry, ...(await state.backend.describe(entry, options)) } : null;
 }
 
 // ===========================================================================
@@ -222,12 +579,18 @@ function showWorking(message) {
   showPanel('working');
 }
 
-function showSignIn({ message = '', tone = 'info' } = {}) {
+/** The first screen: where your vault lives. The clouds come first; this device is the quiet option. */
+function showWelcome({ message = '', tone = 'info' } = {}) {
   $('#signin-label').textContent = DEMO ? 'Open the demo' : 'Continue with Google';
   $('#google-logo').toggleAttribute('hidden', DEMO); // SVG elements have no .hidden property
+  $('#signin-microsoft').hidden = !microsoftReady();
+  $('#welcome-device').hidden = DEMO;
+  $('#welcome-title').textContent = DEMO ? 'Try Secure Box' : readHint('google') || readHint('microsoft') || deviceChoice() ? 'Open your vault' : 'Where should your vault live?';
+  // The cloud used last comes first.
+  if (microsoftReady() && lastProvider() === 'microsoft') $('#signin-microsoft').after($('[data-action="signin"]'));
   setText('#signin-status', message);
   $('#signin-status').dataset.tone = tone;
-  $('#signin-other').hidden = DEMO || !readHint();
+  $('#signin-other').hidden = DEMO || !readHint('google');
   $('#demo-note').hidden = !DEMO;
   showPanel('signin');
 }
@@ -241,19 +604,24 @@ function showError({ title, message, action = 'retry', actionLabel = 'Try again'
   showPanel('error');
 }
 
-const who = () => (state.identity?.email ? `Signed in as ${state.identity.email}` : '');
+const who = () => vaultLabel();
 
-function signIn(prompt = '') {
+function signIn(prompt = '', provider = 'google') {
   if (DEMO) return openAccount();
-  if (prompt === 'select_account') clearHint();
-  showWorking('Redirecting to Google…');
-  beginGoogleSignIn({ clientId: state.config.googleClientId, loginHint: readHint(), prompt });
+  if (prompt === 'select_account') clearHint(provider);
+  rememberProvider(provider);
+  showWorking(`Redirecting to ${companyName(provider)}…`);
+  if (provider === 'microsoft') {
+    return beginMicrosoftSignIn({ clientId: state.config.microsoftClientId, loginHint: readHint('microsoft'), prompt }).catch((err) => showWelcome({ message: err.message, tone: 'error' }));
+  }
+  beginGoogleSignIn({ clientId: state.config.googleClientId, loginHint: readHint('google'), prompt });
   return undefined;
 }
 
 function retry() {
+  if (currentProvider() === 'local' && !DEMO) return openDeviceVault();
   if (DEMO || (state.auth && state.auth.expiresAt - Date.now() > 120_000)) return openAccount();
-  return signIn();
+  return signIn('', currentProvider());
 }
 
 function strengthMeter(input, meter) {
@@ -278,10 +646,7 @@ async function openAccount() {
       setText('#missing-keyring-who', who());
       showPanel('missing-keyring');
     } else if (!state.keyringDoc) {
-      for (const id of ['#create-password', '#create-confirm']) $(id).value = '';
-      setText('#create-error', '');
-      setText('#create-who', who());
-      showPanel('create');
+      showCreate();
     } else showUnlock();
   } catch (err) {
     handleError(err);
@@ -294,9 +659,10 @@ function showUnlock(message = '') {
   setText('#unlock-error', message);
   setText('#unlock-status', state.lockMessage);
   state.lockMessage = '';
-  setText('#unlock-who', who());
+  setText('#unlock-who', vaultLabel());
   $('#unlock-demo-hint').hidden = !DEMO;
-  $('#unlock-other').hidden = DEMO;
+  $('#unlock-other').hidden = DEMO || isDevice();
+  $('#unlock-switch').hidden = DEMO;
   showPanel('unlock');
 }
 
@@ -307,7 +673,16 @@ async function unlock() {
   setBusy(button, true);
   setText('#unlock-error', '');
   try {
-    const master = await unlockWithPassword(state.keyringDoc, password);
+    let master;
+    try {
+      master = await unlockWithPassword(state.keyringDoc, password);
+    } catch (err) {
+      // Changed the master password in another vault? This device may already have the new key ring.
+      const newer = err instanceof KeyringError ? await newerKeyringHere(state.keyringDoc) : null;
+      if (!newer) throw err;
+      master = await unlockWithPassword(newer, password);
+      state.keyringDoc = newer;
+    }
     $('#unlock-password').value = '';
     await openVault(master);
   } catch (err) {
@@ -319,14 +694,14 @@ async function unlock() {
 }
 
 async function openVault(master, { unlockedAt } = {}) {
-  const cipher = await VaultCipher.create(master);
+  const cipher = await cipherFor(master);
   if (!state.loaded.vault) {
     state.pendingApp = { master, cipher };
     showPanel('missing-vault');
     return;
   }
-  const envelope = parseEnvelope(state.loaded.vault.text);
-  if (envelope.kid !== master.kid) throw new VaultError('wrong-key', 'Your vault and key ring belong to different keys. Restore the matching files from Drive’s trash.');
+  const envelope = parseEnvelope(state.loaded.vault.text, cipher.format);
+  if (envelope.kid !== master.kid) throw new VaultError('wrong-key', 'Your vault and key ring belong to different keys. Restore the matching files from the trash (recycle bin) where they’re stored.');
   const vault = await cipher.open(envelope);
   enterApp({ master, cipher, vault, rev: state.loaded.vault.rev, unlockedAt });
 }
@@ -352,7 +727,7 @@ async function createAccount() {
   setText('#create-error', '');
   try {
     const { doc, master, recovery } = await createKeyring(password);
-    const cipher = await VaultCipher.create(master);
+    const cipher = await cipherFor(master);
     const vault = emptyVault();
     const rev = await state.backend.create({ keyringText: serializeKeyring(doc), vaultText: await cipher.seal(vault), kid: master.kid });
     $('#create-password').value = '';
@@ -363,6 +738,77 @@ async function createAccount() {
     showKit();
   } catch (err) {
     handleError(err);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function showCreate() {
+  for (const id of ['#create-password', '#create-confirm']) $(id).value = '';
+  setText('#create-error', '');
+  setText('#create-who', who());
+  $('#create-adopt').hidden = DEMO;
+  showPanel('create');
+}
+
+// ---------------------------------------------------------------------------
+// A new vault, the same master password: it starts with the key ring you already have, from a
+// key ring backup (when Secure Box is unlocked, switching vaults does this by itself).
+// ---------------------------------------------------------------------------
+function showAdopt() {
+  state.adoptDoc = null;
+  $('#adopt-password').value = '';
+  setText('#adopt-error', '');
+  setText('#adopt-file', '');
+  setText('#adopt-who', vaultLabel());
+  showPanel('adopt');
+}
+
+async function pickAdoptKeyring() {
+  const file = await pickFile('.json,application/json');
+  if (!file) return;
+  try {
+    state.adoptDoc = parseKeyring(await file.text());
+    setText('#adopt-file', `Using ${file.name}`);
+    setText('#adopt-error', '');
+  } catch (err) {
+    state.adoptDoc = null;
+    setText('#adopt-file', '');
+    setText('#adopt-error', `That isn’t a Secure Box key ring backup (${err.message})`);
+  }
+}
+
+async function adoptKeyring() {
+  const doc = state.adoptDoc;
+  if (!doc) return setText('#adopt-error', 'Load your key ring backup first. In a vault that’s open: ⋯ → Key ring backup.');
+  const secret = $('#adopt-password').value;
+  if (!secret) return setText('#adopt-error', 'Enter your master password.');
+  const button = $('[data-action="adopt"]');
+  setBusy(button, true);
+  setText('#adopt-error', '');
+  try {
+    let master;
+    try {
+      master = await unlockWithPassword(doc, secret);
+    } catch (err) {
+      if (!(err instanceof KeyringError)) throw err;
+      // An Emergency Kit recovery key opens it too.
+      master = await unlockWithRecovery(doc, secret).catch(() => {
+        throw new KeyringError('wrong-password', 'That master password (or recovery key) doesn’t open this key ring.');
+      });
+    }
+    await verifyRevision(doc, master);
+    const cipher = await cipherFor(master);
+    const vault = emptyVault();
+    const rev = await state.backend.create({ keyringText: serializeKeyring(doc), vaultText: await cipher.seal(vault), kid: master.kid });
+    $('#adopt-password').value = '';
+    state.keyringDoc = doc;
+    state.adoptDoc = null;
+    enterApp({ master, cipher, vault, rev });
+    toast(`Your ${providerName()} vault is ready, with the same master password`);
+  } catch (err) {
+    if (err instanceof KeyringError) setText('#adopt-error', err.message);
+    else handleError(err);
   } finally {
     setBusy(button, false);
   }
@@ -417,6 +863,7 @@ async function recover() {
   setText('#recover-error', '');
   try {
     const master = await unlockWithRecovery(state.keyringDoc, key);
+    await verifyRevision(state.keyringDoc, master);
     const doc = await withNewPassword(state.keyringDoc, master, password);
     await state.backend.saveKeyring(serializeKeyring(doc));
     state.keyringDoc = doc;
@@ -433,6 +880,12 @@ async function recover() {
 function handleError(err) {
   console.error(err);
   const again = { action: 'signin', actionLabel: 'Continue with Google' };
+  if (err instanceof MicrosoftError) {
+    const microsoft = { action: 'signin-microsoft', actionLabel: 'Continue with Microsoft' };
+    if (err.code === 'expired') return showError({ title: 'Please sign in again', message: err.message, ...microsoft });
+    if (err.code === 'drive-scope') return showError({ title: 'OneDrive access is needed', message: err.message, action: 'signin-consent', actionLabel: 'Continue with Microsoft' });
+    return showError({ title: 'OneDrive problem', message: err.message });
+  }
   if (err instanceof GoogleError) {
     if (err.code === 'expired') return showError({ title: 'Please sign in again', message: err.message, ...again });
     if (err.code === 'drive-scope') return showError({ title: 'Google Drive access is needed', message: err.message, action: 'signin-consent', actionLabel: 'Continue with Google' });
@@ -447,8 +900,10 @@ function enterApp({ master, cipher, vault, rev, unlockedAt = Date.now() }) {
   Object.assign(state, { master, cipher, vault, rev, lastSync: Date.now(), unlocked: true, unlockedAt, pendingApp: null });
   lastActivity = Date.now();
   channel?.postMessage({ type: 'unlocked', sub: state.identity?.sub });
-  $('#account-email').textContent = state.identity?.email || '';
-  $('#source-email').textContent = state.identity?.email || '';
+  $('#account-email').textContent = vaultLabel();
+  state.provider ||= state.backend?.provider || 'google';
+  if (isDevice()) rememberDeviceChoice({ kid: master.kid, where: state.backend.where });
+  renderSource();
   $('#demo-badge').hidden = !DEMO;
   $('#gate').hidden = true;
   $('#app').hidden = false;
@@ -460,61 +915,53 @@ function enterApp({ master, cipher, vault, rev, unlockedAt = Date.now() }) {
   });
   let section = 'passwords';
   try {
-    const saved = localStorage.getItem(SECTION_KEY);
-    if (['files', 'local'].includes(saved)) section = saved;
+    if (localStorage.getItem(SECTION_KEY) === 'files') section = 'files';
   } catch {
     /* ignore */
   }
   setSection(section, { push: false });
   history.replaceState(navState(), '');
   setSyncStatus('idle');
+  renderDeviceStatus();
+  if (isDevice()) checkStrays();
   startAutoLock();
+  // Every copy of the key ring this device can reach goes to the newest revision.
+  verifyRevision(state.keyringDoc, master)
+    .then(() => spreadKeyring())
+    .catch((err) => console.warn('Key ring check:', err));
 }
 
 // ===========================================================================
-// Sections: Google Drive (Passwords, Files) and Local
+// Sections: Passwords and Files, of whichever vault is open
 // ===========================================================================
-/** Files and an open local vault share the file manager. */
-const filesMode = () => state.section === 'files' || (state.section === 'local' && Boolean(localFiles));
+const filesMode = () => state.section === 'files';
 
 function setSection(section, { push = true } = {}) {
-  state.section = section;
+  state.section = section === 'files' ? 'files' : 'passwords';
   try {
-    localStorage.setItem(SECTION_KEY, section);
+    localStorage.setItem(SECTION_KEY, state.section);
   } catch {
     /* ignore */
   }
-  for (const tab of $$('[data-section]')) tab.setAttribute('aria-selected', String(tab.dataset.section === section));
-  if (section === 'files') files.useStore(cloudStore);
-  if (section === 'local' && localFiles) files.useStore(localFiles);
-  const setup = section === 'local' && !localFiles;
-  $('#passwords-view').hidden = section !== 'passwords';
-  $('#files-view').hidden = !filesMode();
-  $('#files-view').classList.toggle('is-local', section === 'local');
-  $('#local-setup').hidden = !setup;
+  for (const tab of $$('[data-section]')) tab.setAttribute('aria-selected', String(tab.dataset.section === state.section));
+  $('#passwords-view').hidden = state.section !== 'passwords';
+  $('#files-view').hidden = state.section !== 'files';
   const search = $('#search');
-  search.value = filesMode() ? files.query : section === 'passwords' ? state.query : '';
-  search.placeholder = section === 'files' ? 'Search files' : section === 'local' ? 'Search local vault' : 'Search passwords';
-  search.disabled = setup;
+  search.value = filesMode() ? files.query : state.query;
+  search.placeholder = filesMode() ? 'Search files' : 'Search passwords';
   $('.topbar').classList.toggle('is-searching', Boolean(search.value));
   renderAll();
-  if (section === 'local') {
-    if (localFiles) checkStrays();
-    else openLocalTab();
-  }
   if (push) pushNav();
 }
 
 function renderAll() {
   if (!state.unlocked) return;
-  if (filesMode()) {
-    files.render();
-    renderLocalStatus(); // Files and Local share the file manager: the bar hides itself outside Local
-  } else if (state.section === 'local') renderLocalSetup();
+  if (filesMode()) files.render();
   else {
     renderList();
     renderDetail();
   }
+  if (isDevice()) renderDeviceStatus();
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +993,7 @@ function onPopState(event) {
   if (!target?.sb) return;
   restoringNav = true;
   try {
-    if (target.section !== state.section && ['passwords', 'files', 'local'].includes(target.section)) setSection(target.section, { push: false });
+    if (target.section !== state.section && ['passwords', 'files'].includes(target.section)) setSection(target.section, { push: false });
     if (filesMode() && target.folder !== files.folder) files.goTo(target.folder ?? null, { push: false });
     if (state.section === 'passwords' && narrow() && target.item !== state.selectedId) {
       select(target.item && state.vault.items.some((it) => it.id === target.item) ? target.item : null, { push: false });
@@ -562,62 +1009,64 @@ function closeDetail() {
   else select(null);
 }
 
-// ---------------------------------------------------------------------------
-// Local: the local vault on this device
-// ---------------------------------------------------------------------------
-async function openLocalTab() {
-  if (local.busy) return;
-  if (local.found === undefined) {
-    local.busy = 'Looking for a local vault…';
-    renderAll();
-    try {
-      local.found = await findLocalVault(state.master.kid, { demo: DEMO });
-    } catch (err) {
-      local.found = null;
-      local.error = err.message;
-    }
-    local.busy = '';
+// ===========================================================================
+// This device: the vault kept only here
+// ===========================================================================
+/**
+ * From the first screen: opens this device's vault (the one used last), or offers to make one.
+ * With `quiet`, it only opens one that exists, and says whether it did.
+ */
+async function openDeviceVault({ quiet = false } = {}) {
+  const support = localSupport();
+  if (support.ios && !support.standalone) {
+    if (!quiet) showPanel('device-ios');
+    return false;
   }
-  if (local.found?.ready) await openLocal({ where: local.found.where, handle: local.found.handle });
-  else renderAll();
+  if (!support.browser && !support.folder) {
+    if (!quiet) showError({ title: 'Not in this browser', message: 'This browser can’t keep a vault on this device. Use an up-to-date Chrome, Edge, Firefox or Safari.', action: 'show-welcome', actionLabel: 'Back' });
+    return false;
+  }
+  const vaults = (await findLocalVaults({ demo: DEMO })).filter((v) => v.complete || v.where === 'folder');
+  const last = deviceChoice();
+  const pick = vaults.find((v) => v.kid === last?.kid && v.where === last?.where) || vaults.find((v) => v.where === 'browser') || vaults[0];
+  if (!pick) {
+    if (quiet) return false;
+    showDeviceNew();
+    return true;
+  }
+  if (pick.where === 'folder' && !pick.ready) {
+    state.devicePick = pick;
+    setText('#device-allow-name', pick.name);
+    showPanel('device-allow');
+    return true;
+  }
+  await useDeviceVault(pick);
+  return true;
 }
 
-async function openLocal({ where, handle = null, create = false }) {
-  local.busy = create ? 'Creating the local vault…' : 'Opening the local vault…';
-  local.error = '';
-  renderAll();
-  try {
-    local.store = await openLocalVault({
-      master: state.master,
-      where,
-      handle,
-      create,
-      demo: DEMO,
-      notify: () => channel?.postMessage({ type: 'local-changed', kid: state.master.kid }),
-    });
-    localFiles = {
-      kind: 'local',
-      getVault: () => local.store.getVault(),
-      commit: (change) => local.store.commit(change),
-      backend: () => local.store.backend,
-      ensure: async () => {},
-      fresh: () => true,
-    };
-    local.found = { where, handle, name: handle?.name, ready: true };
-    local.protection = await local.store.protection();
-  } catch (err) {
-    console.error(err);
-    local.store = null;
-    localFiles = null;
-    local.error = err.code === 'other-account' ? err.message : `The local vault couldn’t be opened: ${err.message}`;
-  } finally {
-    local.busy = '';
-  }
-  if (state.section === 'local') setSection('local', { push: false });
+function showDeviceNew() {
+  const folder = localSupport().folder && !DEMO;
+  $('#device-new-choice').hidden = !folder;
+  $('#device-new-browser-note').hidden = folder;
+  $('input[name="device-new-where"][value="browser"]').checked = true;
+  setText('#device-new-error', '');
+  showPanel('device-new');
 }
 
-async function createLocal() {
-  const where = $('input[name="local-where"]:checked')?.value === 'folder' ? 'folder' : 'browser';
+/** Opens (or prepares to create) this device's vault, ready for its unlock or create screen. */
+async function useDeviceVault({ where, handle = null, kid = null }) {
+  state.auth = null;
+  state.provider = 'local';
+  state.backend = createLocalBackend({ where, handle, kid, demo: DEMO, notify: notifyVaultChanged });
+  state.identity = state.backend.identity;
+  rememberProvider('local');
+  renderSource();
+  await streamingStarted;
+  await openAccount();
+}
+
+async function createDeviceVault() {
+  const where = $('input[name="device-new-where"]:checked')?.value === 'folder' && localSupport().folder ? 'folder' : 'browser';
   let handle = null;
   if (where === 'folder') {
     try {
@@ -627,58 +1076,139 @@ async function createLocal() {
       throw err;
     }
   } else {
-    // Ask the browser to keep it. Firefox asks the person, which needs this click.
-    navigator.storage?.persist?.().catch(() => {});
+    navigator.storage?.persist?.().catch(() => {}); // ask the browser to keep it (Firefox asks the person)
   }
-  await openLocal({ where, handle, create: true });
-  if (local.store) toast(where === 'folder' ? `Local vault ready in “${handle.name}”` : 'Local vault ready');
+  await useDeviceVault({ where, handle });
 }
 
-async function allowLocalFolder() {
-  if (await allowFolder(local.found.handle)) await openLocal({ where: 'folder', handle: local.found.handle });
-  else toast('Secure Box wasn’t allowed to open the folder.', 'error');
+async function allowDeviceFolder() {
+  const pick = state.devicePick;
+  if (!pick) return showWelcome();
+  if (!(await allowFolder(pick.handle))) return setText('#device-allow-error', 'Secure Box wasn’t allowed to open the folder.');
+  await useDeviceVault(pick);
 }
 
-async function forgetLocalFolder() {
-  const name = local.found?.name || 'this folder';
-  const ok = await confirmDialog({
-    title: 'Stop using this folder?',
-    message: `Secure Box forgets “${name}”. The encrypted files stay in it: choose the folder again any time to open them.`,
-    confirmLabel: 'Forget folder',
-  });
-  if (!ok) return;
-  await forgetFolder(state.master.kid, { demo: DEMO });
-  Object.assign(local, { store: null, found: null, strays: [], error: '' });
-  localFiles = null;
-  setSection('local', { push: false });
+async function forgetDeviceFolderAtGate() {
+  const pick = state.devicePick;
+  if (pick) await forgetFolder(pick.kid, { demo: DEMO });
+  state.devicePick = null;
+  showWelcome({ message: `Secure Box forgot “${pick?.name || 'the folder'}”. Its encrypted files are still there.` });
 }
 
-async function protectLocal() {
-  const granted = await local.store.protect();
-  local.protection = await local.store.protection();
-  renderLocalStatus();
-  if (granted) toast('Protected: the browser won’t clear the local vault by itself');
+/** First screen → Restore a backup: makes this device's vault from a backup file. */
+async function restoreDeviceFromGate() {
+  const file = await pickFile('.zip,application/zip');
+  if (!file) return;
+  setText('#device-new-error', '');
+  try {
+    const backup = await readBackup(file);
+    if (!backup.keyring) throw new Error('This backup is from an earlier version of Secure Box. Open your vault on this device first, then use ⋯ → Restore a backup.');
+    const { kid } = backup.manifest;
+    if ((await findLocalVaults({ demo: DEMO })).some((v) => v.kid === kid && v.where === 'browser')) {
+      throw new Error('This device already has that vault. Open it, then use ⋯ → Restore a backup to add what’s missing.');
+    }
+    showWorking('Restoring your vault…');
+    const backend = createLocalBackend({ where: 'browser', kid, demo: DEMO });
+    await backend.create({ keyringText: backup.keyring, vaultText: backup.index, kid });
+    for (const id of backup.blobIds()) await backend.restoreBlob(backup, `local:${id}`);
+    await useDeviceVault({ where: 'browser', kid });
+    toast('Restored. Unlock it with your master password.');
+  } catch (err) {
+    showDeviceNew();
+    setText('#device-new-error', err.message);
+  }
+}
+
+// ---- The status bar of this device's vault ---------------------------------
+function backupAt() {
+  try {
+    return Number(JSON.parse(localStorage.getItem(BACKUP_KEY) || '{}')[state.master?.kid]) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function rememberBackup(at) {
+  try {
+    const all = JSON.parse(localStorage.getItem(BACKUP_KEY) || '{}');
+    all[state.master.kid] = at;
+    localStorage.setItem(BACKUP_KEY, JSON.stringify(all));
+  } catch {
+    /* ignore */
+  }
+}
+
+function renderDeviceStatus() {
+  const bar = $('#vault-status');
+  const backend = state.backend;
+  bar.hidden = !state.unlocked || !isDevice();
+  $('#menu-device').hidden = bar.hidden;
+  if (bar.hidden) return;
+  $('#menu-device-backup').hidden = backend.where !== 'browser';
+  $('#menu-device-forget').hidden = backend.where !== 'folder';
+  const parts = [
+    h('span', { class: 'local-where' }, icon(backend.where === 'folder' ? 'folder' : 'device', 16), h('span', { text: backend.where === 'folder' ? `Kept in “${backend.name}”` : 'Kept in this browser' })),
+  ];
+  if (device.protection === 'protected') parts.push(h('span', { class: 'local-pill is-ok', text: 'Won’t be cleared automatically' }));
+  if (device.protection === 'unprotected') {
+    parts.push(h('span', { class: 'local-pill is-warn', text: 'The browser may clear it when space runs low' }));
+    parts.push(h('button', { type: 'button', class: 'btn btn-ghost btn-sm', dataset: { action: 'device-protect' } }, icon('shield', 16), h('span', { text: 'Protect' })));
+  }
+  if (device.busy) parts.push(h('span', { class: 'local-busy', role: 'status' }, h('span', { class: 'spinner spinner-sm', 'aria-hidden': 'true' }), h('span', { text: device.busy })));
+  else if (backend.where === 'browser' && (state.vault.items.length || state.vault.files.length)) {
+    const at = backupAt();
+    const changed = Number(String(state.rev || '').split(':')[0]) || 0; // when the vault was last saved
+    const stale = !at || (changed > at + 5000 && Date.now() - at > 7 * 86_400_000);
+    parts.push(h('span', { class: `local-pill${stale ? ' is-warn' : ''}`, text: at ? `Backed up ${relativeTime(at)}` : 'Not backed up yet' }));
+    parts.push(h('button', { type: 'button', class: 'btn btn-ghost btn-sm', dataset: { action: 'device-backup' } }, icon('download', 16), h('span', { text: 'Back up' })));
+  }
+  const rows = [h('div', { class: 'local-status-row' }, ...parts)];
+  if (device.strays.length) {
+    const names = device.strays.slice(0, 3).map((s) => s.name).join(', ') + (device.strays.length > 3 ? ` and ${device.strays.length - 3} more` : '');
+    rows.push(
+      h('div', { class: 'local-status-row local-strays' },
+        icon('alert', 16),
+        h('span', { text: `${device.strays.length === 1 ? 'An unencrypted file is' : `${device.strays.length} unencrypted files are`} in this vault’s folder: ${names}` }),
+        h('button', { type: 'button', class: 'btn btn-primary btn-sm', dataset: { action: 'device-strays' } }, icon('lock', 16), h('span', { text: 'Encrypt them' }))),
+    );
+  }
+  bar.replaceChildren(...rows);
+  // Re-checks quietly: the browser may grant (or drop) protection at any time.
+  backend.protection().then((p) => {
+    if (p !== device.protection && state.backend === backend) {
+      device.protection = p;
+      renderDeviceStatus();
+    }
+  }).catch(() => {});
+}
+
+async function protectDevice() {
+  const granted = await state.backend.protect();
+  device.protection = await state.backend.protection();
+  renderDeviceStatus();
+  if (granted) toast('Protected: the browser won’t clear this vault by itself');
   else toast('The browser said no. Installing Secure Box as an app (Install app, or Add to Home Screen) usually changes that.', 'error');
 }
 
 const busyText = (label) => (p) => {
-  local.busy = `${label}… ${Math.floor(p * 100)}%`;
-  renderLocalStatus();
+  device.busy = `${label}… ${Math.floor(p * 100)}%`;
+  renderDeviceStatus();
 };
 
-async function backupLocal() {
-  if (!local.store || local.busy) return;
+async function backupDevice() {
+  if (!isDevice() || device.busy) return;
   let backup;
   try {
-    local.busy = 'Backing up…';
-    renderLocalStatus();
-    backup = await local.store.backup({ onProgress: busyText('Backing up') });
+    device.busy = 'Backing up…';
+    renderDeviceStatus();
+    backup = await state.backend.backup(state.vault.files, { onProgress: busyText('Backing up') });
+    rememberBackup(Date.now());
   } catch (err) {
     toast(err.message, 'error');
     return;
   } finally {
-    local.busy = '';
-    renderLocalStatus();
+    device.busy = '';
+    renderDeviceStatus();
   }
   const { blob, name } = backup;
   const file = new File([blob], name, { type: 'application/zip' });
@@ -692,152 +1222,94 @@ async function backupLocal() {
   toast(`Backup saved to your downloads (${formatBytes(blob.size)})`);
 }
 
-async function restoreLocal() {
+/** ⋯ → Restore a backup: adds whatever the backup has and this device's vault doesn't. */
+async function restoreDevice() {
+  if (!isDevice()) return;
   const file = await pickFile('.zip,application/zip');
   if (!file) return;
-  if (!local.store) await openLocal({ where: 'browser', create: true });
-  if (!local.store) return;
   try {
-    local.busy = 'Restoring…';
-    renderAll();
-    const added = await local.store.restore(file, { onProgress: busyText('Restoring') });
-    toast(added ? `Restored ${added} ${added === 1 ? 'file' : 'files'}` : 'Nothing to add: everything in that backup is already here');
+    device.busy = 'Restoring…';
+    renderDeviceStatus();
+    const backup = await readBackup(file);
+    if (backup.manifest.kid !== state.master.kid) throw new Error('That backup belongs to a different Secure Box master key.');
+    const saved = await state.cipher.open(parseEnvelope(backup.index, state.cipher.format));
+    const have = { items: new Set(state.vault.items.map((i) => i.id)), folders: new Set(state.vault.folders.map((f) => f.id)), files: new Set(state.vault.files.map((f) => f.id)) };
+    const changes = [
+      ...saved.items.filter((i) => !have.items.has(i.id)).map((item) => ({ op: 'put', item })),
+      ...saved.folders.filter((f) => !have.folders.has(f.id)).map((folder) => ({ op: 'folder-put', folder })),
+    ];
+    const todo = saved.files.filter((f) => !have.files.has(f.id));
+    const total = todo.reduce((n, f) => n + f.size, 0) || 1;
+    let copied = 0;
+    for (const entry of todo) {
+      const ok = await state.backend.restoreBlob(backup, entry.driveId, (n) => {
+        copied += n;
+        busyText('Restoring')(Math.min(1, copied / total));
+      });
+      if (ok) changes.push({ op: 'file-put', file: entry });
+    }
+    if (changes.length) await commit({ op: 'batch', changes });
+    if (backup.keyring) {
+      const copy = parseKeyring(backup.keyring);
+      if (copy.kid === state.master.kid && (await verifyRevision(copy, state.master)) > trustedRevision(state.keyringDoc)) {
+        state.keyringDoc = copy;
+        await spreadKeyring();
+      }
+    }
+    toast(changes.length ? `Restored ${changes.length} ${changes.length === 1 ? 'item' : 'items'}` : 'Nothing to add: everything in that backup is already here');
   } catch (err) {
     toast(err.message, 'error');
   } finally {
-    local.busy = '';
+    device.busy = '';
     renderAll();
+    renderDeviceStatus();
   }
+}
+
+async function forgetDeviceFolder() {
+  const name = state.backend?.name || 'this folder';
+  const ok = await confirmDialog({
+    title: 'Stop using this folder?',
+    message: `Secure Box forgets “${name}” and locks. The encrypted files stay in the folder: choose it again any time to open them.`,
+    confirmLabel: 'Forget folder',
+  });
+  if (!ok) return;
+  await forgetFolder(state.master.kid, { demo: DEMO });
+  rememberProvider('google');
+  lock('manual');
 }
 
 /** Plain files put into a folder vault by hand: offer to encrypt them. */
 async function checkStrays() {
-  if (local.store?.where !== 'folder') return;
-  try {
-    local.strays = await local.store.strays();
-  } catch {
-    local.strays = [];
+  if (!isDevice() || state.backend.where !== 'folder') {
+    device.strays = [];
+    return;
   }
-  if (state.section === 'local') renderLocalStatus();
+  try {
+    device.strays = await state.backend.strays();
+  } catch {
+    device.strays = [];
+  }
+  renderDeviceStatus();
 }
 
 async function encryptStrays() {
-  const strays = local.strays;
-  if (!strays.length || !localFiles) return;
+  const strays = device.strays;
+  if (!strays.length || !isDevice()) return;
+  const backend = state.backend;
   const count = strays.length === 1 ? `“${strays[0].name}”` : `${strays.length} files`;
   const ok = await confirmDialog({
     title: `Encrypt ${count}?`,
-    message: 'They were put into the local vault’s folder by hand, so they aren’t encrypted. Secure Box encrypts each one into the local vault, then deletes the unencrypted original.',
+    message: 'They were put into this vault’s folder by hand, so they aren’t encrypted. Secure Box encrypts each one into the vault, then deletes the unencrypted original.',
     confirmLabel: 'Encrypt',
   });
   if (!ok) return;
-  local.strays = [];
-  renderLocalStatus();
-  await files.enqueue(strays.map((s) => ({ file: s.file, path: s.path, after: () => local.store.removeStray(s) })), null, localFiles);
-  await local.store.pruneEmptyFolders().catch(() => {});
+  device.strays = [];
+  renderDeviceStatus();
+  await files.enqueue(strays.map((s) => ({ file: s.file, path: s.path, after: () => backend.removeStray(s) })), null);
+  await backend.pruneEmptyFolders().catch(() => {});
   await checkStrays();
   renderAll();
-}
-
-function renderLocalStatus() {
-  const bar = $('#local-status');
-  const store = local.store;
-  bar.hidden = !store || state.section !== 'local';
-  if (bar.hidden) return;
-  const v = store.getVault();
-  const parts = [];
-  const where = store.where === 'folder' ? `In “${store.name}”` : 'In this browser';
-  parts.push(h('span', { class: 'local-where' }, icon(store.where === 'folder' ? 'folder' : 'device', 16), h('span', { text: where })));
-  if (local.protection === 'protected') parts.push(h('span', { class: 'local-pill is-ok', text: 'Won’t be cleared automatically' }));
-  if (local.protection === 'unprotected') {
-    parts.push(h('span', { class: 'local-pill is-warn', text: 'The browser may clear it when space runs low' }));
-    parts.push(h('button', { type: 'button', class: 'btn btn-ghost btn-sm', dataset: { action: 'local-protect' } }, icon('shield', 16), h('span', { text: 'Protect' })));
-  }
-  if (local.busy) parts.push(h('span', { class: 'local-busy', role: 'status' }, h('span', { class: 'spinner spinner-sm', 'aria-hidden': 'true' }), h('span', { text: local.busy })));
-  else if (store.where === 'browser' && v.files.length) {
-    const stale = !v.backupAt || (v.changedAt > v.backupAt && Date.now() - v.backupAt > 7 * 86_400_000);
-    parts.push(h('span', { class: `local-pill${stale ? ' is-warn' : ''}`, text: v.backupAt ? `Backed up ${relativeTime(v.backupAt)}` : 'Not backed up yet' }));
-    parts.push(h('button', { type: 'button', class: 'btn btn-ghost btn-sm', dataset: { action: 'local-backup' } }, icon('download', 16), h('span', { text: 'Back up' })));
-  }
-  const rows = [h('div', { class: 'local-status-row' }, ...parts)];
-  if (local.strays.length) {
-    const names = local.strays.slice(0, 3).map((s) => s.name).join(', ') + (local.strays.length > 3 ? ` and ${local.strays.length - 3} more` : '');
-    rows.push(
-      h('div', { class: 'local-status-row local-strays' },
-        icon('alert', 16),
-        h('span', { text: `${local.strays.length === 1 ? 'An unencrypted file is' : `${local.strays.length} unencrypted files are`} in this vault’s folder: ${names}` }),
-        h('button', { type: 'button', class: 'btn btn-primary btn-sm', dataset: { action: 'local-strays' } }, icon('lock', 16), h('span', { text: 'Encrypt them' }))),
-    );
-  }
-  bar.replaceChildren(...rows);
-  $('#tools-forget').hidden = store.where !== 'folder';
-  $('#tools-backup').hidden = store.where !== 'browser';
-  // Re-checks quietly: the browser may grant (or drop) protection at any time.
-  store.protection().then((p) => {
-    if (p !== local.protection) {
-      local.protection = p;
-      renderLocalStatus();
-    }
-  }).catch(() => {});
-}
-
-function renderLocalSetup() {
-  const support = localSupport();
-  const parts = [
-    h('div', { class: 'empty-icon' }, icon('device', 22)),
-    h('h2', { class: 'local-title', text: 'Local vault' }),
-    h('p', { class: 'local-lead', text: 'Encrypted files kept on this device only. They never go to Google Drive, and they unlock with your master password, like everything else.' }),
-  ];
-  if (local.busy) {
-    parts.push(h('div', { class: 'working' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }), h('span', { text: local.busy })));
-  } else if (local.found && !local.found.ready) {
-    parts.push(
-      h('p', { class: 'local-note', text: `Your local vault is in the folder “${local.found.name}”. Your browser asks once per visit before Secure Box may open it.` }),
-      h('div', { class: 'local-actions' },
-        h('button', { type: 'button', class: 'btn btn-primary', dataset: { action: 'local-allow' } }, icon('folder', 16), h('span', { text: `Open “${local.found.name}”` })),
-        h('button', { type: 'button', class: 'btn btn-ghost', dataset: { action: 'local-forget' } }, h('span', { text: 'Forget this folder' }))),
-    );
-  } else if (!support.browser && !support.folder) {
-    parts.push(h('p', { class: 'local-note', text: 'This browser can’t keep a local vault. Use an up-to-date Chrome, Edge, Firefox or Safari.' }));
-  } else if (support.ios && !support.standalone) {
-    parts.push(
-      h('p', { class: 'local-note', text: 'On iPhone and iPad, keep your local vault in the Secure Box app on your Home Screen. Safari deletes the data of websites you haven’t opened for 7 days, and only Home Screen apps are safe from that.' }),
-      h('ol', { class: 'local-steps' }, h('li', { text: 'Tap Share in Safari, then Add to Home Screen.' }), h('li', { text: 'Open Secure Box from your Home Screen, unlock, and come back to Local.' })),
-    );
-  } else {
-    const folderChoice = support.folder && !DEMO;
-    if (folderChoice) {
-      parts.push(
-        h('div', { class: 'local-where-choice', role: 'radiogroup', 'aria-label': 'Where to keep it' },
-          h('label', { class: 'local-option' },
-            h('input', { type: 'radio', name: 'local-where', value: 'browser', checked: true }),
-            h('span', {}, h('strong', { text: 'In this browser' }), h('small', { text: 'Nothing to set up. Back it up now and then: clearing this site’s data in the browser deletes it.' }))),
-          h('label', { class: 'local-option' },
-            h('input', { type: 'radio', name: 'local-where', value: 'folder' }),
-            h('span', {}, h('strong', { text: 'In a folder you choose' }), h('small', { text: 'Ordinary encrypted files you can see, copy and back up. A synced folder (OneDrive, Dropbox, iCloud Drive) works too.' })))),
-      );
-    } else {
-      parts.push(h('p', { class: 'local-note', text: 'It’s kept in this browser’s private storage. Back it up now and then: clearing this site’s data in the browser deletes it.' }));
-    }
-    parts.push(
-      h('div', { class: 'local-actions' },
-        h('button', { type: 'button', class: 'btn btn-primary', dataset: { action: 'local-create' } }, icon('plus', 16), h('span', { text: 'Create local vault' })),
-        h('button', { type: 'button', class: 'btn btn-ghost', dataset: { action: 'local-restore' } }, icon('upload', 16), h('span', { text: 'Restore a backup…' }))),
-    );
-  }
-  if (local.error) parts.push(h('p', { class: 'form-error', role: 'alert', text: local.error }));
-  const tool = (action, iconName, title, text) =>
-    h('button', { type: 'button', class: 'local-tool', dataset: { action } }, h('span', { class: 'local-tool-icon' }, icon(iconName, 18)), h('span', {}, h('strong', { text: title }), h('small', { text })));
-  $('#local-setup').replaceChildren(
-    h('div', { class: 'local-setup-inner' },
-      h('section', { class: 'local-card' }, ...parts),
-      h('section', { class: 'local-tools-list', 'aria-label': 'Tools' },
-        h('h3', { text: 'Tools' }),
-        tool('box-encrypt-open', 'lock', 'Encrypt files', 'Turn files or a folder into .sbox files to keep or share'),
-        tool('box-decrypt-open', 'unlock', 'Decrypt .sbox files', 'Open .sbox files made with Secure Box'),
-        tool('text-open', 'note', 'Encrypt text', 'Encrypt a message, or read one you were sent'),
-        tool('export-keyring', 'key', 'Key ring backup', 'Opens your .sbox files even without Google Drive'))),
-  );
 }
 
 // ===========================================================================
@@ -851,7 +1323,14 @@ function commit(change) {
         // Another device saved since we last read? Pull it first and replay our change on top.
         if ((await state.backend.vaultRevision()) !== state.rev) await pullLatest();
         const next = applyChange(state.vault, change);
-        const rev = await state.backend.writeVault(await state.cipher.seal(next));
+        let rev;
+        try {
+          // OneDrive replaces the vault only if it's still the version we read; if not, go round again.
+          rev = await state.backend.writeVault(await state.cipher.seal(next), state.rev);
+        } catch (err) {
+          if (err?.code === 'conflict') continue;
+          throw err;
+        }
         state.vault = next;
         state.rev = rev;
         state.lastSync = Date.now();
@@ -875,7 +1354,7 @@ async function pullLatest() {
     state.lastSync = Date.now();
     return false;
   }
-  const envelope = parseEnvelope(text);
+  const envelope = parseEnvelope(text, state.cipher.format);
   if (envelope.kid !== state.cipher.kid) throw new VaultError('wrong-key', 'The vault was re-keyed on another device. Lock and unlock again.');
   state.vault = await state.cipher.open(envelope);
   state.rev = rev;
@@ -905,7 +1384,7 @@ async function syncNow({ quiet = false } = {}) {
 
 function setSyncStatus(status) {
   clearTimeout(syncLabelTimer);
-  const text = { saving: 'Saving…', syncing: 'Syncing…', saved: 'Saved', error: 'Not saved', idle: 'Encrypted · synced' }[status];
+  const text = { saving: 'Saving…', syncing: 'Syncing…', saved: 'Saved', error: 'Not saved', idle: isDevice() ? 'Encrypted · on this device' : 'Encrypted · synced' }[status];
   for (const el of $$('[data-sync-status]')) {
     el.dataset.state = status;
     el.textContent = text;
@@ -914,8 +1393,9 @@ function setSyncStatus(status) {
 }
 
 function describeSaveError(err) {
-  if (err instanceof GoogleError && err.code === 'expired') return 'Google access expired — nothing was saved. Reconnect and try again.';
-  if (err instanceof GoogleError && err.code === 'network') return 'You seem to be offline — nothing was saved. Try again.';
+  const cloud = err instanceof GoogleError || err instanceof MicrosoftError;
+  if (cloud && err.code === 'expired') return `${providerName()} access expired — nothing was saved. Reconnect and try again.`;
+  if (cloud && err.code === 'network') return 'You seem to be offline — nothing was saved. Try again.';
   return `Couldn’t save: ${err.message}`;
 }
 
@@ -929,23 +1409,54 @@ function driveFresh(margin = 5 * 60_000) {
 let reconnecting = null;
 let reconnectedElsewhere = null; // closes this window's Reconnect dialog when another window reconnected
 
-/** Takes a fresher Google token for the same account (from this or another window). */
-function useToken({ accessToken, expiresAt }) {
+/** Takes a fresher token for the same account (from this or another window). */
+function useToken({ accessToken, expiresAt, refreshToken }) {
   if (!state.auth || !(expiresAt > state.auth.expiresAt)) return false;
   state.auth.accessToken = accessToken;
   state.auth.expiresAt = expiresAt;
+  if (refreshToken) state.auth.refreshToken = refreshToken;
   forgetStreams();
   return true;
 }
 
-/** Resolves when Drive can be used. Shows a one-click "Reconnect" dialog when the token ran out. */
-function ensureDrive() {
-  if (driveFresh()) return Promise.resolve();
+let refreshing = null;
+
+/**
+ * Microsoft: renews the access token in the background with the refresh token (valid 24 hours),
+ * and shares it with the other windows. Resolves true when it worked.
+ */
+function refreshQuietly() {
+  if (state.auth?.provider !== 'microsoft' || !state.auth.refreshToken) return Promise.resolve(false);
+  refreshing ??= refreshMicrosoft(state.config.microsoftClientId, state.auth)
+    .then((next) => {
+      useToken(next);
+      channel?.postMessage({ type: 'token', sub: state.identity.sub, accessToken: next.accessToken, expiresAt: next.expiresAt });
+      return true;
+    })
+    .catch((err) => {
+      console.warn('Microsoft token refresh:', err);
+      return false;
+    })
+    .finally(() => {
+      refreshing = null;
+    });
+  return refreshing;
+}
+
+/** Resolves when the cloud can be used. Shows a one-click "Reconnect" dialog when the sign-in ran out. */
+async function ensureDrive() {
+  if (driveFresh()) return;
+  if (await refreshQuietly()) return;
   reconnecting ??= new Promise((resolve, reject) => {
     const dialog = $('#reconnect');
     const status = $('#reconnect-status');
     const go = $('#reconnect-go');
     let controller = null;
+    const microsoft = state.auth?.provider === 'microsoft';
+    $('#reconnect-title').textContent = `Reconnect ${providerName()}`;
+    $('#reconnect-text').textContent = microsoft
+      ? 'Microsoft asks you to sign in again once a day. Reconnect to keep working — your vault stays unlocked.'
+      : 'For your security, Google’s access lasts one hour. Reconnect to keep working — your vault stays unlocked.';
     setText('#reconnect-status', '');
     go.disabled = false;
     const finish = (fn, value) => {
@@ -958,19 +1469,22 @@ function ensureDrive() {
     };
     reconnectedElsewhere = () => {
       controller?.abort();
-      toast('Reconnected to Google Drive');
+      toast(`Reconnected to ${providerName()}`);
       finish(resolve);
     };
     go.onclick = () => {
       controller = new AbortController();
       go.disabled = true;
-      setText('#reconnect-status', 'Finish signing in in the Google window…');
-      reconnectWithPopup({ clientId: state.config.googleClientId, loginHint: state.identity.email, expectedSub: state.identity.sub, signal: controller.signal }).then(
+      setText('#reconnect-status', `Finish signing in in the ${companyName()} window…`);
+      const popup = microsoft
+        ? reconnectMicrosoftWithPopup({ clientId: state.config.microsoftClientId, loginHint: state.identity.email, previous: state.auth, signal: controller.signal })
+        : reconnectWithPopup({ clientId: state.config.googleClientId, loginHint: state.identity.email, expectedSub: state.identity.sub, signal: controller.signal });
+      popup.then(
         (result) => {
           useToken(result);
           // Every other Secure Box window of this browser can use the new token too.
           channel?.postMessage({ type: 'token', sub: state.identity.sub, accessToken: result.accessToken, expiresAt: result.expiresAt });
-          toast('Reconnected to Google Drive');
+          toast(`Reconnected to ${providerName()}`);
           finish(resolve);
         },
         (err) => {
@@ -982,7 +1496,7 @@ function ensureDrive() {
     };
     dialog.onclose = () => {
       controller?.abort();
-      finish(reject, new GoogleError('cancelled', 'Google Drive is disconnected. Reconnect to continue.'));
+      finish(reject, new GoogleError('cancelled', `${providerName()} is disconnected. Reconnect to continue.`));
     };
     dialog.showModal();
   });
@@ -1016,13 +1530,17 @@ function startAutoLock() {
     document.addEventListener(type, touch, { capture: true, passive: true });
   }
   setInterval(checkAutoLock, 5000);
+  // Microsoft: renew the hour-long access token in the background, before anything needs it.
+  setInterval(() => {
+    if (state.unlocked && state.auth?.provider === 'microsoft' && !driveFresh(10 * 60_000)) refreshQuietly();
+  }, 60_000);
   window.addEventListener('pageshow', checkAutoLock);
   document.addEventListener('visibilitychange', () => {
     checkAutoLock();
     if (document.visibilityState === 'visible' && state.unlocked && Date.now() - state.lastSync > 60_000 && !$('dialog[open]')) syncNow({ quiet: true });
   });
   window.addEventListener('beforeunload', (event) => {
-    if (files?.busy() || tools.busy() || local.busy) event.preventDefault();
+    if (files?.busy() || tools.busy() || device.busy) event.preventDefault();
   });
 }
 
@@ -1031,7 +1549,7 @@ function checkAutoLock() {
   // Another window locked while this one was asleep or in the back/forward cache.
   if (lockedAt() > state.unlockedAt) return lock('other', { fromOtherWindow: true });
   // Uploads, local encryption and playing media count as activity.
-  if (files?.busy() || tools.busy() || local.busy || $$('video, audio').some((m) => !m.paused)) noteActivity();
+  if (files?.busy() || tools.busy() || device.busy || $$('video, audio').some((m) => !m.paused)) noteActivity();
   if (Date.now() - lastActivity >= idleLimit()) lock('idle');
   else if (Date.now() - state.unlockedAt >= sessionLimit()) lock('expired');
 }
@@ -1082,9 +1600,11 @@ function currentPanel() {
 /** What an unlocked window hands to a new one. It travels only in memory, never to disk. */
 function sessionToShare() {
   const fresh = Date.now() - lastActivity < idleLimit() && Date.now() - state.unlockedAt < sessionLimit();
-  if (!state.unlocked || !state.master || (!DEMO && !state.auth) || !fresh || lockedAt() > state.unlockedAt) return null;
+  if (!state.unlocked || !state.master || (!DEMO && !isDevice() && !state.auth) || !fresh || lockedAt() > state.unlockedAt) return null;
   return {
-    auth: DEMO ? null : { accessToken: state.auth.accessToken, expiresAt: state.auth.expiresAt, identity: { ...state.identity }, driveGranted: true },
+    vault: isDevice() ? { provider: 'local', where: state.backend.where, kid: state.master.kid } : { provider: state.provider },
+    // The access token only: a Microsoft refresh token stays in the window that signed in.
+    auth: DEMO || isDevice() ? null : { provider: state.auth.provider || 'google', accessToken: state.auth.accessToken, expiresAt: state.auth.expiresAt, identity: { ...state.identity }, driveGranted: true },
     master: { kid: state.master.kid, key: state.master.key },
     unlockedAt: state.unlockedAt,
   };
@@ -1092,7 +1612,7 @@ function sessionToShare() {
 
 function validSession(s) {
   const auth = s?.auth;
-  const authOk = DEMO || (typeof auth?.accessToken === 'string' && Number.isFinite(auth.expiresAt) && typeof auth.identity?.sub === 'string');
+  const authOk = DEMO || s?.vault?.provider === 'local' || (typeof auth?.accessToken === 'string' && Number.isFinite(auth.expiresAt) && typeof auth.identity?.sub === 'string');
   return Boolean(
     authOk && s.master && typeof s.master.kid === 'string' && s.master.key instanceof Uint8Array && s.master.key.length === 32
       && Number.isFinite(s.unlockedAt) && s.unlockedAt > lockedAt() && Date.now() - s.unlockedAt < sessionLimit(),
@@ -1108,9 +1628,9 @@ function listenToOtherWindows() {
       if (session) channel.postMessage({ type: 'offer', id: data.id, session });
     } else if (data.type === 'lock') {
       if (state.unlocked) lock(data.reason, { fromOtherWindow: true });
-    } else if (data.type === 'local-changed') {
-      // Another window saved to the local vault: pick it up.
-      if (local.store && data.kid === state.master?.kid) local.store.reload().then((changed) => changed && renderAll()).catch(() => {});
+    } else if (data.type === 'vault-changed') {
+      // Another window saved to this device's vault: pick it up.
+      if (state.unlocked && isDevice() && data.kid === state.master?.kid) syncNow({ quiet: true });
     } else if (data.type === 'activity') {
       if (state.unlocked && Number.isFinite(data.at)) lastActivity = Math.max(lastActivity, Math.min(Date.now(), data.at));
     } else if (data.type === 'token') {
@@ -1160,8 +1680,18 @@ async function joinOtherWindow(ownAuth = null) {
   try {
     const shared = await requestSession();
     if (!shared || state.unlocked) return false;
-    if (!DEMO) {
-      // Someone who just chose another Google account doesn't want this one.
+    if (shared.vault?.provider === 'local') {
+      // The other window has this device's vault open: open the same one.
+      if (ownAuth) return false;
+      const here = (await findLocalVaults({ demo: DEMO })).find((v) => v.kid === shared.vault.kid && v.where === shared.vault.where && v.ready);
+      if (!here) return false;
+      state.auth = null;
+      state.provider = 'local';
+      state.backend = createLocalBackend({ where: here.where, handle: here.handle || null, kid: here.kid, demo: DEMO, notify: notifyVaultChanged });
+      state.identity = state.backend.identity;
+      renderSource();
+    } else if (!DEMO) {
+      // Someone who just chose another account (or cloud) doesn't want this one.
       if (ownAuth && ownAuth.identity.sub !== shared.auth.identity.sub) return false;
       let auth = ownAuth;
       if (!auth) {
@@ -1172,10 +1702,8 @@ async function joinOtherWindow(ownAuth = null) {
         }
         auth = { ...shared.auth, identity: { ...shared.auth.identity } };
       }
-      state.auth = auth;
-      state.identity = auth.identity;
-      saveHint(auth.identity.email);
-      state.backend = createCloudBackend(auth);
+      useAuth(auth);
+      state.backend = backendFor(auth);
     }
     showWorking('Opening your Secure Box…');
     await streamingStarted;
@@ -1199,6 +1727,7 @@ async function joinOtherWindow(ownAuth = null) {
 
 function silentSignInAllowed() {
   if (DEMO || !readHint()) return false;
+  if (lastProvider() === 'microsoft' && !microsoftReady()) return false;
   try {
     // At most one background attempt every 20 seconds per tab, so a problem can never loop.
     return Date.now() - (Number(sessionStorage.getItem(SILENT_KEY)) || 0) > 20_000;
@@ -1214,8 +1743,13 @@ function silentSignIn(reason) {
   } catch {
     /* private mode */
   }
-  showWorking('Signing in with Google…');
-  beginGoogleSignIn({ clientId: state.config.googleClientId, loginHint: readHint(), silent: true });
+  const provider = lastProvider();
+  showWorking(`Signing in with ${companyName(provider)}…`);
+  if (provider === 'microsoft') {
+    beginMicrosoftSignIn({ clientId: state.config.microsoftClientId, loginHint: readHint('microsoft'), silent: true }).catch(() => showWelcome());
+    return;
+  }
+  beginGoogleSignIn({ clientId: state.config.googleClientId, loginHint: readHint('google'), silent: true });
 }
 
 function takeLockReason() {
@@ -1570,6 +2104,12 @@ function openPasswordDialog() {
   $('#pw-current').focus();
 }
 
+/** The vaults this device knows of, besides the open one: for "it reaches them when you open them". */
+function otherVaultsNote() {
+  const others = PROVIDERS.filter((p) => p !== state.provider && (p === 'local' ? deviceChoice() : readHint(p))).map((p) => providerName(p));
+  return others.length ? ` Your ${others.join(' and ')} ${others.length === 1 ? 'vault gets' : 'vaults get'} it when you next open ${others.length === 1 ? 'it' : 'them'} here, from the vault menu.` : '';
+}
+
 async function changePassword() {
   const current = $('#pw-current').value;
   const next = $('#pw-new').value;
@@ -1586,7 +2126,8 @@ async function changePassword() {
     await state.backend.saveKeyring(serializeKeyring(doc));
     state.keyringDoc = doc;
     $('#password-dialog').close();
-    toast('Master password changed');
+    await spreadKeyring(state.backend); // this device's vault and the clouds signed in now
+    toast(`Master password changed.${otherVaultsNote()}`);
   } catch (err) {
     setText('#pw-error', err instanceof KeyringError ? 'Your current master password is not correct.' : describeSaveError(err));
   } finally {
@@ -1597,7 +2138,7 @@ async function changePassword() {
 async function newEmergencyKit() {
   const ok = await confirmDialog({
     title: 'Make a new Emergency Kit?',
-    message: 'Your current Emergency Kit will stop working immediately. Save the new one offline — never in Google Drive or email.',
+    message: 'Your current Emergency Kit stops working, for all your vaults. Save the new one offline: never in your cloud drive or email.',
     confirmLabel: 'Make new kit',
   });
   if (!ok) return;
@@ -1607,19 +2148,20 @@ async function newEmergencyKit() {
     await state.backend.saveKeyring(serializeKeyring(doc));
     state.keyringDoc = doc;
     downloadKit(recovery);
-    toast('New Emergency Kit downloaded — the old one no longer works');
+    await spreadKeyring(state.backend);
+    toast(`New Emergency Kit downloaded: the old one no longer works.${otherVaultsNote()}`);
   } catch (err) {
     toast(describeSaveError(err), 'error');
   }
 }
 
-/** A copy of the key ring: with it, .sbox files made with this account open even without Drive. */
+/** A copy of the key ring, which all of this person's vaults share. */
 async function exportKeyring() {
   if (!state.unlocked || !state.keyringDoc) throw new Error('Unlock Secure Box first.');
   const ok = await confirmDialog({
     title: 'Export key ring backup?',
     message:
-      'With this file and your master password or Emergency Kit, .sbox files made with your account open on any device, even without Google Drive. It’s encrypted, but keep it private: it keeps opening with today’s master password and Emergency Kit even after you change them.',
+      'The key ring is your master key, locked with your master password and Emergency Kit. All your vaults share it. With this copy and your master password or Emergency Kit, you can open your .sbox files and messages on any device, and start a new vault with the same master password. Keep it private: it keeps opening with today’s master password and Emergency Kit, even after you change them.',
     confirmLabel: 'Export',
   });
   if (!ok) return;
@@ -1645,34 +2187,44 @@ function closeSearch() {
   $('.topbar').classList.remove('is-searching');
 }
 
-function readHint() {
+// Which account this browser last used, per provider (an email, no secrets).
+const hintKey = (provider) => (provider === 'microsoft' ? `${HINT_KEY}.microsoft` : HINT_KEY);
+
+function readHint(provider = lastProvider()) {
   try {
-    return localStorage.getItem(HINT_KEY) || '';
+    return localStorage.getItem(hintKey(provider)) || '';
   } catch {
     return '';
   }
 }
 
-function saveHint(email) {
+function saveHint(email, provider = 'google') {
   try {
-    if (email) localStorage.setItem(HINT_KEY, email);
+    if (email) localStorage.setItem(hintKey(provider), email);
   } catch {
     /* ignore */
   }
 }
 
-function clearHint() {
+function clearHint(provider = lastProvider()) {
   try {
-    localStorage.removeItem(HINT_KEY);
+    localStorage.removeItem(hintKey(provider));
   } catch {
     /* ignore */
   }
 }
 
 const actions = {
-  signin: () => signIn(),
-  'signin-other': () => signIn('select_account'),
-  'signin-consent': () => signIn('consent'),
+  signin: () => signIn('', 'google'),
+  'signin-microsoft': () => signIn('', 'microsoft'),
+  'signin-other': () => signIn('select_account', 'google'),
+  'signin-other-current': () => signIn('select_account', currentProvider()),
+  'source-switch': (button) => switchVault(button.dataset.provider),
+  'adopt-show': () => showAdopt(),
+  'adopt-pick': () => pickAdoptKeyring(),
+  adopt: () => adoptKeyring(),
+  'adopt-cancel': () => showCreate(),
+  'signin-consent': () => signIn('consent', currentProvider()),
   retry: () => retry(),
   reload: () => location.reload(),
   'search-open': () => openSearch(),
@@ -1691,13 +2243,17 @@ const actions = {
   'new-vault': () => startNewVault(),
   'new-item': () => openEditor(),
   primary: () => (filesMode() ? files.upload() : openEditor()),
-  'local-create': () => createLocal(),
-  'local-allow': () => allowLocalFolder(),
-  'local-forget': () => forgetLocalFolder(),
-  'local-protect': () => protectLocal(),
-  'local-backup': () => backupLocal(),
-  'local-restore': () => restoreLocal(),
-  'local-strays': () => encryptStrays(),
+  'open-device': () => openDeviceVault(),
+  'device-create': () => createDeviceVault(),
+  'device-restore-new': () => restoreDeviceFromGate(),
+  'device-allow': () => allowDeviceFolder(),
+  'device-forget-gate': () => forgetDeviceFolderAtGate(),
+  'show-welcome': () => showWelcome(),
+  'device-protect': () => protectDevice(),
+  'device-backup': () => backupDevice(),
+  'device-restore': () => restoreDevice(),
+  'device-forget': () => forgetDeviceFolder(),
+  'device-strays': () => encryptStrays(),
   lock: () => lock('manual'),
   sync: () => syncNow(),
   'import-csv': () => importCsv(),
