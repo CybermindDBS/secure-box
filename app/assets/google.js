@@ -153,7 +153,10 @@ export function reconnectWithPopup({ clientId, loginHint, expectedSub, signal })
       signal?.removeEventListener('abort', onAbort);
       fn(value);
     };
-    const onAbort = () => finish(reject, new GoogleError('cancelled', 'Cancelled.'));
+    const onAbort = () => {
+      popup.close();
+      finish(reject, new GoogleError('cancelled', 'Cancelled.'));
+    };
     signal?.addEventListener('abort', onAbort);
     channel.onmessage = (event) => {
       const params = new URLSearchParams(event.data?.fragment || '');

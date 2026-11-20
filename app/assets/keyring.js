@@ -138,6 +138,10 @@ export function parseKeyring(text) {
     throw new KeyringError('bad-keyring', 'The key ring file is damaged.');
   }
   const slotOk = (s) => s && typeof s.salt === 'string' && typeof s.iv === 'string' && typeof s.wrapped === 'string';
+  if (typeof doc?.format === 'string' && doc.format !== FORMAT && doc.format.endsWith('-keyring')) {
+    // Intact, but in a format this version doesn't read (Secure Box is still changing its formats).
+    throw new KeyringError('other-version', `This key ring was made by another version of Secure Box (“${doc.format}”), so this one can’t open it.`);
+  }
   if (!doc || doc.format !== FORMAT || typeof doc.kid !== 'string' || !slotOk(doc.password) || !slotOk(doc.recovery)) {
     throw new KeyringError('bad-keyring', 'The key ring file is damaged.');
   }

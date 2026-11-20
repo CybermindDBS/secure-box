@@ -99,6 +99,16 @@ async function folderRoot(picked, create) {
   return picked.getDirectoryHandle(VAULT_DIR, { create });
 }
 
+/** The key id of the vault in a chosen folder (in it, or in its "Secure Box" folder), or null if it holds none. */
+export async function vaultIn(picked) {
+  try {
+    const root = await folderRoot(picked, false);
+    return JSON.parse(await (await (await root.getFileHandle(KEYRING)).getFile()).text()).kid || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The local vaults on this device: [{ kid, where, handle?, name, ready }]. `ready` is false for
  * a folder that needs permission again.
@@ -144,6 +154,82 @@ export async function forgetFolder(kid, { demo = false } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Moving and deleting touch only a vault's own entries (key ring, vault, files), so anything
+// else in a chosen folder stays where it is.
+// ---------------------------------------------------------------------------
+const BLOB_NAME = /^[0-9a-f-]{36}$/i;
+
+const ignoreMissing = (err) => {
+  if (err?.name !== 'NotFoundError') throw err;
+};
+
+async function isEmpty(dir) {
+  return Boolean((await dir.entries().next()).done);
+}
+
+/** False once a directory was deleted (or moved) outside Secure Box: then everything on its handle fails. */
+const reachable = (dir) => dir.entries().next().then(() => true, () => false);
+
+async function writeFrom(dir, name, file, onBytes) {
+  const writable = await (await dir.getFileHandle(name, { create: true })).createWritable();
+  try {
+    const reader = file.stream().getReader();
+    for (let next = await reader.read(); !next.done; next = await reader.read()) {
+      await writable.write(next.value);
+      onBytes?.(next.value.length);
+    }
+    await writable.close();
+  } catch (err) {
+    await writable.abort().catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Copies a vault, exactly as stored, from one directory to another: its encrypted files first,
+ * then the vault and its key ring, so a copy that stops halfway is never taken for a vault. A
+ * place that already has a vault is refused, and on any failure what was written is removed.
+ */
+export async function copyVault(from, to, { onProgress, signal } = {}) {
+  if ((await has(to, KEYRING)) || (await has(to, INDEX))) throw new LocalError('exists', 'There’s already a Secure Box vault there.');
+  const [keyring, index] = await Promise.all([KEYRING, INDEX].map(async (name) => (await from.getFileHandle(name)).getFile()));
+  const fromFiles = await from.getDirectoryHandle(FILES).catch(() => null);
+  const blobs = [];
+  if (fromFiles) {
+    for await (const [name, entry] of fromFiles.entries()) if (entry.kind === 'file' && BLOB_NAME.test(name)) blobs.push({ name, file: await entry.getFile() });
+  }
+  const toFiles = await to.getDirectoryHandle(FILES, { create: true });
+  const total = blobs.reduce((n, b) => n + b.file.size, keyring.size + index.size) || 1;
+  let done = 0;
+  const step = (n) => onProgress?.(Math.min(1, (done += n) / total));
+  const written = [];
+  try {
+    for (const { name, file } of blobs) {
+      signal?.throwIfAborted();
+      written.push([toFiles, name]);
+      await writeFrom(toFiles, name, file, step);
+    }
+    for (const [name, file] of [[INDEX, index], [KEYRING, keyring]]) {
+      written.push([to, name]);
+      await writeFrom(to, name, file, step);
+    }
+    for (const { name, file } of blobs) {
+      if ((await (await toFiles.getFileHandle(name)).getFile()).size !== file.size) throw new LocalError('copy', 'A file didn’t copy completely.');
+    }
+  } catch (err) {
+    for (const [dir, name] of written.reverse()) await dir.removeEntry(name).catch(() => {}); // the key ring goes first
+    if (await isEmpty(toFiles)) await to.removeEntry(FILES).catch(() => {});
+    throw err;
+  }
+}
+
+/** Deletes a vault's own entries from its directory, the key ring first: a delete that stops halfway leaves no vault. */
+export async function removeVault(dir) {
+  for (const name of [KEYRING, INDEX]) await dir.removeEntry(name).catch(ignoreMissing);
+  await dir.removeEntry(FILES, { recursive: true }).catch(ignoreMissing);
+}
+
+// ---------------------------------------------------------------------------
 // The backend (same calls as the cloud ones in backend.js)
 // ---------------------------------------------------------------------------
 /**
@@ -155,14 +241,21 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
   let filesDir = null;
   let stamp = '';
   let currentKid = kid;
+  let lost = null; // set once the vault turns out to be gone (see goneError)
 
   const lockName = () => `secure-box-local:${where}:${spaceKey(currentKid || handle?.name || 'new', demo)}`;
   const withLock = (run) => (navigator.locks ? navigator.locks.request(lockName(), run) : run());
 
   async function open(create = false) {
+    if (lost) throw lost; // never quietly make a new, empty vault where the old one was
     if (root) return root;
-    if (where === 'folder') root = await folderRoot(handle, create);
-    else {
+    if (where === 'folder') {
+      try {
+        root = await folderRoot(handle, create);
+      } catch (err) {
+        throw err.name === 'NotFoundError' ? await goneError() : err;
+      }
+    } else {
       if (!currentKid) throw new LocalError('missing', 'There is no vault on this device yet.');
       root = await (await browserBase(demo, create)).getDirectoryHandle(currentKid, { create });
     }
@@ -170,17 +263,37 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
     return root;
   }
 
+  /** A folder vault that was moved or deleted outside Secure Box: from now on, every call says so. */
+  async function goneError() {
+    root = null;
+    filesDir = null;
+    lost = new LocalError(
+      'gone',
+      (await reachable(handle))
+        ? `Your vault isn’t in “${handle.name}” any more: its “${VAULT_DIR}” folder was moved or deleted.`
+        : `The folder “${handle.name}” that held your vault on this device isn’t there any more.`,
+    );
+    return lost;
+  }
+
   async function readFile(name) {
+    const top = await open();
     try {
-      return await (await (await open()).getFileHandle(name)).getFile();
+      return await (await top.getFileHandle(name)).getFile();
     } catch (err) {
-      if (err.name === 'NotFoundError') return null;
-      throw err;
+      if (err.name !== 'NotFoundError') throw err;
+      if (where === 'folder' && !(await reachable(top))) throw await goneError();
+      return null;
     }
   }
 
   async function writeFile(name, text) {
-    const handleOf = await (await open(true)).getFileHandle(name, { create: true });
+    let handleOf;
+    try {
+      handleOf = await (await open(true)).getFileHandle(name, { create: true });
+    } catch (err) {
+      throw err.name === 'NotFoundError' && where === 'folder' ? await goneError() : err;
+    }
     const writable = await handleOf.createWritable(); // replaces the old file in one step, on close()
     await writable.write(text);
     await writable.close();
@@ -195,9 +308,16 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
 
   const fid = (driveId) => {
     const id = isLocalId(driveId) ? driveId.slice(ID_PREFIX.length) : '';
-    if (!/^[0-9a-f-]{36}$/i.test(id)) throw new Error('Not a file of this device’s vault.');
+    if (!BLOB_NAME.test(id)) throw new Error('Not a file of this device’s vault.');
     return id;
   };
+
+  /** The vault's own folder goes too once it's empty: the key id's folder in the browser, "Secure Box" in a chosen one. */
+  async function dropFolder(top) {
+    if (!(await isEmpty(top))) return;
+    if (where === 'browser') await (await browserBase(demo, false)).removeEntry(currentKid).catch(() => {});
+    else if (!(await top.isSameEntry(handle))) await handle.removeEntry(VAULT_DIR).catch(() => {});
+  }
 
   async function blobOf(driveId) {
     await open();
@@ -229,7 +349,8 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
     async load() {
       if (where === 'browser' && !currentKid) return { keyring: null, vault: null }; // a new vault, not made yet
       try {
-        await open(where === 'folder');
+        // A newly chosen folder gets its vault folder now; a known one must still be there.
+        await open(where === 'folder' && !currentKid);
       } catch (err) {
         if (err.name === 'NotFoundError' && where === 'browser') return { keyring: null, vault: null };
         throw err;
@@ -355,6 +476,74 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
         return empty;
       };
       await prune(top);
+    },
+
+    // ---- Moving and deleting ------------------------------------------------
+    /** The vault's own folder (made if `create`): see the layout at the top. */
+    root: (create = false) => open(create),
+
+    /** After a copy here didn't finish: this place's folders go if they hold nothing. */
+    async dropIfEmpty() {
+      if (!root) return;
+      const top = root;
+      root = null;
+      filesDir = null;
+      const files = await top.getDirectoryHandle(FILES).catch(() => null);
+      if (files && (await isEmpty(files))) await top.removeEntry(FILES).catch(() => {});
+      await dropFolder(top);
+    },
+
+    /**
+     * Moves this vault, exactly as stored, to `target` (a backend for another place on this
+     * device, same key id): copies it, lets the app open the copy (`opened`), then deletes it
+     * here. Other windows' saves wait meanwhile. Resolves with the error that kept the old copy,
+     * if deleting it failed; nothing is deleted when the copy or `opened` fails.
+     */
+    async moveTo(target, { onProgress, signal, opened }) {
+      return withLock(async () => {
+        const from = await open();
+        const to = await target.root(true);
+        if (await from.isSameEntry(to)) throw new LocalError('same', 'Your vault is already there.');
+        // Deleting this copy afterwards would take a copy inside it along.
+        if (await from.resolve?.(to)) {
+          await target.dropIfEmpty().catch(() => {});
+          throw new LocalError('inside', 'That folder is inside your vault’s own folder. Choose one outside it.');
+        }
+        try {
+          await copyVault(from, to, { onProgress, signal });
+        } catch (err) {
+          if (err.code !== 'exists') await target.dropIfEmpty().catch(() => {});
+          throw err;
+        }
+        try {
+          await opened();
+        } catch (err) {
+          // No locks here: a move between two folders shares this one.
+          await removeVault(to).catch(() => {});
+          await target.dropIfEmpty().catch(() => {});
+          throw err;
+        }
+        try {
+          await removeVault(from);
+          root = null;
+          filesDir = null;
+          await dropFolder(from);
+          return null;
+        } catch (err) {
+          return err;
+        }
+      });
+    },
+
+    /** Deletes this vault from this device: its key ring, vault and encrypted files, and nothing else. */
+    async removeAll() {
+      await withLock(async () => {
+        const top = await open();
+        await removeVault(top);
+        root = null;
+        filesDir = null;
+        await dropFolder(top);
+      });
     },
 
     // ---- Backups ----------------------------------------------------------

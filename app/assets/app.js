@@ -29,8 +29,8 @@ import {
 } from './keyring.js';
 import { createLocalTools } from './local-tools.js';
 import { MicrosoftError, beginMicrosoftSignIn, reconnectMicrosoftWithPopup, refreshMicrosoft, takeMicrosoftRedirect } from './microsoft.js';
-import { allowFolder, createLocalBackend, findLocalVaults, forgetFolder, localSupport, readBackup } from './localstore.js';
-import { forgetStreams, startStreaming } from './stream.js';
+import { LocalError, allowFolder, createLocalBackend, findLocalVaults, forgetFolder, localSupport, readBackup, vaultIn } from './localstore.js';
+import { downloadsRunning, forgetStreams, startStreaming } from './stream.js';
 import { $, $$, avatar, confirmDialog, copyText, downloadFile, formatDate, h, icon, pickFile, relativeTime, toast } from './ui.js';
 import { VaultCipher, VaultError, applyChange, emptyVault, hostnameOf, itemsFromCsv, itemsToCsv, makeItem, parseEnvelope, safeHref } from './vault.js';
 
@@ -72,6 +72,8 @@ const state = {
   keyringDoc: null,
   provider: null, // the open vault: 'google', 'microsoft' or 'local'
   switching: null, // the vault being opened instead, while it opens: { provider, step, since }
+  masters: new Map(), // every key ring unlocked this session: kid -> { master, keyringDoc }
+  kids: {}, // the key id each vault turned out to use, by provider (for the vault menu)
   auths: {}, // cloud sign-ins of this session, by provider
   master: null,
   cipher: null,
@@ -136,10 +138,13 @@ async function start() {
     idle: 'Locked after a period of inactivity.',
     expired: 'Your session ended. Unlock to continue.',
     other: 'Locked from another Secure Box window.',
+    deleted: 'Your vault on this device was deleted.',
+    moved: 'Your vault on this device moved in another window. Unlock to open it in its new place.',
+    gone: 'Your vault on this device went missing while it was open.',
   }[reason] || '';
   state.lockMessage = lockMessage;
 
-  const streaming = startStreaming({ describe: describeForStream, read: (id, a, b) => state.backend.readBytes(id, a, b) }).then((ok) => {
+  const streaming = startStreaming({ describe: describeForStream, read: readForStream }).then((ok) => {
     state.streaming = ok;
   });
   streamingStarted = streaming;
@@ -298,14 +303,16 @@ function renderSource() {
       : !available ? 'Coming soon'
       : p === 'local' ? 'Only on this device, not synced'
       : state.auths[p] ? `Open · ${state.auths[p].identity.email}` : `Sign in with ${companyName(p)}`;
-    option.querySelector('small').textContent = sub;
+    // A vault known to have its own key ring says so: switching to it asks for its master password.
+    const ownKey = !current && available && p !== opening && state.master && state.kids[p] && state.kids[p] !== state.master.kid;
+    option.querySelector('small').textContent = ownKey ? `${sub} · own master password` : sub;
   }
 }
 
 /** A cloud sign-in in a pop-up, while Secure Box stays unlocked. Must come from a click. */
-async function signInPopup(provider) {
-  if (provider === 'microsoft') return reconnectMicrosoftWithPopup({ clientId: state.config.microsoftClientId, loginHint: readHint('microsoft') });
-  return { ...(await reconnectWithPopup({ clientId: state.config.googleClientId, loginHint: readHint('google') })), provider: 'google' };
+async function signInPopup(provider, { signal } = {}) {
+  if (provider === 'microsoft') return reconnectMicrosoftWithPopup({ clientId: state.config.microsoftClientId, loginHint: readHint('microsoft'), signal });
+  return { ...(await reconnectWithPopup({ clientId: state.config.googleClientId, loginHint: readHint('google'), signal })), provider: 'google' };
 }
 
 /**
@@ -361,18 +368,25 @@ async function switchVault(provider) {
           : `Your ${providerName(provider)} vault is missing its key ring file. Restore “Secure Box Key Ring.json” from the bin there, then try again.`,
       );
     }
-    if (doc && doc.kid !== state.master.kid) {
-      const ok = await confirmDialog({
-        title: 'A different master password',
-        message: `The vault in ${providerName(provider)} was made with another master password. Secure Box locks, and you can open it with that one.`,
-        confirmLabel: 'Lock and open it',
-      });
-      if (!ok) return;
-      if (auth) state.auths[provider] = auth;
-      rememberProvider(provider);
-      return lock('manual');
+    // The key rings this session has open: the open vault's, and any other unlocked since.
+    state.masters.set(state.master.kid, { master: state.master, keyringDoc: state.keyringDoc });
+    let entry = state.masters.get(state.master.kid);
+    if (doc) {
+      state.kids[provider] = doc.kid;
+      if (doc.kid !== state.master.kid) {
+        // A vault with its own key ring (its own master key, even if its password is the same).
+        entry = state.masters.get(doc.kid);
+        if (!entry) {
+          setSwitchStep('own');
+          const master = await askOwnPassword(doc, provider);
+          if (!master || !state.unlocked) return;
+          await verifyRevision(doc, master);
+          entry = { master, keyringDoc: doc };
+          state.masters.set(doc.kid, entry);
+        }
+      }
     }
-    const cipher = await cipherFor(state.master, backend);
+    const cipher = await cipherFor(entry.master, backend);
     let vault;
     let rev;
     if (!doc) {
@@ -391,7 +405,7 @@ async function switchVault(provider) {
       rev = await backend.create({ keyringText: serializeKeyring(state.keyringDoc), vaultText: await cipher.seal(vault), kid: state.master.kid });
       doc = state.keyringDoc;
     } else {
-      doc = await syncKeyring(doc, backend);
+      doc = await syncKeyring(doc, backend, entry);
       if (loaded.vault) {
         setSwitchStep('decrypt');
         const env = parseEnvelope(loaded.vault.text, cipher.format);
@@ -400,14 +414,14 @@ async function switchVault(provider) {
       } else {
         setSwitchStep('create');
         vault = emptyVault();
-        rev = await backend.createVault(await cipher.seal(vault), state.master.kid);
+        rev = await backend.createVault(await cipher.seal(vault), entry.master.kid);
       }
     }
     await settleSwitching();
     if (!state.unlocked) return;
     await crossFade(() => {
       endSwitching();
-      enterVault({ provider, backend, auth, keyringDoc: doc, cipher, vault, rev });
+      enterVault({ provider, backend, auth, keyringDoc: doc, cipher, vault, rev, master: entry.master });
       markArriving();
     });
     opened = true;
@@ -420,7 +434,11 @@ async function switchVault(provider) {
   }
 }
 
-/** This device's vault for the unlocked key: found, or (after asking where) a new one. */
+/**
+ * This device's vault: the one with the open key ring, else one with a key ring open this session,
+ * else the one used last (if it has its own key ring, switching asks for its password). Only when
+ * there's none at all is a new one made, after asking where.
+ */
 async function deviceBackendForSession() {
   const support = localSupport();
   if (support.ios && !support.standalone) {
@@ -433,7 +451,11 @@ async function deviceBackendForSession() {
   }
   if (!support.browser && !support.folder) throw new Error('This browser can’t keep a vault on this device. Use an up-to-date Chrome, Edge, Firefox or Safari.');
   const vaults = await findLocalVaults({ demo: DEMO });
-  let pick = vaults.find((v) => v.kid === state.master.kid);
+  let pick =
+    vaults.find((v) => v.kid === state.master.kid) ||
+    vaults.find((v) => state.masters.has(v.kid)) ||
+    vaults.find((v) => v.kid === deviceChoice()?.kid) ||
+    vaults[0];
   if (!pick) {
     const choice = await chooseDeviceWhere();
     if (!choice) return null;
@@ -443,12 +465,30 @@ async function deviceBackendForSession() {
   return createLocalBackend({ where: pick.where, handle: pick.handle || null, kid: pick.kid, demo: DEMO, notify: notifyVaultChanged });
 }
 
-/** Where a new vault on this device goes: the browser's storage, or a folder (Chrome and Edge on computers, Chrome on Android). */
-async function chooseDeviceWhere() {
-  if (!localSupport().folder || DEMO) return { where: 'browser' };
+/**
+ * Where a new vault on this device goes: the browser's storage, or a folder (Chrome and Edge on
+ * computers, Chrome on Android). With `moving` (where the vault is now), where it moves to.
+ */
+async function chooseDeviceWhere({ moving = null } = {}) {
+  const folderOk = localSupport().folder && !DEMO;
+  if (!moving && !folderOk) return { where: 'browser' };
   const dialog = $('#device-where');
+  const browser = dialog.querySelector('input[value="browser"]');
+  const folder = dialog.querySelector('input[value="folder"]');
   dialog.returnValue = '';
-  dialog.querySelector('input[value="browser"]').checked = true;
+  setText('#device-where-title', moving ? 'Move your vault on this device' : 'Where on this device?');
+  setText(
+    '#device-where-text',
+    moving
+      ? 'Secure Box copies it there exactly as it is, still encrypted, opens it there, then deletes the old copy.'
+      : 'Your vault on this device opens with your current master password. Nothing in it is uploaded.',
+  );
+  setText('#device-where-folder', moving === 'folder' ? 'In another folder' : 'In a folder you choose');
+  setText('#device-where-ok', moving ? 'Move' : 'Continue');
+  browser.disabled = moving === 'browser';
+  folder.disabled = !folderOk;
+  $('#device-where-now').hidden = moving !== 'browser';
+  (moving === 'browser' ? folder : browser).checked = true;
   const result = await new Promise((resolve) => {
     dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true });
     dialog.showModal();
@@ -493,6 +533,7 @@ function switchStepText(provider, step) {
       find: 'Looking for your vault on this device…',
       load: provider === 'local' ? 'Reading your encrypted vault…' : `Fetching your encrypted vault from ${providerName(provider)}…`,
       decrypt: 'Decrypting it with your master key…',
+      own: 'This vault has its own master password…',
       create: 'Setting up your new vault…',
     }[step] || 'Just a moment…'
   );
@@ -567,8 +608,9 @@ function markArriving() {
   arrivingTimer = setTimeout(() => app.classList.remove('is-arriving'), 900);
 }
 
-/** Makes another vault the open one (no reload, no password: same master key). */
-function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev }) {
+/** Makes another vault the open one, without a reload. `master` is its master key (another one if it has its own key ring). */
+function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev, master = state.master }) {
+  if (state.backend !== backend) rememberLeftVault(); // its downloads keep going
   if (auth) {
     state.auths[provider] = auth;
     state.auth = auth;
@@ -577,7 +619,9 @@ function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev })
     state.auth = null;
     state.identity = backend.identity;
   }
-  Object.assign(state, { provider, backend, keyringDoc, cipher, vault, rev, lastSync: Date.now(), selectedId: null, query: '' });
+  Object.assign(state, { provider, backend, keyringDoc, cipher, vault, rev, master, lastSync: Date.now(), selectedId: null, query: '' });
+  state.masters.set(master.kid, { master, keyringDoc });
+  state.kids[provider] = master.kid;
   state.loaded = null;
   state.revealed.clear();
   rememberProvider(provider);
@@ -595,17 +639,77 @@ function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev })
   if (provider === 'local') checkStrays();
 }
 
-/** Keeps every copy of the key ring at the newest revision. `doc` was just read from `backend`. */
-async function syncKeyring(doc, backend) {
-  const theirs = await verifyRevision(doc, state.master);
-  const ours = trustedRevision(state.keyringDoc);
+/**
+ * Keeps every copy of a key ring at the newest revision. `doc` was just read from `backend`;
+ * `entry` is what this session knows of that key ring ({ master, keyringDoc }), by default the
+ * open vault's. Returns the newest copy.
+ */
+async function syncKeyring(doc, backend, entry = { master: state.master, keyringDoc: state.keyringDoc }) {
+  const theirs = await verifyRevision(doc, entry.master);
+  const ours = trustedRevision(entry.keyringDoc);
   if (theirs > ours) {
-    state.keyringDoc = doc;
-    spreadKeyring(backend).catch((err) => console.warn('Key ring update:', err));
+    entry.keyringDoc = doc;
+    // The other copies catch up now for the open key ring (another key ring's do when its vault is open).
+    if (entry.master.kid === state.master.kid) {
+      state.keyringDoc = doc;
+      spreadKeyring(backend).catch((err) => console.warn('Key ring update:', err));
+    }
     return doc;
   }
-  if (ours > theirs) await backend.saveKeyring(serializeKeyring(state.keyringDoc)).catch((err) => console.warn('Key ring update:', err));
-  return state.keyringDoc;
+  if (ours > theirs) await backend.saveKeyring(serializeKeyring(entry.keyringDoc)).catch((err) => console.warn('Key ring update:', err));
+  return entry.keyringDoc;
+}
+
+/**
+ * A vault with its own key ring: asks for its master password (or its Emergency Kit's recovery
+ * key) in place, without locking. Resolves with its master key, or null if cancelled.
+ */
+function askOwnPassword(doc, provider) {
+  const dialog = $('#own-key');
+  const input = $('#own-key-password');
+  const ok = $('#own-key-ok');
+  setText('#own-key-text', `Your ${placeOfVault(provider)} has its own key ring, so the master password you unlocked with doesn’t open it, even if it’s the same words. Enter the master password you use for it.`);
+  setText('#own-key-error', '');
+  input.value = '';
+  return new Promise((resolve) => {
+    let master = null;
+    const submit = async () => {
+      const secret = input.value;
+      if (!secret) return setText('#own-key-error', 'Enter its master password.');
+      setBusy(ok, true);
+      setText('#own-key-error', '');
+      try {
+        master = await unlockWithPassword(doc, secret).catch((err) => {
+          if (!(err instanceof KeyringError)) throw err;
+          return unlockWithRecovery(doc, secret);
+        });
+        dialog.close('ok');
+      } catch {
+        setText('#own-key-error', 'That isn’t the master password (or recovery key) of this vault.');
+        input.select();
+      } finally {
+        setBusy(ok, false);
+      }
+    };
+    ok.onclick = submit;
+    input.onkeydown = (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      submit();
+    };
+    dialog.addEventListener(
+      'close',
+      () => {
+        input.value = '';
+        ok.onclick = null;
+        input.onkeydown = null;
+        resolve(master);
+      },
+      { once: true },
+    );
+    dialog.showModal();
+    input.focus();
+  });
 }
 
 /**
@@ -667,10 +771,32 @@ async function loadConfig() {
 
 /** Answers the streaming service worker: key + Drive token for one file, only while unlocked. */
 /** What the streaming worker needs for a file: its entry, and where to get the bytes (`fresh`: new addresses). */
+// Vaults left this session (newest first), so downloads that started in them finish after a
+// switch: a ZIP asks for each file as it gets there, and this device's files are read through
+// this page. They're dropped on lock, like everything else.
+const leftVaults = [];
+
+function rememberLeftVault() {
+  if (!state.backend || !state.vault) return;
+  leftVaults.unshift({ backend: state.backend, vault: state.vault });
+  leftVaults.length = Math.min(leftVaults.length, 4);
+}
+
+const streamSources = () => [{ backend: state.backend, vault: state.vault }, ...leftVaults];
+
 async function describeForStream(fileId, options) {
   if (!state.unlocked) return null;
-  const entry = state.vault.files.find((f) => f.id === fileId);
-  return entry ? { entry, ...(await state.backend.describe(entry, options)) } : null;
+  for (const { backend, vault } of streamSources()) {
+    const entry = vault?.files.find((f) => f.id === fileId);
+    if (entry) return { entry, ...(await backend.describe(entry, options)) };
+  }
+  return null;
+}
+
+/** Encrypted bytes of a file being streamed, from whichever vault it belongs to. */
+function readForStream(driveId, start, end) {
+  const source = streamSources().find(({ vault }) => vault?.files.some((f) => f.driveId === driveId));
+  return (source?.backend || state.backend).readBytes(driveId, start, end);
 }
 
 // ===========================================================================
@@ -711,12 +837,19 @@ function showWelcome({ message = '', tone = 'info' } = {}) {
   showPanel('signin');
 }
 
-function showError({ title, message, action = 'retry', actionLabel = 'Try again' }) {
+/**
+ * The error screen, which always has a way on ("Open another vault"). `deletable`: the vault on
+ * this device that couldn't be opened can be deleted from here; `forgettable`: one that's gone
+ * can be forgotten.
+ */
+function showError({ title, message, action = 'retry', actionLabel = 'Try again', deletable = false, forgettable = false }) {
   $('#error-title').textContent = title;
   $('#error-text').textContent = message;
   const button = $('#error-action');
   button.dataset.action = action;
   button.textContent = actionLabel;
+  $('#error-delete').hidden = !deletable;
+  $('#error-forget').hidden = !forgettable;
   showPanel('error');
 }
 
@@ -762,7 +895,7 @@ async function openAccount() {
       setText('#missing-keyring-who', who());
       showPanel('missing-keyring');
     } else if (!state.keyringDoc) {
-      showCreate();
+      showStart();
     } else showUnlock();
   } catch (err) {
     handleError(err);
@@ -859,44 +992,152 @@ async function createAccount() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// A place with no vault yet. First the question that decides everything: is this the first
+// vault (create a master password), or one more for the master password you already have?
+// ---------------------------------------------------------------------------
+const placeOfVault = (provider) => (provider === 'local' ? 'vault on this device' : `${providerName(provider)} vault`);
+
+/** Other vaults this browser has seen: "Google Drive", "OneDrive", "this device". */
+function knownVaultsElsewhere(here) {
+  const known = [];
+  if (here !== 'google' && readHint('google')) known.push('Google Drive');
+  if (here !== 'microsoft' && microsoftReady() && readHint('microsoft')) known.push('OneDrive');
+  if (here !== 'local' && deviceChoice()) known.push('this device');
+  return known;
+}
+
+function showStart() {
+  const here = currentProvider();
+  setText('#start-title', here === 'local' ? 'No vault on this device yet' : `No vault in your ${providerName(here)} yet`);
+  setText('#start-who', who());
+  const known = knownVaultsElsewhere(here);
+  $('#start-existing').classList.toggle('is-suggested', known.length > 0);
+  setText('#start-hint', known.length ? `You’ve used Secure Box with ${known.join(' and ')} in this browser. To keep that master password, choose “No, I already have one”.` : '');
+  showPanel('start');
+}
+
 function showCreate() {
   for (const id of ['#create-password', '#create-confirm']) $(id).value = '';
   setText('#create-error', '');
   setText('#create-who', who());
-  $('#create-adopt').hidden = DEMO;
   showPanel('create');
 }
 
 // ---------------------------------------------------------------------------
-// A new vault, the same master password: it starts with the key ring you already have, from a
-// key ring backup (when Secure Box is unlocked, switching vaults does this by itself).
+// One more vault for the master password you already have, in two steps: bring the key ring of
+// a vault you have (a cloud signs in, in a pop-up; this device's is read here; or a key ring
+// backup file), then unlock it. When Secure Box is unlocked, switching vaults does all this.
 // ---------------------------------------------------------------------------
-function showAdopt() {
+let adoptAbort = null; // cancels a sign-in pop-up that's still open
+
+async function showAdopt() {
   state.adoptDoc = null;
   $('#adopt-password').value = '';
   setText('#adopt-error', '');
-  setText('#adopt-file', '');
   setText('#adopt-who', vaultLabel());
+  const here = currentProvider();
+  setText('#adopt-intro', `Your new ${placeOfVault(here)} starts empty, and opens with the same master password and Emergency Kit as your other vaults.`);
+  for (const button of $$('[data-action="adopt-from"]')) {
+    const from = button.dataset.from;
+    button.hidden = from === here || from === 'local' || (from === 'microsoft' && !microsoftReady());
+  }
+  adoptStep(null);
   showPanel('adopt');
+  if (here !== 'local') {
+    // This device's vault is offered once one is found.
+    const vaults = await findLocalVaults({ demo: DEMO }).catch(() => []);
+    const pick = vaults.find((v) => v.kid === deviceChoice()?.kid) || vaults[0];
+    if (pick) {
+      setText('#adopt-local-note', pick.where === 'folder' ? `Its vault in “${pick.name}”` : 'Its vault in this browser');
+      $('[data-action="adopt-from"][data-from="local"]').hidden = false;
+    }
+  }
+}
+
+/** Step 1 (no key ring yet: where is it?) or step 2 (`found` describes it: now its password). */
+function adoptStep(found) {
+  $('#adopt-step-source').hidden = Boolean(found);
+  $('#adopt-step-unlock').hidden = !found;
+  $('#adopt-open').hidden = !found;
+  $('#adopt-found').textContent = found || '';
+  if (found) $('#adopt-password').focus();
+}
+
+/** While a key ring is fetched: a status line (with Cancel for a pop-up), and nothing else to press. */
+function adoptWaiting(message, { cancellable = false } = {}) {
+  setText('#adopt-status', message);
+  $('#adopt-waiting').hidden = !message;
+  $('[data-action="adopt-stop"]').hidden = !cancellable;
+  for (const button of $$('#adopt-step-source .choice')) button.disabled = Boolean(message);
+}
+
+/** What went wrong while bringing a key ring from `place`, and what to do instead. */
+function adoptProblem(err, place) {
+  if (err?.code === 'network') return `Couldn’t reach ${place} just now. Check your connection and try again, or bring the key ring another way.`;
+  if (err?.code === 'popup-blocked') return err.message;
+  if (err?.code === 'other-version') return `${err.message} Go back and choose “Yes, it’s my first” to start afresh.`;
+  if (err?.code === 'bad-keyring') return `The key ring in ${place} is damaged. Bring it another way, for example from a key ring backup.`;
+  if (err instanceof GoogleError || err instanceof MicrosoftError) return `${place} said: ${err.message}`;
+  return err?.message || String(err);
+}
+
+/** Fetches the key ring of the vault in `from` ('google', 'microsoft' or 'local'). */
+async function adoptFrom(from) {
+  const place = from === 'local' ? 'this device' : providerName(from);
+  setText('#adopt-error', '');
+  adoptAbort = new AbortController();
+  try {
+    let text;
+    let found;
+    if (from === 'local') {
+      adoptWaiting('Reading the key ring on this device…');
+      const vaults = await findLocalVaults({ demo: DEMO });
+      const pick = vaults.find((v) => v.kid === deviceChoice()?.kid) || vaults[0];
+      if (!pick) throw new Error('There’s no vault on this device any more.');
+      if (pick.where === 'folder' && !pick.ready && !(await allowFolder(pick.handle))) throw new Error('Secure Box wasn’t allowed to open its folder.');
+      text = (await createLocalBackend({ where: pick.where, handle: pick.handle || null, kid: pick.kid, demo: DEMO }).load()).keyring;
+      if (!text) throw new Error('The vault on this device has no key ring.');
+      found = pick.where === 'folder' ? `The key ring of your vault in “${pick.name}”` : 'The key ring of your vault in this browser';
+    } else {
+      adoptWaiting(`Sign in with ${companyName(from)} in the pop-up window…`, { cancellable: true });
+      const auth = await signInPopup(from, { signal: adoptAbort.signal });
+      if (!auth.driveGranted) throw new Error(`Secure Box needs access to ${place}. Try again, and allow it when ${companyName(from)} asks.`);
+      auth.provider = from;
+      state.auths[from] = auth; // switching to that vault later needs no new sign-in
+      saveHint(auth.identity.email, from);
+      adoptWaiting(`Fetching the key ring from ${place}…`);
+      text = (await backendFor(auth).load()).keyring;
+      if (!text) throw new Error(`There’s no Secure Box vault in ${place} for ${auth.identity.email}. If yours is in another ${companyName(from)} account, try again and choose that one.`);
+      found = `The key ring of your ${place} vault (${auth.identity.email})`;
+    }
+    state.adoptDoc = parseKeyring(text);
+    adoptStep(found);
+  } catch (err) {
+    state.adoptDoc = null;
+    if (err?.code !== 'cancelled') setText('#adopt-error', adoptProblem(err, place));
+  } finally {
+    adoptAbort = null;
+    adoptWaiting('');
+  }
 }
 
 async function pickAdoptKeyring() {
   const file = await pickFile('.json,application/json');
   if (!file) return;
+  setText('#adopt-error', '');
   try {
     state.adoptDoc = parseKeyring(await file.text());
-    setText('#adopt-file', `Using ${file.name}`);
-    setText('#adopt-error', '');
+    adoptStep(`The key ring backup “${file.name}”`);
   } catch (err) {
     state.adoptDoc = null;
-    setText('#adopt-file', '');
-    setText('#adopt-error', `That isn’t a Secure Box key ring backup (${err.message})`);
+    setText('#adopt-error', err?.code === 'other-version' ? adoptProblem(err) : 'That file isn’t a Secure Box key ring backup. It’s the .json file saved with ⋯ → Key ring backup.');
   }
 }
 
 async function adoptKeyring() {
   const doc = state.adoptDoc;
-  if (!doc) return setText('#adopt-error', 'Load your key ring backup first. In a vault that’s open: ⋯ → Key ring backup.');
+  if (!doc) return setText('#adopt-error', 'First choose where one of your vaults is.');
   const secret = $('#adopt-password').value;
   if (!secret) return setText('#adopt-error', 'Enter your master password.');
   const button = $('[data-action="adopt"]');
@@ -952,6 +1193,7 @@ function showRecover() {
   for (const id of ['#recover-key', '#recover-password', '#recover-confirm']) $(id).value = '';
   setText('#recover-file-name', '');
   setText('#recover-error', '');
+  $('#recover-delete').hidden = !isDevice(); // a cloud vault is deleted in the cloud, not from here
   showPanel('recover');
 }
 
@@ -1007,7 +1249,24 @@ function handleError(err) {
     if (err.code === 'drive-scope') return showError({ title: 'Google Drive access is needed', message: err.message, action: 'signin-consent', actionLabel: 'Continue with Google' });
     return showError({ title: err.code === 'drive-disabled' ? 'Turn on the Google Drive API' : 'Google Drive problem', message: err.message });
   }
-  if (err instanceof VaultError || err instanceof KeyringError) return showError({ title: 'Couldn’t open your vault', message: err.message });
+  if (err instanceof LocalError && err.code === 'gone') {
+    return showError({
+      title: 'Your vault on this device is missing',
+      message: `${err.message} If you moved or renamed it, find it again. If it was deleted, Secure Box can forget it.`,
+      action: 'device-relocate',
+      actionLabel: 'Find the folder…',
+      forgettable: true,
+    });
+  }
+  if (err instanceof KeyringError && err.code === 'other-version') {
+    const startOver = isDevice()
+      ? 'You can delete it below and start over.'
+      : state.provider === 'microsoft'
+        ? 'To start over, delete what’s in “Apps/Secure Box” in your OneDrive, then reload this page.'
+        : 'To start over, move the “Secure Box” folder in your Google Drive to the bin, then reload this page.';
+    return showError({ title: 'This vault is from another version', message: `${err.message} ${startOver}`, deletable: isDevice() });
+  }
+  if (err instanceof VaultError || err instanceof KeyringError) return showError({ title: 'Couldn’t open your vault', message: err.message, deletable: isDevice() });
   return showError({ title: 'Something went wrong', message: err.message || String(err) });
 }
 
@@ -1018,6 +1277,8 @@ function enterApp({ master, cipher, vault, rev, unlockedAt = Date.now() }) {
   channel?.postMessage({ type: 'unlocked', sub: state.identity?.sub });
   $('#account-email').textContent = vaultLabel();
   state.provider ||= state.backend?.provider || 'google';
+  state.masters = new Map([[master.kid, { master, keyringDoc: state.keyringDoc }]]);
+  state.kids[state.provider] = master.kid;
   if (isDevice()) rememberDeviceChoice({ kid: master.kid, where: state.backend.where });
   renderSource();
   $('#demo-badge').hidden = !DEMO;
@@ -1217,7 +1478,9 @@ async function createDeviceVault() {
 async function allowDeviceFolder() {
   const pick = state.devicePick;
   if (!pick) return showWelcome();
-  if (!(await allowFolder(pick.handle))) return setText('#device-allow-error', 'Secure Box wasn’t allowed to open the folder.');
+  // A folder that's gone can't be allowed: opening it then says what happened.
+  const allowed = await allowFolder(pick.handle).catch((err) => (err.name === 'NotFoundError' ? 'gone' : Promise.reject(err)));
+  if (!allowed) return setText('#device-allow-error', 'Secure Box wasn’t allowed to open the folder.');
   await useDeviceVault(pick);
 }
 
@@ -1278,6 +1541,8 @@ function renderDeviceStatus() {
   if (bar.hidden) return;
   $('#menu-device-backup').hidden = backend.where !== 'browser';
   $('#menu-device-forget').hidden = backend.where !== 'folder';
+  // A folder vault can always move (into the browser, or to another folder); one in the browser only where folders exist.
+  $('#menu-device-move').hidden = DEMO || (backend.where === 'browser' && !localSupport().folder);
   const parts = [
     h('span', { class: 'local-where' }, icon(backend.where === 'folder' ? 'folder' : 'device', 16), h('span', { text: backend.where === 'folder' ? `Kept in “${backend.name}”` : 'Kept in this browser' })),
   ];
@@ -1398,6 +1663,148 @@ async function restoreDevice() {
   }
 }
 
+const placeOf = (backend) => (backend.where === 'folder' ? `“${backend.name}”` : 'this browser');
+const counted = (n, one, many) => (n ? `${n} ${n === 1 ? one : many}` : '');
+
+/** ⋯ → Move this vault: copies it to another place exactly as stored, opens it there, then deletes the old copy. */
+async function moveDevice() {
+  if (!isDevice() || device.busy) return;
+  if (files?.unfinished()) return toast('Let the uploads finish, then move the vault.', 'error');
+  const source = state.backend;
+  const choice = await chooseDeviceWhere({ moving: source.where });
+  if (!choice) return;
+  const kid = state.master.kid;
+  const target = createLocalBackend({ where: choice.where, handle: choice.handle || null, kid, demo: DEMO, notify: notifyVaultChanged });
+  device.busy = 'Moving…';
+  renderDeviceStatus();
+  try {
+    await saveChain; // nothing half-saved left behind in the old place
+    const leftover = await source.moveTo(target, {
+      onProgress: busyText('Moving'),
+      // The copy is complete: from here the app reads and saves there.
+      opened: async () => {
+        const { vault } = await target.load(); // also remembers a chosen folder
+        if (!vault) throw new Error('The copy couldn’t be opened.');
+        state.backend = target;
+        state.rev = vault.rev;
+        rememberDeviceChoice({ kid, where: target.where });
+        if (target.where === 'browser') await forgetFolder(kid, { demo: DEMO });
+        forgetStreams();
+      },
+    });
+    channel?.postMessage({ type: 'device-moved', kid }); // other windows with it open lock, then open it in its new place
+    device.protection = '';
+    if (target.where === 'browser') navigator.storage?.persist?.().catch(() => {});
+    if (leftover) toast(`Moved to ${placeOf(target)}, but the old copy couldn’t be deleted: ${leftover.message}`, 'error');
+    else toast(`Moved to ${placeOf(target)}`);
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    device.busy = '';
+    $('#account-email').textContent = vaultLabel();
+    renderSource();
+    renderAll();
+    renderDeviceStatus();
+    checkStrays();
+  }
+}
+
+/** What this browser remembers about a deleted vault on this device: its folder, the choice of it, its last backup. */
+async function forgetDeletedDevice(kid) {
+  await forgetFolder(kid, { demo: DEMO });
+  try {
+    if (deviceChoice()?.kid === kid) localStorage.removeItem(DEVICE_KEY);
+    const all = JSON.parse(localStorage.getItem(BACKUP_KEY) || '{}');
+    delete all[kid];
+    localStorage.setItem(BACKUP_KEY, JSON.stringify(all));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** ⋯ → Delete this vault: deletes the vault on this device for good, then locks. */
+async function deleteDevice() {
+  if (!isDevice() || device.busy) return;
+  const backend = state.backend;
+  const what = [counted(state.vault.items.length, 'password or note', 'passwords and notes'), counted(state.vault.files.length, 'file', 'files')].filter(Boolean).join(' and ');
+  const ok = await confirmDialog({
+    title: 'Delete your vault on this device?',
+    message: [
+      what ? `This deletes its ${what} from ${placeOf(backend)} for good, then locks Secure Box.` : `It’s empty. This deletes it from ${placeOf(backend)}, then locks Secure Box.`,
+      backend.where === 'folder' ? 'Anything else in that folder stays.' : what && !backupAt() ? 'It has never been backed up.' : '',
+      'Your Google Drive and OneDrive vaults aren’t affected.',
+    ].filter(Boolean).join(' '),
+    confirmLabel: 'Delete vault',
+    danger: true,
+  });
+  if (!ok) return;
+  await files.stopAll();
+  device.busy = 'Deleting…';
+  renderDeviceStatus();
+  try {
+    await saveChain; // a save still on its way would bring the vault back
+    await backend.removeAll();
+  } catch (err) {
+    device.busy = '';
+    renderDeviceStatus();
+    toast(`Couldn’t delete it: ${err.message}`, 'error');
+    return;
+  }
+  await forgetDeletedDevice(state.master.kid);
+  lock('deleted'); // every window locks: none of them should show the deleted vault
+}
+
+/** Recovery or error screen → Delete this vault: for a vault on this device that can't be opened any more. */
+async function deleteDeviceAtGate() {
+  if (!isDevice()) return;
+  const backend = state.backend;
+  const ok = await confirmDialog({
+    title: 'Delete the vault on this device?',
+    message: `This deletes its passwords and files from ${placeOf(backend)} for good, without opening it.${backend.where === 'folder' ? ' Anything else in that folder stays.' : ''} Your Google Drive and OneDrive vaults aren’t affected.`,
+    confirmLabel: 'Delete vault',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await backend.removeAll();
+  } catch (err) {
+    showError({ title: 'Couldn’t delete it', message: err.message, deletable: true });
+    return;
+  }
+  await forgetDeletedDevice(backend.kid);
+  channel?.postMessage({ type: 'lock', reason: 'deleted' }); // a window that still had it open
+  showWelcome({ message: 'Your vault on this device was deleted.' });
+}
+
+/** Missing-vault screen → Find the folder: the vault's folder was moved or renamed outside Secure Box. */
+async function relocateDevice() {
+  let handle;
+  try {
+    handle = await window.showDirectoryPicker({ id: 'secure-box-local', mode: 'readwrite' });
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    throw err;
+  }
+  const kid = await vaultIn(handle);
+  if (!kid) {
+    return showError({
+      title: 'No vault in that folder',
+      message: `“${handle.name}” doesn’t hold a Secure Box vault. Choose the folder that does, or let Secure Box forget the missing one.`,
+      action: 'device-relocate',
+      actionLabel: 'Find the folder…',
+      forgettable: true,
+    });
+  }
+  await useDeviceVault({ where: 'folder', handle, kid }); // remembers the folder where it is now
+}
+
+/** Missing-vault screen → Forget it: the vault on this device is gone for good. */
+async function forgetGoneDevice() {
+  const kid = state.backend?.kid;
+  if (kid) await forgetDeletedDevice(kid);
+  showWelcome({ message: 'Secure Box forgot the missing vault on this device.' });
+}
+
 async function forgetDeviceFolder() {
   const name = state.backend?.name || 'this folder';
   const ok = await confirmDialog({
@@ -1472,6 +1879,7 @@ function commit(change) {
       throw new Error('The vault keeps changing on another device. Try again in a moment.');
     } catch (err) {
       setSyncStatus('error');
+      if (err?.code === 'gone') vaultGone();
       throw err;
     }
   };
@@ -1510,8 +1918,17 @@ async function syncNow({ quiet = false } = {}) {
     if (!quiet) toast(changed ? 'Updated with changes from another device' : 'Already up to date');
   } catch (err) {
     setSyncStatus('error');
+    if (err?.code === 'gone') return vaultGone();
     if (!quiet) toast(`Sync failed: ${err.message}`, 'error');
   }
+}
+
+/**
+ * The vault on this device was moved or deleted while open: nothing can be saved to it. Locking
+ * leads to the screen that explains it and offers to find the folder again or forget it.
+ */
+function vaultGone() {
+  if (state.unlocked) lock('gone');
 }
 
 function setSyncStatus(status) {
@@ -1676,14 +2093,74 @@ function startAutoLock() {
   });
 }
 
-function checkAutoLock() {
-  if (!state.unlocked) return;
+let checkingLock = false;
+let lockWaits = false; // the session limit passed while transfers were running
+
+async function checkAutoLock() {
+  if (!state.unlocked || checkingLock) return;
   // Another window locked while this one was asleep or in the back/forward cache.
   if (lockedAt() > state.unlockedAt) return lock('other', { fromOtherWindow: true });
   // Uploads, local encryption and playing media count as activity.
   if (files?.busy() || tools.busy() || device.busy || $$('video, audio').some((m) => !m.paused)) noteActivity();
-  if (Date.now() - lastActivity >= idleLimit()) lock('idle');
-  else if (Date.now() - state.unlockedAt >= sessionLimit()) lock('expired');
+  const reason = Date.now() - lastActivity >= idleLimit() ? 'idle' : Date.now() - state.unlockedAt >= sessionLimit() ? 'expired' : null;
+  if (!reason) return;
+  checkingLock = true;
+  try {
+    // Uploads and downloads still running, in any window, finish first: locking would stop them.
+    const running = await transfersRunning();
+    if (!state.unlocked) return;
+    if (running.total) {
+      if (reason === 'expired' && !lockWaits) {
+        lockWaits = true;
+        toast(`Your session is over. Secure Box locks once ${running.total === 1 ? 'the transfer finishes' : 'the transfers finish'}.`);
+      }
+      return;
+    }
+    lock(reason);
+  } finally {
+    checkingLock = false;
+  }
+}
+
+/** Uploads (this window and the others) and downloads (any window) still running. */
+async function transfersRunning() {
+  const [elsewhere, downloads] = await Promise.all([uploadsElsewhere(), downloadsRunning()]);
+  const uploads = (files?.unfinishedCount() || 0) + elsewhere;
+  return { uploads, downloads, total: uploads + downloads };
+}
+
+/** Uploads still running in the other Secure Box windows of this browser (they answer at once). */
+function uploadsElsewhere(wait = 300) {
+  if (!channel) return Promise.resolve(0);
+  const id = crypto.randomUUID();
+  let total = 0;
+  const onMessage = ({ data }) => {
+    if (data?.type === 'busy' && data.id === id) total += Number(data.uploads) || 0;
+  };
+  channel.addEventListener('message', onMessage);
+  channel.postMessage({ type: 'busy?', id });
+  return new Promise((resolve) =>
+    setTimeout(() => {
+      channel.removeEventListener('message', onMessage);
+      resolve(total);
+    }, wait),
+  );
+}
+
+/** Lock (button, menu): asks first while uploads or downloads are running, since locking stops them. */
+async function lockWhenAsked() {
+  const running = await transfersRunning();
+  if (running.total) {
+    const what = [counted(running.uploads, 'upload', 'uploads'), counted(running.downloads, 'download', 'downloads')].filter(Boolean).join(' and ');
+    const ok = await confirmDialog({
+      title: 'Lock now?',
+      message: `${what[0].toUpperCase()}${what.slice(1)} ${running.total === 1 ? 'is' : 'are'} still running. Locking now stops ${running.total === 1 ? 'it' : 'them'}.`,
+      confirmLabel: 'Lock anyway',
+      danger: true,
+    });
+    if (!ok) return;
+  }
+  lock('manual');
 }
 
 function lockedAt() {
@@ -1763,6 +2240,12 @@ function listenToOtherWindows() {
     } else if (data.type === 'vault-changed') {
       // Another window saved to this device's vault: pick it up.
       if (state.unlocked && isDevice() && data.kid === state.master?.kid) syncNow({ quiet: true });
+    } else if (data.type === 'busy?') {
+      // Another window is about to lock: it waits for uploads running here.
+      if (state.unlocked) channel.postMessage({ type: 'busy', id: data.id, uploads: files?.unfinishedCount() || 0 });
+    } else if (data.type === 'device-moved') {
+      // Another window moved this device's vault: the place this one reads from is gone.
+      if (state.unlocked && isDevice() && data.kid === state.master?.kid) lock('moved', { fromOtherWindow: true });
     } else if (data.type === 'activity') {
       if (state.unlocked && Number.isFinite(data.at)) lastActivity = Math.max(lastActivity, Math.min(Date.now(), data.at));
     } else if (data.type === 'token') {
@@ -2356,8 +2839,16 @@ const actions = {
   'source-switch': (button) => switchVault(button.dataset.provider),
   'adopt-show': () => showAdopt(),
   'adopt-pick': () => pickAdoptKeyring(),
+  'adopt-from': (button) => adoptFrom(button.dataset.from),
+  'adopt-stop': () => adoptAbort?.abort(),
+  'adopt-change': () => {
+    state.adoptDoc = null;
+    setText('#adopt-error', '');
+    adoptStep(null);
+  },
+  'start-show': () => showStart(),
+  'start-new': () => showCreate(),
   adopt: () => adoptKeyring(),
-  'adopt-cancel': () => showCreate(),
   'signin-consent': () => signIn('consent', currentProvider()),
   retry: () => retry(),
   reload: () => location.reload(),
@@ -2387,8 +2878,13 @@ const actions = {
   'device-backup': () => backupDevice(),
   'device-restore': () => restoreDevice(),
   'device-forget': () => forgetDeviceFolder(),
+  'device-move': () => moveDevice(),
+  'device-delete': () => deleteDevice(),
+  'device-delete-gate': () => deleteDeviceAtGate(),
+  'device-relocate': () => relocateDevice(),
+  'device-forget-gone': () => forgetGoneDevice(),
   'device-strays': () => encryptStrays(),
-  lock: () => lock('manual'),
+  lock: () => lockWhenAsked(),
   sync: () => syncNow(),
   'import-csv': () => importCsv(),
   'export-csv': () => exportCsv(),
@@ -2446,6 +2942,7 @@ function wireEvents() {
 
   // Gate forms (plain fields, not <form>s, so browsers don't offer to save the master password)
   onEnter('#unlock-password', 'unlock');
+  onEnter('#adopt-password', 'adopt');
   onEnter('#create-confirm', 'create-account');
   onEnter('#recover-confirm', 'recover');
   onEnter('#pw-confirm', 'pw-save');

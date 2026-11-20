@@ -675,7 +675,17 @@ export function createFilesView(ctx) {
     view.selected.clear();
     ctx.onChange();
     toast(allFiles.length + allFolders.length === 1 ? 'Deleted' : `Deleted ${allFiles.length + allFolders.length} items`);
-    for (const file of allFiles) await store.backend().trash(file.driveId).catch(() => {});
+    // The vault no longer lists them; now their encrypted copies go. Say so if one stays behind.
+    let stayed = 0;
+    let reason = '';
+    for (const file of allFiles) {
+      await store.backend().trash(file.driveId).catch((err) => {
+        console.warn('Delete: the encrypted copy stayed', file.driveId, err);
+        stayed += 1;
+        reason ||= err.message || String(err);
+      });
+    }
+    if (stayed) toast(`Deleted from Secure Box, but ${stayed === 1 ? 'its encrypted copy' : `${stayed} encrypted copies`} couldn’t be removed: ${reason}`, 'error');
   }
 
   function deleteSelectionOr(entry, isFolder) {
@@ -1078,6 +1088,8 @@ export function createFilesView(ctx) {
     busy: () => transfers.some((t) => ['queued', 'preparing', 'uploading'].includes(t.status)),
     /** Uploads still to finish, counting ones paused until the sign-in is renewed. */
     unfinished: () => transfers.some((t) => ['queued', 'preparing', 'uploading', 'paused'].includes(t.status)),
+    /** How many uploads are still to finish (locking would stop them). */
+    unfinishedCount: () => transfers.filter((t) => ['queued', 'preparing', 'uploading', 'paused'].includes(t.status)).length,
     searchKey(event) {
       if (event.key === 'Escape' && view.query) {
         event.preventDefault();

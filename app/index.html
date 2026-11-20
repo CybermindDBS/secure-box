@@ -113,6 +113,25 @@
       <div class="working"><span class="spinner" aria-hidden="true"></span><span id="working-text">Unlocking…</span></div>
     </section>
 
+    <!-- A place with no vault yet: the first vault, or one more for a master password you already have? -->
+    <section class="panel" data-panel="start" hidden>
+      <h2 id="start-title">No vault here yet</h2>
+      <p class="panel-text">Is this your first Secure Box vault?</p>
+      <div class="choice-list">
+        <button id="start-new" class="choice" type="button" data-action="start-new">
+          <span class="choice-icon" data-icon="plus" data-icon-size="20"></span>
+          <span class="choice-text"><strong>Yes, it’s my first</strong><small>Create a master password. It will open this vault and any you add later.</small></span>
+        </button>
+        <button id="start-existing" class="choice" type="button" data-action="adopt-show">
+          <span class="choice-icon" data-icon="key" data-icon-size="20"></span>
+          <span class="choice-text"><strong>No, I already have one</strong><small>Keep the master password and Emergency Kit you have. All your vaults share them.</small></span>
+        </button>
+      </div>
+      <p id="start-hint" class="panel-hint start-hint" hidden></p>
+      <p id="start-who" class="panel-foot" hidden></p>
+      <button class="link-btn" type="button" data-action="show-welcome">Open another vault</button>
+    </section>
+
     <section class="panel" data-panel="create" hidden>
       <h2>Create your master password</h2>
       <p class="panel-text">It encrypts the key to everything in your vault. It's never stored or sent anywhere — Secure Box can't reset it for you.</p>
@@ -128,23 +147,51 @@
       <p class="panel-hint">Use 12+ characters — a short sentence only you would think of works well. Don't save it in your browser or online account.</p>
       <p id="create-error" class="form-error" role="alert" hidden></p>
       <button class="btn btn-primary btn-block" type="button" data-action="create-account"><span class="btn-spinner" aria-hidden="true"></span><span>Create vault</span></button>
-      <button id="create-adopt" class="link-btn" type="button" data-action="adopt-show">Already have a Secure Box vault? Use the same master password</button>
+      <button class="link-btn" type="button" data-action="start-show">Back</button>
       <p id="create-who" class="panel-foot" hidden></p>
     </section>
 
+    <!-- One more vault for the master password you already have: fetch its key ring, then unlock it. -->
     <section class="panel" data-panel="adopt" hidden>
-      <h2>Keep your master password</h2>
-      <p class="panel-text">Your new <span data-provider-name>OneDrive</span> vault starts empty, but opens with the master password and Emergency Kit you already have. Your <span class="mono">.sbox</span> files and local vault keep working too.</p>
-      <button id="adopt-pick" class="btn btn-ghost btn-block" type="button" data-action="adopt-pick" data-icon="key">Load your key ring backup…</button>
-      <p id="adopt-file" class="panel-status" hidden></p>
-      <div class="field">
-        <label for="adopt-password">Master password</label>
-        <input id="adopt-password" class="input" type="password" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+      <h2>Use the master password you have</h2>
+      <p id="adopt-intro" class="panel-text"></p>
+      <div id="adopt-step-source">
+        <p class="choice-label">Where is one of your vaults?</p>
+        <div class="choice-list">
+          <button class="choice" type="button" data-action="adopt-from" data-from="google" hidden>
+            <span class="choice-icon" data-icon="cloud" data-icon-size="20"></span>
+            <span class="choice-text"><strong>Google Drive</strong><small>Sign in to fetch its key ring</small></span>
+          </button>
+          <button class="choice" type="button" data-action="adopt-from" data-from="microsoft" hidden>
+            <span class="choice-icon" data-icon="cloud" data-icon-size="20"></span>
+            <span class="choice-text"><strong>OneDrive</strong><small>Sign in to fetch its key ring</small></span>
+          </button>
+          <button class="choice" type="button" data-action="adopt-from" data-from="local" hidden>
+            <span class="choice-icon" data-icon="device" data-icon-size="20"></span>
+            <span class="choice-text"><strong>This device</strong><small id="adopt-local-note">Its vault here</small></span>
+          </button>
+          <button id="adopt-pick" class="choice" type="button" data-action="adopt-pick">
+            <span class="choice-icon" data-icon="archive" data-icon-size="20"></span>
+            <span class="choice-text"><strong>A key ring backup</strong><small>The file saved with ⋯ → Key ring backup</small></span>
+          </button>
+        </div>
       </div>
-      <p class="panel-hint">No key ring backup? In your other vault: Local → Key ring backup.</p>
+      <div id="adopt-step-unlock" hidden>
+        <div class="choice-found" role="status">
+          <span class="choice-found-icon" data-icon="check" data-icon-size="16"></span>
+          <span id="adopt-found" class="choice-found-text"></span>
+          <button class="link-btn" type="button" data-action="adopt-change">Change</button>
+        </div>
+        <div class="field">
+          <label for="adopt-password">Master password</label>
+          <input id="adopt-password" class="input" type="password" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+        </div>
+        <p class="panel-hint">The master password of that vault. Its Emergency Kit’s recovery key works too.</p>
+      </div>
+      <p id="adopt-waiting" class="panel-status adopt-waiting" role="status" hidden><span class="spinner spinner-sm" aria-hidden="true"></span><span id="adopt-status"></span><button class="link-btn" type="button" data-action="adopt-stop">Cancel</button></p>
       <p id="adopt-error" class="form-error" role="alert" hidden></p>
-      <button class="btn btn-primary btn-block" type="button" data-action="adopt"><span class="btn-spinner" aria-hidden="true"></span><span>Open my new vault</span></button>
-      <button class="link-btn" type="button" data-action="adopt-cancel">Create a new master password instead</button>
+      <button id="adopt-open" class="btn btn-primary btn-block" type="button" data-action="adopt" hidden><span class="btn-spinner" aria-hidden="true"></span><span>Open my new vault</span></button>
+      <button class="link-btn" type="button" data-action="start-show">Back</button>
       <p id="adopt-who" class="panel-foot" hidden></p>
     </section>
 
@@ -199,6 +246,7 @@
       <p id="recover-error" class="form-error" role="alert" hidden></p>
       <button class="btn btn-primary btn-block" type="button" data-action="recover"><span class="btn-spinner" aria-hidden="true"></span><span>Reset & unlock</span></button>
       <button class="link-btn" type="button" data-action="show-unlock">Back</button>
+      <p id="recover-delete" class="panel-foot recover-delete" hidden>No Emergency Kit either? <button class="link-btn link-danger" type="button" data-action="device-delete-gate">Delete this vault and start over…</button></p>
     </section>
 
     <section class="panel" data-panel="missing-keyring" hidden>
@@ -207,6 +255,7 @@
       <button class="btn btn-primary btn-block" type="button" data-action="retry">Try again</button>
       <p id="missing-keyring-who" class="panel-foot" hidden></p>
       <button class="link-btn" type="button" data-action="signin-other-current">Use a different <span data-company-name>Google</span> account</button>
+      <button class="link-btn" type="button" data-action="show-welcome">Open another vault</button>
     </section>
 
     <section class="panel" data-panel="missing-vault" hidden>
@@ -216,12 +265,16 @@
         <button class="btn btn-primary btn-block" type="button" data-action="retry">Try again</button>
         <button class="btn btn-ghost btn-block" type="button" data-action="new-vault">Start a new, empty vault</button>
       </div>
+      <button class="link-btn" type="button" data-action="show-welcome">Open another vault</button>
     </section>
 
     <section class="panel" data-panel="error" hidden>
       <h2 id="error-title">Something went wrong</h2>
       <p id="error-text" class="panel-text"></p>
       <button id="error-action" class="btn btn-primary btn-block" type="button" data-action="retry">Try again</button>
+      <button id="error-forget" class="link-btn" type="button" data-action="device-forget-gone" hidden>Forget it</button>
+      <button id="error-delete" class="link-btn link-danger" type="button" data-action="device-delete-gate" hidden>Delete this vault…</button>
+      <button class="link-btn" type="button" data-action="show-welcome">Open another vault</button>
     </section>
 
     <section class="panel" data-panel="setup" hidden>
@@ -376,7 +429,9 @@
   <div id="menu-device" hidden>
     <button id="menu-device-backup" class="menu-item" type="button" data-action="device-backup" data-icon="download">Back up this vault</button>
     <button class="menu-item" type="button" data-action="device-restore" data-icon="upload">Restore a backup…</button>
+    <button id="menu-device-move" class="menu-item" type="button" data-action="device-move" data-icon="move">Move this vault…</button>
     <button id="menu-device-forget" class="menu-item" type="button" data-action="device-forget" data-icon="folder">Stop using this folder…</button>
+    <button class="menu-item menu-danger" type="button" data-action="device-delete" data-icon="trash">Delete this vault…</button>
   </div>
   <div class="menu-sep" role="separator"></div>
   <button class="menu-item" type="button" data-action="change-password" data-icon="key">Change master password…</button>
@@ -675,24 +730,42 @@
   </div>
 </dialog>
 
+<!-- Switching to a vault with its own key ring: its master password, asked in place (no lock) -->
+<dialog id="own-key" class="dialog dialog-sm" aria-labelledby="own-key-title">
+  <div class="dialog-body">
+    <h2 id="own-key-title">This vault has its own master password</h2>
+    <p id="own-key-text" class="panel-text"></p>
+    <div class="field">
+      <label for="own-key-password">Its master password</label>
+      <input id="own-key-password" class="input" type="password" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+    </div>
+    <p id="own-key-error" class="form-error" role="alert" hidden></p>
+    <p class="panel-hint">Its Emergency Kit’s recovery key works too. Both vaults stay open until you lock, so switching back won’t ask again.</p>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn btn-ghost" type="button" data-close="cancel">Cancel</button>
+    <button id="own-key-ok" class="btn btn-primary" type="button"><span class="btn-spinner" aria-hidden="true"></span><span>Open it</span></button>
+  </div>
+</dialog>
+
 <dialog id="device-where" class="dialog dialog-sm" aria-labelledby="device-where-title">
   <div class="dialog-body">
     <h2 id="device-where-title">Where on this device?</h2>
-    <p class="panel-text">Your vault on this device opens with your current master password. Nothing in it is uploaded.</p>
+    <p id="device-where-text" class="panel-text">Your vault on this device opens with your current master password. Nothing in it is uploaded.</p>
     <div class="local-where-choice" role="radiogroup" aria-label="Where to keep it">
       <label class="local-option">
         <input type="radio" name="device-where" value="browser" checked>
-        <span><strong>In this browser</strong><small>Nothing to set up. Clearing this site’s data in the browser deletes it.</small></span>
+        <span><strong>In this browser</strong><small>Nothing to set up. Clearing this site’s data in the browser deletes it.</small><em id="device-where-now" class="local-now" hidden>Where it is now</em></span>
       </label>
       <label class="local-option">
         <input type="radio" name="device-where" value="folder">
-        <span><strong>In a folder you choose</strong><small>Ordinary encrypted files you can see, copy and back up. A synced folder works too.</small></span>
+        <span><strong id="device-where-folder">In a folder you choose</strong><small>Ordinary encrypted files you can see, copy and back up. A synced folder works too.</small></span>
       </label>
     </div>
   </div>
   <div class="dialog-foot">
     <button class="btn btn-ghost" type="button" data-close="cancel">Cancel</button>
-    <button class="btn btn-primary" type="button" data-close="ok">Continue</button>
+    <button id="device-where-ok" class="btn btn-primary" type="button" data-close="ok">Continue</button>
   </div>
 </dialog>
 

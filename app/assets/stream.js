@@ -76,6 +76,21 @@ export function zipUrl(job) {
   return `__unibox/zip/${id}/${encodeURIComponent(job.name)}`;
 }
 
+/** How many downloads the streaming worker is serving right now, from any window (0 if it can't tell). */
+export function downloadsRunning() {
+  const worker = navigator.serviceWorker?.controller;
+  if (!worker) return Promise.resolve(0);
+  return new Promise((resolve) => {
+    const reply = new MessageChannel();
+    const timer = setTimeout(() => resolve(0), 1000);
+    reply.port1.onmessage = (event) => {
+      clearTimeout(timer);
+      resolve(Number(event.data?.downloads) || 0);
+    };
+    worker.postMessage({ type: 'unibox-busy' }, [reply.port2]);
+  });
+}
+
 /** Drops every key and token the service worker may still hold. */
 export function forgetStreams() {
   zipJobs.clear();

@@ -48,7 +48,7 @@ import {
 import { find, parseXml, textOf } from '../app/assets/xml.js';
 import { readZipDirectory, readZipEntry, readZipText, zipStore } from '../app/assets/zip.js';
 import { boxAccess, openContent, readBox, unlockBox, writeBox, zipEntries, zipEntryData, zipFolder } from '../app/assets/localbox.js';
-import { readBackup } from '../app/assets/localstore.js';
+import { createLocalBackend, readBackup, vaultIn } from '../app/assets/localstore.js';
 
 const S = globalThis.UniboxStream;
 const random = (n) => crypto.getRandomValues(new Uint8Array(n));
@@ -249,6 +249,9 @@ test('files, vaults and key rings carry the Secure Box names', async () => {
   const { doc } = await createKeyring('a fresh master password', master);
   assert.equal(doc.format, 'secure-box-keyring');
   assert.ok(!serializeKeyring(doc).includes('unibox'));
+  // A key ring in another version's format says so, rather than "damaged".
+  assert.throws(() => parseKeyring(JSON.stringify({ ...doc, format: 'unibox-keyring' })), { code: 'other-version', message: /another version of Secure Box/ });
+  assert.throws(() => parseKeyring('{"format": "secure-box-keyring", "kid": 1'), { code: 'bad-keyring' });
 });
 
 test('Padmé padding leaks little and costs at most ~12%', () => {
@@ -664,6 +667,198 @@ test('a backup of the vault on this device carries its key ring, and only versio
   await assert.rejects(readBackup(backup(manifest, { keyring: false })), { code: 'not-backup' });
   await assert.rejects(readBackup(backup({ ...manifest, version: 1 })), { code: 'not-backup' });
   await assert.rejects(readBackup(backup({ ...manifest, version: 3 })), { code: 'newer' });
+});
+
+// --- The vault on this device: moving and deleting -----------------------------------------
+// An in-memory stand-in for the browser's folder handles (File System Access API).
+const fsError = (name, message) => Object.assign(new Error(message), { name });
+// Like the browser's: once deleted, everything on a handle fails with NotFoundError.
+const ensureThere = (entry) => {
+  if (entry.removed) throw fsError('NotFoundError', `${entry.name} was deleted`);
+};
+const markRemoved = (entry) => {
+  entry.removed = true;
+  for (const child of entry.children?.values() || []) markRemoved(child);
+};
+class MemFile {
+  constructor(name, opts) {
+    Object.assign(this, { kind: 'file', name, opts, data: new Uint8Array(0) });
+  }
+  async getFile() {
+    ensureThere(this);
+    return new File([this.data], this.name);
+  }
+  async createWritable() {
+    ensureThere(this);
+    const parts = [];
+    return {
+      write: async (chunk) => {
+        if (this.opts.failWrite?.(this.name)) throw new Error(`Disk full while writing ${this.name}`);
+        parts.push(Buffer.from(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk));
+      },
+      close: async () => {
+        this.data = new Uint8Array(Buffer.concat(parts));
+      },
+      abort: async () => {},
+    };
+  }
+  async isSameEntry(other) {
+    return other === this;
+  }
+}
+class MemDir {
+  constructor(name, opts = {}) {
+    Object.assign(this, { kind: 'directory', name, opts, children: new Map() });
+  }
+  async getDirectoryHandle(name, { create = false } = {}) {
+    ensureThere(this);
+    if (!this.children.has(name) && create) this.children.set(name, new MemDir(name, this.opts));
+    const entry = this.children.get(name);
+    if (!entry) throw fsError('NotFoundError', `${name} not found`);
+    if (entry.kind !== 'directory') throw fsError('TypeMismatchError', `${name} is a file`);
+    return entry;
+  }
+  async getFileHandle(name, { create = false } = {}) {
+    ensureThere(this);
+    if (!this.children.has(name) && create) this.children.set(name, new MemFile(name, this.opts));
+    const entry = this.children.get(name);
+    if (!entry) throw fsError('NotFoundError', `${name} not found`);
+    if (entry.kind !== 'file') throw fsError('TypeMismatchError', `${name} is a folder`);
+    return entry;
+  }
+  async removeEntry(name, { recursive = false } = {}) {
+    ensureThere(this);
+    const entry = this.children.get(name);
+    if (!entry) throw fsError('NotFoundError', `${name} not found`);
+    if (entry.kind === 'directory' && entry.children.size && !recursive) throw fsError('InvalidModificationError', `${name} isn’t empty`);
+    this.children.delete(name);
+    markRemoved(entry);
+  }
+  async *entries() {
+    ensureThere(this);
+    yield* [...this.children.entries()];
+  }
+  async isSameEntry(other) {
+    return other === this;
+  }
+  async resolve(other) {
+    if (other === this) return [];
+    for (const [name, entry] of this.children) {
+      const below = entry.kind === 'directory' ? await entry.resolve(other) : null;
+      if (below) return [name, ...below];
+    }
+    return null;
+  }
+}
+/** Every file under a folder as { 'path/name': base64 bytes }, to compare places. */
+function snapshot(dir, prefix = '') {
+  const out = {};
+  for (const [name, entry] of dir.children) {
+    if (entry.kind === 'file') out[prefix + name] = Buffer.from(entry.data).toString('base64');
+    else Object.assign(out, snapshot(entry, `${prefix}${name}/`));
+  }
+  return out;
+}
+const deviceKid = '0123456789abcdef';
+const inFolder = (handle) => createLocalBackend({ where: 'folder', handle, kid: deviceKid });
+async function writeText(dir, name, text) {
+  const writable = await (await dir.getFileHandle(name, { create: true })).createWritable();
+  await writable.write(text);
+  await writable.close();
+}
+/** A vault in a chosen folder (in its "Secure Box" folder), with a few encrypted-file stand-ins. */
+async function folderVault(picked, blobs = 3) {
+  const backend = inFolder(picked);
+  await backend.create({ keyringText: JSON.stringify({ format: 'secure-box-keyring', kid: deviceKid }), vaultText: '{"format":"secure-box-local-index"}', kid: deviceKid });
+  for (let i = 0; i < blobs; i++) {
+    const bytes = random(1000 + 700 * i);
+    await (await backend.openUpload({ fid: crypto.randomUUID() }))(bytes, 0, bytes.length);
+  }
+  return backend;
+}
+
+test('moving the vault on this device copies it byte for byte, then deletes only its own files there', async () => {
+  const documents = new MemDir('Documents');
+  const source = await folderVault(documents);
+  const own = await documents.getDirectoryHandle('Secure Box');
+  await writeText(own, 'notes.txt', 'put here by hand');
+  const { 'notes.txt': stray, ...vaultOnly } = snapshot(own);
+  assert.equal(Object.keys(vaultOnly).filter((path) => path.startsWith('files/')).length, 3);
+
+  const synced = new MemDir('Synced');
+  const target = inFolder(synced);
+  const progress = [];
+  let opened = false;
+  const leftover = await source.moveTo(target, { onProgress: (p) => progress.push(p), opened: async () => (opened = true) });
+  assert.equal(leftover, null);
+  assert.ok(opened, 'the app opened the copy before the old one was deleted');
+  assert.equal(progress.at(-1), 1);
+  assert.deepEqual(snapshot(await synced.getDirectoryHandle('Secure Box')), vaultOnly, 'key ring, vault and every file, byte for byte');
+  assert.deepEqual(snapshot(documents), { 'Secure Box/notes.txt': stray }, 'only the vault left the old folder');
+  assert.ok((await target.load()).vault, 'the copy opens');
+});
+
+test('a move is refused where a vault already is or inside the vault, and a failed one leaves nothing behind', async () => {
+  const documents = new MemDir('Documents');
+  const source = await folderVault(documents);
+  const before = snapshot(documents);
+  const quietly = { opened: async () => {} };
+
+  const taken = new MemDir('Taken');
+  await folderVault(taken, 1);
+  const takenBefore = snapshot(taken);
+  await assert.rejects(source.moveTo(inFolder(taken), quietly), { code: 'exists' });
+  assert.deepEqual(snapshot(taken), takenBefore, 'the vault that was there is untouched');
+
+  await assert.rejects(source.moveTo(inFolder(documents), quietly), { code: 'same' });
+  const own = await documents.getDirectoryHandle('Secure Box');
+  const inner = await own.getDirectoryHandle('inner', { create: true });
+  await assert.rejects(source.moveTo(inFolder(inner), quietly), { code: 'inside' });
+  assert.equal(inner.children.size, 0, 'nothing was made inside the vault');
+  await own.removeEntry('inner');
+
+  const full = new MemDir('Full', { failWrite: (name) => name === 'index.json' });
+  await assert.rejects(source.moveTo(inFolder(full), quietly), /Disk full/);
+  assert.equal(full.children.size, 0, 'a copy that stopped halfway is cleared away');
+  const unopened = new MemDir('Unopened');
+  await assert.rejects(source.moveTo(inFolder(unopened), { opened: async () => { throw new Error('could not open'); } }), /could not open/);
+  assert.equal(unopened.children.size, 0, 'a copy the app couldn’t open is cleared away');
+
+  assert.deepEqual(snapshot(documents), before, 'the vault stayed where it was, untouched');
+});
+
+test('a folder vault moved or deleted outside Secure Box says so, and is never quietly made again', async () => {
+  const home = new MemDir('Home');
+  const documents = await home.getDirectoryHandle('Documents', { create: true });
+  await folderVault(documents);
+  assert.equal(await vaultIn(documents), deviceKid, 'a folder holding a vault is recognised');
+  assert.equal(await vaultIn(new MemDir('Empty')), null);
+
+  // Its "Secure Box" folder deleted by hand: the chosen folder is still there, the vault isn't.
+  await documents.removeEntry('Secure Box', { recursive: true });
+  const known = inFolder(documents);
+  await assert.rejects(known.load(), { code: 'gone', message: /isn’t in “Documents” any more/ });
+  await assert.rejects(known.saveKeyring('{}'), { code: 'gone' });
+  assert.equal(documents.children.size, 0, 'no new, empty vault appeared in its place');
+
+  // The chosen folder itself deleted by hand.
+  await home.removeEntry('Documents', { recursive: true });
+  await assert.rejects(inFolder(documents).load(), { code: 'gone', message: /“Documents” that held your vault .* isn’t there any more/ });
+
+  // A newly chosen folder (no key id yet) is a new vault, not a missing one.
+  assert.deepEqual(await createLocalBackend({ where: 'folder', handle: new MemDir('New') }).load(), { keyring: null, vault: null });
+});
+
+test('deleting the vault on this device removes only its own files, and its folder once empty', async () => {
+  const documents = new MemDir('Documents');
+  await (await folderVault(documents)).removeAll();
+  assert.equal(documents.children.size, 0, 'its "Secure Box" folder went too');
+
+  const photos = new MemDir('Photos');
+  const vault = await folderVault(photos);
+  await writeText(await photos.getDirectoryHandle('Secure Box'), 'notes.txt', 'put here by hand');
+  await vault.removeAll();
+  assert.deepEqual(Object.keys(snapshot(photos)), ['Secure Box/notes.txt'], 'what someone else put there stays');
 });
 
 test('the local vault index has its own key: it can never pass for the vault, or the other way round', async () => {

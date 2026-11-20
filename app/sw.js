@@ -29,8 +29,58 @@ self.addEventListener('activate', function (event) {
   event.waitUntil(self.clients.claim());
 });
 self.addEventListener('message', function (event) {
-  if (event.data && event.data.type === 'unibox-forget') known.clear();
+  var type = event.data && event.data.type;
+  if (type === 'unibox-forget') known.clear();
+  // A window about to lock asks first: locking would stop downloads that are still running.
+  else if (type === 'unibox-busy' && event.ports && event.ports[0]) event.ports[0].postMessage({ downloads: downloadsRunning() });
 });
+
+// ---------------------------------------------------------------------------
+// Downloads under way (single files and ZIPs, not playback). One that moved no data for two
+// minutes (paused, or stuck) no longer counts, so it can't keep Secure Box unlocked forever.
+// ---------------------------------------------------------------------------
+var downloads = new Set();
+
+function downloadsRunning() {
+  var now = Date.now();
+  var running = 0;
+  downloads.forEach(function (d) {
+    if (now - d.at < 120000) running += 1;
+  });
+  return running;
+}
+
+/** `stream`, counted as a download for as long as it runs. */
+function counted(stream) {
+  var reader = stream.getReader();
+  var record = { at: Date.now() };
+  downloads.add(record);
+  var finish = function () {
+    downloads.delete(record);
+  };
+  return new ReadableStream(
+    {
+      pull: async function (controller) {
+        try {
+          var next = await reader.read();
+          record.at = Date.now();
+          if (next.done) {
+            finish();
+            controller.close();
+          } else controller.enqueue(next.value);
+        } catch (err) {
+          finish();
+          controller.error(err);
+        }
+      },
+      cancel: function (reason) {
+        finish();
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 2 },
+  );
+}
 
 self.addEventListener('fetch', function (event) {
   var url = new URL(event.request.url);
@@ -295,7 +345,8 @@ async function serve(event, url) {
   base['Content-Length'] = String(to - from + 1);
 
   await header(info);
-  return new Response(await primed(plainStream(info, from, to)), { status: status, headers: headersFor(entry, base) });
+  var body = await primed(plainStream(info, from, to));
+  return new Response(download ? counted(body) : body, { status: status, headers: headersFor(entry, base) });
 }
 
 /**
@@ -394,7 +445,7 @@ async function serveZip(event, url) {
     },
     { highWaterMark: 2 },
   );
-  return new Response(body, {
+  return new Response(counted(body), {
     headers: headersFor(null, {
       'Content-Type': 'application/zip',
       'Content-Disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(job.name),

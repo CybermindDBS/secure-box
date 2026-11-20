@@ -80,7 +80,9 @@ Then open http://localhost:8080/index.html?demo. The demo master password is `se
 - Google's access lasts one hour. After that you click **Reconnect** once, and your vault stays unlocked. One reconnect serves every open Secure Box window.
 - Once you've signed in on a browser, Secure Box reconnects to Google by itself when you open it, so only your master password is asked. It remembers only which Google account you used. To switch, choose **Use a different Google account** on the unlock screen.
 
-**Session.** Secure Box auto-locks after 10 minutes of inactivity. Locking reloads the page, which drops every key and secret from memory. Copied passwords are cleared from the clipboard after 30 seconds.
+**Session.** Secure Box auto-locks after 10 minutes of inactivity, and after 8 hours in any case. Locking reloads the page, which drops every key and secret from memory. Copied passwords are cleared from the clipboard after 30 seconds.
+- Uploads and downloads still running, in any window, hold both automatic locks until they finish. A download that has moved no data for two minutes stops counting.
+- **Lock** asks first while uploads or downloads are running, since locking stops them.
 
 **Several windows.** The Secure Box windows and tabs of one browser share a single unlocked session:
 - A new window opens already unlocked while another one is unlocked, and unlocking one window unlocks the others that are waiting.
@@ -220,7 +222,15 @@ Your vault, files and Emergency Kit live in Google Drive, so nothing needs copyi
 - **Google Drive** or **OneDrive** (recommended): on all your devices, and safe if you lose one.
 - **Only on this device**: no account needed, but nothing syncs, so you back it up yourself.
 
+**A place with no vault yet** asks one question: **Is this your first Secure Box vault?**
+- **Yes, it's my first:** create a master password. It opens this vault and any you add later.
+- **No, I already have one:** say where one of your vaults is: Google Drive or OneDrive (it signs in, in a pop-up), this device, or a key ring backup file. Then enter that vault's master password. The new vault shares its master password and Emergency Kit.
+- If the other cloud can't be reached, or has no vault for that account, Secure Box says so; choose another of the ways instead.
+
 After that, Secure Box opens the vault you used last. The name next to **Passwords** and **Files** says which one is open. Click it to switch to another: a cloud asks you to sign in once, a new place is set up with your current master password, and you never type the password again to switch. Each vault keeps its own passwords and files.
+- **A vault with its own key ring** (set up separately, so it has its own master key even if its password is the same) asks for its own master password when you switch to it, without locking. Both stay open until you lock. The vault menu marks such a vault "own master password".
+- **Downloads keep going when you switch.** A download started in one vault finishes after you open another. Uploads belong to their vault, so switching asks first and stops them.
+- **Nothing leaves you stuck.** Every error screen has **Open another vault**. If a vault on this device was moved or deleted outside Secure Box, it says so and offers **Find the folder…** (if you moved it) or **Forget it**.
 
 Your browser's **Back** and **Forward** buttons move between tabs and folders, close the viewer, and on phones close an open password.
 
@@ -255,7 +265,7 @@ Your browser's **Back** and **Forward** buttons move between tabs and folders, c
 
 **Menu (⋯)**
 - Sync now
-- For a vault on this device: **Back up this vault**, **Restore a backup…**, and for a folder, **Stop using this folder…**
+- For a vault on this device: **Back up this vault**, **Restore a backup…**, **Move this vault…**, **Delete this vault…**, and for a folder, **Stop using this folder…**
 - **Change master password** (your Emergency Kit keeps working)
 - **New Emergency Kit** (the old one stops working)
 - **Key ring backup** (below)
@@ -272,6 +282,15 @@ Passwords and files kept only here: nothing is uploaded. It works like a cloud v
 - **Back up** saves the whole vault as one `.zip`, exactly as stored and still encrypted, so you can keep it anywhere. The bar reminds you when it's out of date.
 - **Restore a backup.** On a new phone or computer, choose **Keep it only on this device → Restore a backup…** on the first screen, then unlock with your master password. In an open vault, **⋯ → Restore a backup…** adds back whatever is missing.
 - **Files put in by hand.** If someone copies plain files into a folder vault's `Secure Box` folder, the bar lists them and offers **Encrypt them**. Each one is encrypted into the vault, and then the unencrypted original is deleted.
+- **Move this vault.** **⋯ → Move this vault…** moves it between this browser and a folder, or from one folder to another, wherever folders can be chosen.
+  - Secure Box copies it exactly as stored, still encrypted, and checks the copy. It opens the copy, then deletes the old one.
+  - If anything goes wrong, nothing is deleted and the vault stays where it was.
+  - It won't move into a place that already has a vault, or into a folder inside its own.
+  - Files someone else put in the old folder stay there.
+- **Delete this vault.** **⋯ → Delete this vault…** deletes its key ring, its vault and every encrypted file from this device, then locks.
+  - Anything else in a chosen folder stays.
+  - It can't be undone, except from a backup.
+  - A vault you can't open any more can be deleted too: from **Forgot master password? → Delete this vault and start over…**, or from the error screen if it can't be read.
 
 **Tools (⋯ menu)**
 
@@ -283,7 +302,7 @@ These work on your computer or phone and upload nothing.
 - **Add a sharing password** lets someone without your account open the files: they go to Secure Box, choose **Open a .sbox file** on the sign-in screen, and enter the password. Send the password separately from the files. Your own account can always open them too.
 - **Decrypt .sbox files:** files made with your account open straight away. Others ask for their sharing password, or for the key ring backup of the account that made them. A folder is unpacked into the folder you choose, or downloaded as a `.zip`.
 - **Encrypt text:** type or paste text and press **Encrypt** to get a message block to paste anywhere. Paste a message block instead, and the button turns into **Decrypt**. Add a sharing password, and someone without an account can read it with **Read a message** on the sign-in screen.
-- **Key ring backup:** saves a copy of your key ring: your master key, locked with your master password and Emergency Kit. With it you can open your `.sbox` files and messages on any device, and start a new vault with the same master password (**Already have a Secure Box vault? Use the same master password** when you create one). Keep it private: it keeps opening with the master password and Emergency Kit you have on the day you export it, even after you change them.
+- **Key ring backup:** saves a copy of your key ring: your master key, locked with your master password and Emergency Kit. With it you can open your `.sbox` files and messages on any device, and start a new vault with the same master password (**No, I already have one → A key ring backup** when you create one). Keep it private: it keeps opening with the master password and Emergency Kit you have on the day you export it, even after you change them.
 
 ### Install as an app
 
@@ -302,7 +321,7 @@ Secure Box can be installed like an app. It opens in its own window, and browser
 | A bad change to the vault | In Drive, right-click `Secure Box Vault.json` → **Manage versions** and download an earlier version. |
 | No access to Google Drive, but you need your `.sbox` files | On the sign-in screen, choose **Open a .sbox file**, load your key ring backup, and enter your master password or Emergency Kit recovery key. |
 | The vault on this device is gone (site data cleared, new phone) | On the first screen, choose **Keep it only on this device → Restore a backup…** with your latest backup, then unlock with your master password. |
-| Lost both the master password and the Emergency Kit | The data can't be recovered. That's the point of the encryption. |
+| Lost both the master password and the Emergency Kit | The data can't be recovered. That's the point of the encryption. For a vault on this device, **Forgot master password? → Delete this vault and start over…** clears it away. |
 
 ## Troubleshooting
 
@@ -329,7 +348,7 @@ npm test
 ```
 
 - `npm run dev` serves `app/` at http://localhost:8080. Add `?demo` to the URL for the in-memory demo.
-- `npm test` runs 43 unit tests, covering the key ring and its revisions, encryption formats, `.sbox` files, encrypted messages, the local vault's index key and backups, tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, and OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive).
+- `npm test` runs 47 unit tests, covering the key ring and its revisions, encryption formats, `.sbox` files, encrypted messages, the local vault's index key and backups, moving and deleting it, and a vault folder moved or deleted outside Secure Box (against a stand-in for a chosen folder), tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, and OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive).
 
 ```
 app/

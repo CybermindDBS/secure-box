@@ -3659,6 +3659,155 @@ a.menu-item {
   line-height: 1.45;
 }
 
+/* Moving a vault: where it is now can't be chosen */
+.local-option:has(input:disabled) {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.local-now {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11.5px;
+  font-style: normal;
+  font-weight: 600;
+}
+
+/* A dialog's explanation and the field under it */
+.dialog-body .panel-text + .field {
+  margin-top: 14px;
+}
+
+/* ---------- Choices on the first screens: first vault or not, and where your other vault is ---------- */
+.choice-label {
+  margin: 14px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 560;
+}
+
+.choice-list {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 14px;
+}
+
+.choice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s, box-shadow 0.15s;
+}
+
+.choice:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.choice:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.choice:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* This browser has seen other vaults: "No, I already have one" is the likely answer */
+.choice.is-suggested {
+  border-color: var(--accent);
+}
+
+.choice-icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.choice-text strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.choice-text small {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.start-hint {
+  margin-top: -4px;
+}
+
+/* A key ring was found: where it came from, and a way to choose again */
+.choice-found {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  font-size: 13px;
+}
+
+.choice-found-icon {
+  display: inline-grid;
+  color: var(--ok);
+}
+
+.choice-found-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.choice-found .link-btn {
+  margin: 0;
+}
+
+.adopt-waiting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.adopt-waiting .link-btn {
+  margin: 0 0 0 auto;
+}
+
+/* Deleting a vault on this device from the recovery and error screens */
+.link-btn.link-danger,
+.link-btn.link-danger:hover {
+  color: var(--danger);
+}
+
+.recover-delete {
+  margin-top: 16px;
+}
+
 .local-actions {
   display: flex;
   flex-wrap: wrap;
