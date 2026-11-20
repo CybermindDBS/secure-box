@@ -221,7 +221,7 @@ export class Drive {
 
   /** Everything Secure Box keeps in Drive, except the encrypted file blobs. */
   async findUnibox() {
-    const kinds = ['root', 'files', 'keyring', 'vault', 'master-key'];
+    const kinds = ['root', 'files', 'keyring', 'vault'];
     const q = `(${kinds.map((k) => `appProperties has { key='unibox' and value='${k}' }`).join(' or ')}) and trashed = false`;
     const params = new URLSearchParams({
       q,

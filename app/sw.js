@@ -1,14 +1,15 @@
 /*
  * Secure Box service worker: a private, in-browser "server" for encrypted files.
  *
- * Requests to <app>/__unibox/file/<id> are answered by fetching the encrypted bytes (from
- * Google Drive with HTTP Range requests, or a piece at a time from the Secure Box page for
- * OneDrive and this device) and decrypting chunk by chunk as they stream in, so videos can
- * seek and nothing is downloaded in full. Responses are marked no-store and
+ * Requests to <app>/__unibox/file/<id> are answered by fetching the encrypted bytes (straight
+ * from Google Drive or OneDrive with HTTP Range requests, or a piece at a time from the Secure
+ * Box page for a vault on this device) and decrypting chunk by chunk as they stream in, so
+ * videos can seek and nothing is downloaded in full. Responses are marked no-store and
  * nothing is ever written to Cache Storage, IndexedDB or disk by this worker.
  * File keys and the Drive token are asked from the open Secure Box tab when needed and kept in
  * memory for at most a minute.
  */
+// stream-core.js decrypts Secure Box files ("SECBOXF1"); zip-core.js builds ZIP downloads.
 importScripts('assets/stream-core.js', 'assets/zip-core.js');
 var S = self.UniboxStream;
 var Z = self.UniboxZip;

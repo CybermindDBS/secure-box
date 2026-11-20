@@ -95,7 +95,7 @@ export function createOneDriveBackend(auth) {
 
 export function createCloudBackend(auth) {
   const drive = new Drive(() => auth.accessToken);
-  const ids = { root: null, files: null, keyring: null, vault: null, legacy: [] };
+  const ids = { root: null, files: null, keyring: null, vault: null };
 
   async function rootFolder() {
     ids.root ??= await drive.createFolder('Secure Box', null, 'root');
@@ -120,7 +120,6 @@ export function createCloudBackend(auth) {
       const vault = (keyring && of('vault').find((v) => v.kid === keyring.kid)) || of('vault')[0] || null;
       ids.keyring = keyring?.id || null;
       ids.vault = vault?.id || null;
-      ids.legacy = of('master-key').map((f) => f.id);
       const [keyringText, vaultText] = await Promise.all([keyring && drive.readText(keyring.id), vault && drive.readText(vault.id)]);
       return { keyring: keyringText || null, vault: vault ? { text: vaultText, rev: vault.headRevisionId } : null };
     },
@@ -136,11 +135,7 @@ export function createCloudBackend(auth) {
           description: 'Secure Box key ring: your master key, encrypted with your master password. Do not delete.',
         })
       ).id;
-      const rev = await this.createVault(vaultText, kid);
-      // The unprotected key file from the first version of Secure Box is no longer used.
-      await Promise.all(ids.legacy.map((id) => drive.trash(id).catch(() => {})));
-      ids.legacy = [];
-      return rev;
+      return this.createVault(vaultText, kid);
     },
 
     async createVault(vaultText, kid) {

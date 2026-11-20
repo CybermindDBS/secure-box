@@ -71,6 +71,7 @@ const state = {
   loaded: null, // { keyring, vault } as found in Drive
   keyringDoc: null,
   provider: null, // the open vault: 'google', 'microsoft' or 'local'
+  switching: null, // the vault being opened instead, while it opens: { provider, step, since }
   auths: {}, // cloud sign-ins of this session, by provider
   master: null,
   cipher: null,
@@ -267,16 +268,20 @@ function vaultLabel() {
   return where ? `${providerName()} · ${where}` : providerName();
 }
 
-/** The vault's name wherever the page shows it, and the vault menu. */
+/** The vault's name wherever the page shows it, and the vault menu. While another vault opens, the button names that one. */
 function renderSource() {
   const provider = currentProvider();
   const name = providerName(provider);
+  const opening = state.switching?.provider || null;
+  const shown = opening || provider;
+  const shownName = providerName(shown);
   const button = $('#source-btn');
-  button.querySelector('.source-name').textContent = name;
-  button.firstElementChild.replaceWith(icon(provider === 'local' ? 'device' : 'cloud', 16));
-  button.title = provider === 'local' ? 'Passwords and Files are kept on this device only' : `Passwords and Files are stored in your ${name}`;
-  button.setAttribute('aria-label', `${name}: where Passwords and Files are kept`);
-  button.closest('.section-group').setAttribute('aria-label', name);
+  button.querySelector('.source-name').textContent = shownName;
+  button.firstElementChild.replaceWith(opening ? h('span', { class: 'spinner spinner-sm', 'aria-hidden': 'true' }) : icon(shown === 'local' ? 'device' : 'cloud', 16));
+  button.classList.toggle('is-opening', Boolean(opening));
+  button.title = opening ? `${switchTitle(opening)}…` : shown === 'local' ? 'Passwords and Files are kept on this device only' : `Passwords and Files are stored in your ${shownName}`;
+  button.setAttribute('aria-label', opening ? switchTitle(opening) : `${shownName}: where Passwords and Files are kept`);
+  button.closest('.section-group').setAttribute('aria-label', shownName);
   for (const el of $$('[data-provider-name]')) el.textContent = name;
   for (const el of $$('[data-company-name]')) el.textContent = companyName(provider === 'local' ? 'google' : provider);
   for (const option of $$('.source-option[data-provider]')) {
@@ -285,8 +290,10 @@ function renderSource() {
     const available = p !== 'microsoft' || microsoftReady();
     option.classList.toggle('is-current', current);
     option.classList.toggle('is-soon', !available);
-    option.disabled = current || !available;
-    const sub = current
+    option.disabled = current || !available || Boolean(opening);
+    const sub = p === opening
+      ? 'Opening…'
+      : current
       ? p === 'local' ? state.backend?.name || '' : state.identity?.email || ''
       : !available ? 'Coming soon'
       : p === 'local' ? 'Only on this device, not synced'
@@ -306,7 +313,7 @@ async function signInPopup(provider) {
  * key opens without a password, and a place without a vault gets one, with the same password.
  */
 async function switchVault(provider) {
-  if (!PROVIDERS.includes(provider) || provider === state.provider || !state.unlocked) return;
+  if (!PROVIDERS.includes(provider) || provider === state.provider || !state.unlocked || state.switching) return;
   if (tools.busy()) return toast('Finish or cancel the open tool first.', 'error');
   if (files?.unfinished()) {
     // Unfinished uploads (paused ones too) belong to this vault: stop them before another one opens.
@@ -320,31 +327,39 @@ async function switchVault(provider) {
     if (!ok) return;
     await files.stopAll();
   }
+  // From here the open vault steps aside: Passwords and Files empty out and a loader fills them.
+  beginSwitching(provider);
+  let opened = false;
   try {
     let backend;
     let auth = null;
     if (provider === 'local') {
+      setSwitchStep('find');
       backend = await deviceBackendForSession();
       if (!backend) return;
     } else if (DEMO) {
       backend = state.demoBackend;
     } else {
       auth = state.auths[provider];
-      if (!auth || auth.expiresAt - Date.now() < 2 * 60_000) auth = await signInPopup(provider);
+      if (!auth || auth.expiresAt - Date.now() < 2 * 60_000) {
+        setSwitchStep('signin');
+        auth = await signInPopup(provider);
+      }
       if (!auth.driveGranted) throw new Error(`Secure Box needs access to ${providerName(provider)}. Try again and allow it.`);
       auth.provider = provider;
       saveHint(auth.identity.email, provider);
       backend = backendFor(auth);
     }
-    showSwitching(provider);
+    setSwitchStep('load');
     const loaded = await backend.load();
     let doc = loaded.keyring ? parseKeyring(loaded.keyring) : null;
     if (!doc && loaded.vault) {
-      // A vault from before vaults kept their own key ring: give it ours, if it's ours.
-      const env = parseEnvelope(loaded.vault.text, backend.vaultPurpose?.format);
-      if (env.kid !== state.master.kid) throw new Error(`The vault in ${providerName(provider)} belongs to a different Secure Box key.`);
-      await backend.saveKeyring(serializeKeyring(state.keyringDoc));
-      doc = state.keyringDoc;
+      // Every vault keeps its key ring beside it, so this one's was deleted (as the unlock screen says too).
+      throw new Error(
+        provider === 'local'
+          ? 'The vault on this device is missing its key ring file (keyring.json).'
+          : `Your ${providerName(provider)} vault is missing its key ring file. Restore “Secure Box Key Ring.json” from the bin there, then try again.`,
+      );
     }
     if (doc && doc.kid !== state.master.kid) {
       const ok = await confirmDialog({
@@ -371,27 +386,37 @@ async function switchVault(provider) {
         confirmLabel: 'Set it up',
       });
       if (!ok) return;
+      setSwitchStep('create');
       vault = emptyVault();
       rev = await backend.create({ keyringText: serializeKeyring(state.keyringDoc), vaultText: await cipher.seal(vault), kid: state.master.kid });
       doc = state.keyringDoc;
     } else {
       doc = await syncKeyring(doc, backend);
       if (loaded.vault) {
+        setSwitchStep('decrypt');
         const env = parseEnvelope(loaded.vault.text, cipher.format);
         vault = await cipher.open(env);
         rev = loaded.vault.rev;
       } else {
+        setSwitchStep('create');
         vault = emptyVault();
         rev = await backend.createVault(await cipher.seal(vault), state.master.kid);
       }
     }
-    enterVault({ provider, backend, auth, keyringDoc: doc, cipher, vault, rev });
+    await settleSwitching();
+    if (!state.unlocked) return;
+    await crossFade(() => {
+      endSwitching();
+      enterVault({ provider, backend, auth, keyringDoc: doc, cipher, vault, rev });
+      markArriving();
+    });
+    opened = true;
     toast(`Opened ${provider === 'local' ? 'your vault on this device' : `your ${providerName(provider)} vault`}`);
   } catch (err) {
     console.error(err);
     if (err?.code !== 'cancelled') toast(err.message || 'Couldn’t open that vault.', 'error');
   } finally {
-    hideSwitching();
+    if (!opened) await returnToOpenVault();
   }
 }
 
@@ -441,14 +466,105 @@ async function chooseDeviceWhere() {
   return { where: 'browser' };
 }
 
-function showSwitching(provider) {
-  const bar = $('#vault-switching');
-  bar.textContent = `Opening ${providerName(provider)}…`;
-  bar.hidden = false;
+// ---------------------------------------------------------------------------
+// Switching vaults as one calm transition: the open vault clears at once and a loader takes its
+// place inside Passwords and Files (their bars stay where they are), then the other vault rises
+// in. If it doesn't open, the vault that was open comes back the same way.
+// ---------------------------------------------------------------------------
+const SWITCH_MIN_MS = 650; // a loader that flashes for a frame reads as a glitch, not a step
+const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+let arrivingTimer = 0;
+
+/** Runs `update` as a cross-fade where the browser has View Transitions, and at once elsewhere. */
+async function crossFade(update) {
+  if (!document.startViewTransition || reducedMotion() || document.hidden) return update();
+  const transition = document.startViewTransition(update);
+  transition.ready.catch(() => {}); // a newer transition skips this one, which is fine
+  transition.finished.catch(() => {});
+  return transition.updateCallbackDone;
 }
 
-function hideSwitching() {
-  $('#vault-switching').hidden = true;
+const switchTitle = (provider) => (provider === 'local' ? 'Opening your vault on this device' : `Opening your ${providerName(provider)} vault`);
+
+function switchStepText(provider, step) {
+  return (
+    {
+      signin: `Sign in with ${companyName(provider)} in the pop-up window`,
+      find: 'Looking for your vault on this device…',
+      load: provider === 'local' ? 'Reading your encrypted vault…' : `Fetching your encrypted vault from ${providerName(provider)}…`,
+      decrypt: 'Decrypting it with your master key…',
+      create: 'Setting up your new vault…',
+    }[step] || 'Just a moment…'
+  );
+}
+
+function beginSwitching(provider) {
+  state.switching = { provider, step: switchStepText(provider), since: performance.now() };
+  crossFade(paintSwitching).catch((err) => console.warn('Switching:', err));
+}
+
+/** The line under the loader's title says what is happening right now. */
+function setSwitchStep(step) {
+  if (!state.switching) return;
+  state.switching.step = switchStepText(state.switching.provider, step);
+  for (const el of $$('[data-switch-step]')) {
+    el.textContent = state.switching.step;
+    if (!reducedMotion()) el.animate([{ opacity: 0, transform: 'translateY(3px)' }, { opacity: 1, transform: 'none' }], { duration: 260, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' });
+  }
+}
+
+/** Keeps the loader up long enough to read as a step rather than a flicker. */
+async function settleSwitching() {
+  const left = SWITCH_MIN_MS - (performance.now() - (state.switching?.since ?? 0));
+  if (left > 0) await pause(left);
+}
+
+/** While a vault opens, nothing can be clicked that would act on the vault that's closing. */
+function switchingChrome(on) {
+  $('#app').classList.toggle('is-switching', on);
+  for (const el of $$('.list-tools, .files-tools, #menu-btn')) el.inert = on;
+  $('#search').disabled = on;
+}
+
+function paintSwitching() {
+  switchingChrome(Boolean(state.switching));
+  renderSource();
+  renderAll();
+}
+
+function endSwitching() {
+  state.switching = null;
+  files?.showLoading(null);
+  switchingChrome(false);
+}
+
+/** The other vault didn't open (cancelled, declined or failed): the open one comes back. */
+async function returnToOpenVault() {
+  if (!state.switching) return;
+  if (!state.unlocked) return endSwitching(); // locking: the page reloads
+  await crossFade(() => {
+    endSwitching();
+    renderSource();
+    renderAll();
+    markArriving();
+  }).catch((err) => console.warn('Switching back:', err));
+}
+
+/** What fills Passwords and Files while another vault opens. */
+function switchLoader() {
+  const { provider, step } = state.switching;
+  return h('div', { class: 'vault-loader', role: 'status' },
+    h('span', { class: 'vault-loader-mark', 'aria-hidden': 'true' }, icon(provider === 'local' ? 'device' : 'cloud', 24)),
+    h('p', { class: 'vault-loader-title', text: switchTitle(provider) }),
+    h('p', { class: 'vault-loader-step', text: step, dataset: { switchStep: '' } }));
+}
+
+/** A vault that has just appeared rises in, a few rows at a time. */
+function markArriving() {
+  const app = $('#app');
+  app.classList.add('is-arriving');
+  clearTimeout(arrivingTimer);
+  arrivingTimer = setTimeout(() => app.classList.remove('is-arriving'), 900);
 }
 
 /** Makes another vault the open one (no reload, no password: same master key). */
@@ -501,7 +617,7 @@ async function spreadKeyring(alreadyDone = null) {
   const kid = state.master.kid;
   const reach = [];
   if (state.backend && state.backend !== alreadyDone) reach.push(state.backend);
-  const here = (await findLocalVaults({ demo: DEMO }).catch(() => [])).find((v) => v.kid === kid && v.ready && v.complete);
+  const here = (await findLocalVaults({ demo: DEMO }).catch(() => [])).find((v) => v.kid === kid && v.ready);
   if (here && !(isDevice() && state.backend.where === here.where)) reach.push(createLocalBackend({ where: here.where, handle: here.handle || null, kid, demo: DEMO }));
   for (const [provider, auth] of Object.entries(state.auths)) {
     if (auth && provider !== state.provider && auth.expiresAt - Date.now() > 60_000) reach.push(backendFor(auth));
@@ -526,7 +642,7 @@ async function spreadKeyring(alreadyDone = null) {
 
 /** The key ring kept by this device's vault for `kid`, if it's newer than `than`: a fallback at unlock. */
 async function newerKeyringHere(than) {
-  const here = (await findLocalVaults({ demo: DEMO }).catch(() => [])).find((v) => v.kid === than.kid && v.ready && v.complete);
+  const here = (await findLocalVaults({ demo: DEMO }).catch(() => [])).find((v) => v.kid === than.kid && v.ready);
   if (!here || (isDevice() && state.backend.where === here.where)) return null;
   try {
     const { keyring } = await createLocalBackend({ where: here.where, handle: here.handle || null, kid: than.kid, demo: DEMO }).load();
@@ -920,6 +1036,7 @@ function enterApp({ master, cipher, vault, rev, unlockedAt = Date.now() }) {
     /* ignore */
   }
   setSection(section, { push: false });
+  markArriving();
   history.replaceState(navState(), '');
   setSyncStatus('idle');
   renderDeviceStatus();
@@ -956,12 +1073,28 @@ function setSection(section, { push = true } = {}) {
 
 function renderAll() {
   if (!state.unlocked) return;
+  if (state.switching) return renderSwitching();
   if (filesMode()) files.render();
   else {
     renderList();
     renderDetail();
   }
   if (isDevice()) renderDeviceStatus();
+}
+
+/** Passwords and Files while another vault opens: nothing of the one that's closing, just the loader. */
+function renderSwitching() {
+  $('#vault-status').hidden = true;
+  $('#menu-device').hidden = true;
+  if (filesMode()) return files.showLoading(switchLoader());
+  renderedDetailId = null;
+  $('#passwords-view').classList.remove('show-detail');
+  $('#list').replaceChildren();
+  $('#count').textContent = '';
+  const empty = $('#list-empty');
+  empty.hidden = false;
+  empty.replaceChildren(switchLoader()); // on phones the list is all there is
+  $('#detail').replaceChildren(h('div', { class: 'detail-empty' }, switchLoader()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1159,7 @@ async function openDeviceVault({ quiet = false } = {}) {
     if (!quiet) showError({ title: 'Not in this browser', message: 'This browser can’t keep a vault on this device. Use an up-to-date Chrome, Edge, Firefox or Safari.', action: 'show-welcome', actionLabel: 'Back' });
     return false;
   }
-  const vaults = (await findLocalVaults({ demo: DEMO })).filter((v) => v.complete || v.where === 'folder');
+  const vaults = await findLocalVaults({ demo: DEMO });
   const last = deviceChoice();
   const pick = vaults.find((v) => v.kid === last?.kid && v.where === last?.where) || vaults.find((v) => v.where === 'browser') || vaults[0];
   if (!pick) {
@@ -1102,7 +1235,6 @@ async function restoreDeviceFromGate() {
   setText('#device-new-error', '');
   try {
     const backup = await readBackup(file);
-    if (!backup.keyring) throw new Error('This backup is from an earlier version of Secure Box. Open your vault on this device first, then use ⋯ → Restore a backup.');
     const { kid } = backup.manifest;
     if ((await findLocalVaults({ demo: DEMO })).some((v) => v.kid === kid && v.where === 'browser')) {
       throw new Error('This device already has that vault. Open it, then use ⋯ → Restore a backup to add what’s missing.');
@@ -1141,7 +1273,7 @@ function rememberBackup(at) {
 function renderDeviceStatus() {
   const bar = $('#vault-status');
   const backend = state.backend;
-  bar.hidden = !state.unlocked || !isDevice();
+  bar.hidden = !state.unlocked || !isDevice() || Boolean(state.switching);
   $('#menu-device').hidden = bar.hidden;
   if (bar.hidden) return;
   $('#menu-device-backup').hidden = backend.where !== 'browser';
@@ -1775,6 +1907,7 @@ function visibleItems() {
 const subtitleOf = (item) => (item.type === 'note' ? 'Secure note' : item.username || hostnameOf(item.url) || 'Login');
 
 function renderList() {
+  if (state.switching) return; // renderSwitching() fills it meanwhile
   const items = visibleItems();
   const total = state.vault.items.length;
   $('#list').replaceChildren(
@@ -1832,6 +1965,7 @@ function moveSelection(step) {
 let renderedDetailId = null;
 
 function renderDetail() {
+  if (state.switching) return;
   const pane = $('#detail');
   const item = state.vault.items.find((it) => it.id === state.selectedId);
   const entering = Boolean(item) && item.id !== renderedDetailId;
@@ -2094,7 +2228,7 @@ async function exportCsv() {
     message: 'The file will contain every password and note in plain text. Keep it somewhere safe and delete it when you are done.',
     confirmLabel: 'Export',
   });
-  if (ok) downloadFile(`unibox-passwords-${today()}.csv`, itemsToCsv(state.vault.items), 'text/csv;charset=utf-8');
+  if (ok) downloadFile(`secure-box-passwords-${today()}.csv`, itemsToCsv(state.vault.items), 'text/csv;charset=utf-8');
 }
 
 function openPasswordDialog() {
@@ -2366,7 +2500,7 @@ function wireEvents() {
 
   // Global shortcuts
   document.addEventListener('keydown', (event) => {
-    if (!state.unlocked || $('dialog[open]')) return;
+    if (!state.unlocked || state.switching || $('dialog[open]')) return;
     const typing = event.target.closest?.('input, textarea, select, [contenteditable="true"]');
     const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
     if ((event.key === '/' && !typing && plain) || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k')) {

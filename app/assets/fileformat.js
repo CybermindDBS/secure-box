@@ -1,5 +1,5 @@
 /**
- * Secure Box encrypted file format, version 1 ("UNIBOXF1").
+ * Secure Box encrypted file format, version 1 ("SECBOXF1").
  *
  * Every file gets its own random 256-bit key. That key lives only inside the encrypted
  * vault (S3), never next to the file (Google Drive), so neither provider alone can decrypt.
@@ -7,7 +7,7 @@
  * Layout of the blob stored in Drive:
  *
  *   header (35 bytes, authenticated as AAD of every chunk)
- *     "UNIBOXF1" | chunk size (u32 BE) | nonce prefix (7 random bytes) | file id (16 bytes)
+ *     "SECBOXF1" | chunk size (u32 BE) | nonce prefix (7 random bytes) | file id (16 bytes)
  *   thumbnail segment (optional, for images/videos)
  *   content segment: Padmé-padded file bytes, split into chunks
  *
@@ -23,7 +23,7 @@ export const CHUNK_SIZE = 1024 * 1024;
 export const HEADER_BYTES = 35;
 export const MAX_FILE_SIZE = 2 * 1024 ** 3;
 const TAG_BYTES = 16;
-const MAGIC = [0x55, 0x4e, 0x49, 0x42, 0x4f, 0x58, 0x46, 0x31]; // "UNIBOXF1"
+const MAGIC = [0x53, 0x45, 0x43, 0x42, 0x4f, 0x58, 0x46, 0x31]; // "SECBOXF1"
 const FLAG = { content: 0, contentLast: 1, thumb: 2, thumbLast: 3 };
 
 export class FileCryptoError extends Error {

@@ -16,7 +16,7 @@ import { decryptAesGcm, deriveAesKey, encryptAesGcm, fromBase64, hmacSha256, imp
 export const KEYRING_FILE_NAME = 'Secure Box Key Ring.json';
 export const PBKDF2_ITERATIONS = 600_000;
 export const MIN_PASSWORD_LENGTH = 12;
-const FORMAT = 'unibox-keyring';
+const FORMAT = 'secure-box-keyring';
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
 export class KeyringError extends Error {
@@ -40,7 +40,7 @@ async function passwordKey(password, salt, iterations) {
   );
 }
 
-const recoveryKey = async (bytes, salt) => deriveAesKey(await importHkdfKey(bytes), salt, 'unibox/recovery-key/v1');
+const recoveryKey = async (bytes, salt) => deriveAesKey(await importHkdfKey(bytes), salt, 'secure-box/recovery-key/v1');
 
 async function seal(key, p1, additionalData) {
   const { iv, ciphertext } = await encryptAesGcm(key, p1, additionalData);

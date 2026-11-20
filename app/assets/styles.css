@@ -473,10 +473,10 @@ strong {
   height: 100dvh;
   display: grid;
   grid-template-columns: minmax(0, 1fr); /* never wider than the screen */
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
 
-/* Fixed rows: the status bars are often hidden, and the open section keeps the stretchy row. */
+/* Fixed rows: the status bar is often hidden, and the open section keeps the stretchy row. */
 .app > .topbar {
   grid-row: 1;
 }
@@ -485,13 +485,9 @@ strong {
   grid-row: 2;
 }
 
-.app > .vault-switching {
-  grid-row: 3;
-}
-
 .app > #passwords-view,
 .app > #files-view {
-  grid-row: 4;
+  grid-row: 3;
 }
 
 .topbar {
@@ -3793,20 +3789,162 @@ a.menu-item {
   margin: 8px 20px 0;
 }
 
-.vault-switching {
-  margin: 8px 20px 0;
-  padding: 8px 12px;
-  border-radius: 10px;
+@media (max-width: 760px) {
+  .app > .vault-status {
+    margin: 6px 8px 0;
+  }
+}
+
+/* ---------- Switching vaults ----------
+   The open vault clears at once and a loader fills Passwords and Files until the other vault is
+   ready; then it rises in. The bars and their tools stay where they are, faded and out of reach. */
+.vault-loader {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 100%;
+  padding: 56px 24px;
+  color: var(--text-3);
+  text-align: center;
+  animation: rise 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.vault-loader-mark {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  margin-bottom: 18px;
+  border-radius: 50%;
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+/* A ring sweeping around the vault's icon, its tail fading away */
+.vault-loader-mark::before {
+  content: '';
+  position: absolute;
+  inset: -7px;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent 0 35%, var(--accent));
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
+  animation: spin 1.1s linear infinite;
+}
+
+.vault-loader-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 14.5px;
+  font-weight: 600;
+}
+
+.vault-loader-step {
+  max-width: 360px;
+  min-height: 1.5em;
+  margin: 0;
+  color: var(--text-2);
   font-size: 13px;
 }
 
-@media (max-width: 760px) {
-  .app > .vault-status,
-  .vault-switching {
-    margin: 6px 8px 0;
+/* In the file manager and (on phones) the item list, the loader takes all the room there is */
+.files .files-body.is-loading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: stretch;
+}
+
+.app.is-switching .list-pane {
+  display: flex;
+  flex-direction: column;
+}
+
+.app.is-switching #list-empty {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  padding: 0;
+}
+
+.app.is-switching #list-empty > .vault-loader {
+  flex: 1;
+}
+
+/* Wider screens show the loader in the detail pane, and the list stays empty */
+@media (min-width: 761px) {
+  .app.is-switching #list-empty {
+    display: none;
   }
+}
+
+/* The tools of the vault that's closing (inert meanwhile) */
+.app.is-switching :is(.list-tools, .files-tools, #menu-btn, .search) {
+  opacity: 0.4;
+}
+
+.app.is-switching .crumb {
+  color: var(--text-3);
+}
+
+.app.is-switching [data-sync-status] {
+  visibility: hidden;
+}
+
+/* The top bar names the vault that's opening, with a spinner for its icon (phones too, where
+   the tabs' labels are hidden) */
+.sections .source-btn.is-opening {
+  color: var(--text-2);
+}
+
+.sections .source-btn > .spinner {
+  display: block;
+}
+
+/* A vault that has just appeared rises in, a few rows at a time */
+.app.is-arriving :is(.list > li, .files-body > *, .detail, .detail-empty, .list-empty) {
+  animation: rise 0.34s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.app.is-arriving :is(.list > li, .files-body > *):nth-child(2) {
+  animation-delay: 0.025s;
+}
+
+.app.is-arriving :is(.list > li, .files-body > *):nth-child(3) {
+  animation-delay: 0.05s;
+}
+
+.app.is-arriving :is(.list > li, .files-body > *):nth-child(4) {
+  animation-delay: 0.075s;
+}
+
+.app.is-arriving :is(.list > li, .files-body > *):nth-child(5) {
+  animation-delay: 0.1s;
+}
+
+.app.is-arriving :is(.list > li, .files-body > *):nth-child(6) {
+  animation-delay: 0.125s;
+}
+
+.app.is-arriving :is(.list > li, .files-body > *):nth-child(7) {
+  animation-delay: 0.15s;
+}
+
+.app.is-arriving :is(.list > li, .files-body > *):nth-child(8) {
+  animation-delay: 0.175s;
+}
+
+.app.is-arriving :is(.list > li, .files-body > *):nth-child(n + 9) {
+  animation-delay: 0.2s;
+}
+
+/* Where the browser has View Transitions, each step of a switch cross-fades */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.24s;
+  animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 /* Upload totals */
@@ -3895,5 +4033,11 @@ a.menu-item {
   *::after {
     animation-duration: 0.001ms !important;
     transition-duration: 0.001ms !important;
+  }
+
+  /* no staggered delays either: everything appears at once */
+  .vault-loader,
+  .app.is-arriving :is(.list > li, .files-body > *, .detail, .detail-empty, .list-empty) {
+    animation: none !important;
   }
 }

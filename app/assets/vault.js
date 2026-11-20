@@ -3,7 +3,7 @@
  *
  * Key hierarchy
  *   master key  32 random bytes, kept only in wrapped form in the key ring (see keyring.js)
- *   vault key   HKDF-SHA-256(master key, fresh random salt, "unibox/vault-encryption/v1")
+ *   vault key   HKDF-SHA-256(master key, fresh random salt, "secure-box/vault-encryption/v1")
  *               -> AES-256-GCM. A brand-new key is derived for every save.
  *   file keys   32 random bytes per file, kept inside the encrypted vault (see fileformat.js)
  *
@@ -12,9 +12,9 @@
  */
 import { decryptAesGcm, deriveAesKey, encryptAesGcm, fromBase64, fromUtf8, importHkdfKey, padme, randomBytes, toBase64, utf8 } from './crypto.js';
 
-const VAULT_FORMAT = 'unibox-vault';
+const VAULT_FORMAT = 'secure-box-vault';
 const VAULT_VERSION = 2;
-const HKDF_INFO = 'unibox/vault-encryption/v1';
+const HKDF_INFO = 'secure-box/vault-encryption/v1';
 
 export class VaultError extends Error {
   constructor(code, message) {
@@ -35,7 +35,7 @@ export function parseEnvelope(text, format = VAULT_FORMAT) {
     throw new VaultError('bad-vault', 'The vault file is not valid JSON.');
   }
   if (!env || env.format !== format) throw new VaultError('bad-vault', 'The file is not a Secure Box vault.');
-  if (env.version !== 1 && env.version !== 2) throw new VaultError('bad-vault', 'This vault was written by a newer version of Secure Box.');
+  if (env.version !== VAULT_VERSION) throw new VaultError('bad-vault', 'This vault was written by a newer version of Secure Box.');
   for (const field of ['kid', 'salt', 'iv', 'ct']) {
     if (typeof env[field] !== 'string' || !env[field]) throw new VaultError('bad-vault', 'The vault file is incomplete.');
   }

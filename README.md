@@ -329,7 +329,7 @@ npm test
 ```
 
 - `npm run dev` serves `app/` at http://localhost:8080. Add `?demo` to the URL for the in-memory demo.
-- `npm test` runs 41 unit tests, covering the key ring and its revisions, encryption formats, `.sbox` files, encrypted messages, the local vault's index key, tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, and OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive).
+- `npm test` runs 43 unit tests, covering the key ring and its revisions, encryption formats, `.sbox` files, encrypted messages, the local vault's index key and backups, tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, and OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive).
 
 ```
 app/

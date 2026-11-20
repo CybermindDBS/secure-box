@@ -48,6 +48,7 @@ import {
 import { find, parseXml, textOf } from '../app/assets/xml.js';
 import { readZipDirectory, readZipEntry, readZipText, zipStore } from '../app/assets/zip.js';
 import { boxAccess, openContent, readBox, unlockBox, writeBox, zipEntries, zipEntryData, zipFolder } from '../app/assets/localbox.js';
+import { readBackup } from '../app/assets/localstore.js';
 
 const S = globalThis.UniboxStream;
 const random = (n) => crypto.getRandomValues(new Uint8Array(n));
@@ -232,6 +233,22 @@ test('the service worker decrypts any byte range exactly', async () => {
     assert.equal(at - 1, span.end);
     assert.ok(Buffer.concat(out.map((p) => Buffer.from(p))).equals(Buffer.from(bytes.subarray(from, to + 1))), `range ${from}-${to}`);
   }
+});
+
+test('files, vaults and key rings carry the Secure Box names', async () => {
+  const { blob, entry } = await encryptBytes(bigRandom(3000));
+  assert.equal(Buffer.from(blob.subarray(0, 8)).toString('latin1'), 'SECBOXF1');
+  S.checkHeader(blob.subarray(0, S.HEADER), entry); // the service worker takes it
+  const stranger = blob.slice();
+  stranger.set(Buffer.from('NOTABOX1'), 0);
+  await assert.rejects(plainOf(stranger, entry), /not a Secure Box encrypted file/);
+  assert.throws(() => S.checkHeader(stranger.subarray(0, S.HEADER), entry), /Not a Secure Box encrypted file/);
+
+  const master = { kid: 'abcdef0123456789', key: random(32) };
+  assert.equal(JSON.parse(await (await VaultCipher.create(master)).seal(emptyVault())).format, 'secure-box-vault');
+  const { doc } = await createKeyring('a fresh master password', master);
+  assert.equal(doc.format, 'secure-box-keyring');
+  assert.ok(!serializeKeyring(doc).includes('unibox'));
 });
 
 test('Padmé padding leaks little and costs at most ~12%', () => {
@@ -630,6 +647,25 @@ test('key ring revisions: every change counts up, and an old copy can’t pose a
   await assert.rejects(unlockWithPassword(stored, 'correct horse battery staple'));
 });
 
+test('a backup of the vault on this device carries its key ring, and only version 2 is read', async () => {
+  const manifest = { format: 'secure-box-local-backup', version: 2, kid: 'abcdef0123456789' };
+  const backup = (m, { keyring = true } = {}) =>
+    new Blob([
+      zipStore([
+        { name: 'backup.json', data: JSON.stringify(m) },
+        ...(keyring ? [{ name: 'keyring.json', data: '{"format":"secure-box-keyring"}' }] : []),
+        { name: 'index.json', data: '{"format":"secure-box-local-index"}' },
+      ]),
+    ]);
+  const read = await readBackup(backup(manifest));
+  assert.equal(read.manifest.kid, manifest.kid);
+  assert.match(read.keyring, /secure-box-keyring/);
+  assert.match(read.index, /secure-box-local-index/);
+  await assert.rejects(readBackup(backup(manifest, { keyring: false })), { code: 'not-backup' });
+  await assert.rejects(readBackup(backup({ ...manifest, version: 1 })), { code: 'not-backup' });
+  await assert.rejects(readBackup(backup({ ...manifest, version: 3 })), { code: 'newer' });
+});
+
 test('the local vault index has its own key: it can never pass for the vault, or the other way round', async () => {
   const vaultCipher = await VaultCipher.create(masterA);
   const indexCipher = await VaultCipher.create(masterA, LOCAL_INDEX);
@@ -637,7 +673,7 @@ test('the local vault index has its own key: it can never pass for the vault, or
   const sealedVault = await vaultCipher.seal(emptyVault());
   assert.deepEqual((await indexCipher.open(parseEnvelope(sealedIndex, LOCAL_INDEX.format))).files, []);
   assert.throws(() => parseEnvelope(sealedIndex), { code: 'bad-vault' });
-  await assert.rejects(vaultCipher.open({ ...JSON.parse(sealedIndex), format: 'unibox-vault' }), { code: 'decrypt-failed' });
+  await assert.rejects(vaultCipher.open({ ...JSON.parse(sealedIndex), format: 'secure-box-vault' }), { code: 'decrypt-failed' });
   await assert.rejects(indexCipher.open(JSON.parse(sealedVault)), { code: 'bad-vault' });
   await assert.rejects(indexCipher.open({ ...JSON.parse(sealedVault), format: LOCAL_INDEX.format }), { code: 'decrypt-failed' });
 });

@@ -72,6 +72,7 @@ export function createFilesView(ctx) {
     sort: pref('unibox.filesSort', 'name', ['name', 'updated', 'size', 'type']),
     // Off by default: while off, no thumbnail is fetched or decrypted at all.
     thumbs: pref('unibox.thumbnails', 'off', ['on', 'off']) === 'on',
+    loading: null, // while another vault opens: the loader shown instead of any files
   };
   const transfers = [];
   let processing = false;
@@ -260,6 +261,7 @@ export function createFilesView(ctx) {
   // Rendering
   // ---------------------------------------------------------------------------
   function render() {
+    if (view.loading) return renderLoading();
     if (view.folder && !folderById(view.folder)) view.folder = null;
     for (const id of [...view.selected]) if (!fileById(id) && !folderById(id)) view.selected.delete(id);
     renderCrumbs();
@@ -268,6 +270,20 @@ export function createFilesView(ctx) {
     for (const radio of $$('input[name="files-layout"]')) radio.checked = radio.value === view.layout;
     $('#files-sort').value = view.sort;
     $('#thumbs-toggle').checked = view.thumbs;
+  }
+
+  /** An empty file manager at its top folder, with the loader where the files go. */
+  function renderLoading() {
+    const nav = $('#crumbs');
+    nav.replaceChildren(h('span', { class: 'crumb is-current' }, icon('home', 16), h('span', { text: rootName() })));
+    nav.title = '';
+    updateCrumbFades();
+    const body = $('#files-body');
+    body.className = `files-body layout-${view.layout} is-loading`;
+    body.replaceChildren(view.loading);
+    $('#files-count').textContent = '';
+    $('#selection-bar').hidden = true;
+    $('#files-view').classList.remove('has-selection');
   }
 
   function dropTarget(el, folderId) {
@@ -930,6 +946,10 @@ export function createFilesView(ctx) {
   filesView.addEventListener('dragover', (event) => {
     if (![...event.dataTransfer.types].includes('Files')) return;
     event.preventDefault();
+    if (view.loading) {
+      event.dataTransfer.dropEffect = 'none'; // another vault is opening: nothing to drop into yet
+      return;
+    }
     $('#drop-verb').textContent = isLocal() ? 'save to' : 'upload to';
     $('#drop-target').textContent = view.folder ? folderById(view.folder)?.name : rootName();
     $('#drop-overlay').hidden = false;
@@ -940,6 +960,7 @@ export function createFilesView(ctx) {
   filesView.addEventListener('drop', (event) => {
     if (![...event.dataTransfer.types].includes('Files')) return;
     event.preventDefault();
+    if (view.loading) return; // another vault is opening: the drop would land in the old one
     $('#drop-overlay').hidden = true;
     uploadFromDrop(event.dataTransfer);
   });
@@ -1030,6 +1051,11 @@ export function createFilesView(ctx) {
       Object.assign(view, navs.get(next) || { folder: null, query: '', selected: new Set(), anchor: null });
     },
     goTo: (folder, options) => openFolder(folder && folderById(folder) ? folder : null, options),
+    /** While another vault opens: an empty file manager with `node` (a loader) in it. null ends it. */
+    showLoading(node) {
+      view.loading = node;
+      if (node) render();
+    },
     /** Another vault was opened: start at the top, nothing selected. */
     reset() {
       Object.assign(view, { folder: null, query: '', selected: new Set(), anchor: null });

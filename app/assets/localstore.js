@@ -100,9 +100,8 @@ async function folderRoot(picked, create) {
 }
 
 /**
- * The local vaults on this device: [{ kid, where, handle?, name, ready, complete }]. `ready` is
- * false for a folder that needs permission again; `complete` is false for a vault from before
- * vaults kept their own key ring (it gets one the next time it's opened while unlocked).
+ * The local vaults on this device: [{ kid, where, handle?, name, ready }]. `ready` is false for
+ * a folder that needs permission again.
  */
 export async function findLocalVaults({ demo = false } = {}) {
   const support = localSupport();
@@ -118,15 +117,15 @@ export async function findLocalVaults({ demo = false } = {}) {
       } catch {
         /* treated as "ask again" */
       }
-      found.push({ kid, where: 'folder', handle, name: handle.name, ready: permission === 'granted', complete: true });
+      found.push({ kid, where: 'folder', handle, name: handle.name, ready: permission === 'granted' });
     }
   }
   if (support.browser) {
     try {
       const base = await browserBase(demo, false);
       for await (const [kid, dir] of base.entries()) {
-        if (dir.kind !== 'directory' || !(await has(dir, INDEX))) continue;
-        found.push({ kid, where: 'browser', name: 'This browser', ready: true, complete: await has(dir, KEYRING) });
+        if (dir.kind !== 'directory' || !(await has(dir, INDEX)) || !(await has(dir, KEYRING))) continue;
+        found.push({ kid, where: 'browser', name: 'This browser', ready: true });
       }
     } catch {
       /* no local vault in this browser */
@@ -410,10 +409,7 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
   return backend;
 }
 
-/**
- * Reads a backup ZIP: { manifest, keyring, index, blob(id) -> zip entry, content, size(id) }.
- * Older backups (version 1) have no key ring: they can only be added to a vault that's open.
- */
+/** Reads a backup ZIP: { manifest, keyring, index, blob(id) -> zip entry, content, size(id) }. */
 export async function readBackup(file) {
   const content = { size: file.size, read: async (from, to) => new Uint8Array(await file.slice(from, to + 1).arrayBuffer()) };
   const notBackup = () => new LocalError('not-backup', 'That isn’t a Secure Box backup, or it’s damaged.');
@@ -424,13 +420,9 @@ export async function readBackup(file) {
     throw notBackup();
   }
   const byPath = new Map(entries.map((e) => [e.path, e]));
-  const readText = async (path, optional = false) => {
+  const readText = async (path) => {
     const entry = byPath.get(path);
-    if (!entry) {
-      if (optional) return null;
-      throw notBackup();
-    }
-    if (entry.size > 64 * 1024 * 1024) throw notBackup();
+    if (!entry || entry.size > 64 * 1024 * 1024) throw notBackup();
     const parts = [];
     for await (const bytes of zipEntryData(content, entry)) parts.push(bytes);
     return new Blob(parts).text();
@@ -442,10 +434,10 @@ export async function readBackup(file) {
     throw notBackup();
   }
   if (manifest?.format !== BACKUP_FORMAT) throw notBackup();
-  if (manifest.version !== 1 && manifest.version !== 2) throw new LocalError('newer', 'That backup was made by a newer version of Secure Box.');
+  if (manifest.version !== 2) throw manifest.version > 2 ? new LocalError('newer', 'That backup was made by a newer version of Secure Box.') : notBackup();
   return {
     manifest,
-    keyring: await readText(KEYRING, true),
+    keyring: await readText(KEYRING),
     index: await readText(INDEX),
     content,
     blob: (id) => byPath.get(`${FILES}/${id}`) || null,

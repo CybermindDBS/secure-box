@@ -1,5 +1,5 @@
 /*
- * Random-access decryption of the Secure Box file format ("UNIBOXF1", see fileformat.js),
+ * Random-access decryption of the Secure Box file format ("SECBOXF1", see fileformat.js),
  * for the service worker. Classic script (loaded with importScripts) that also works as an
  * ES module in Node for tests. Defines globalThis.UniboxStream.
  */
@@ -7,7 +7,7 @@
   'use strict';
   var TAG = 16;
   var HEADER = 35;
-  var MAGIC = [0x55, 0x4e, 0x49, 0x42, 0x4f, 0x58, 0x46, 0x31];
+  var MAGIC = 'SECBOXF1';
 
   function padme(length) {
     var L = Math.max(length, 256);
@@ -67,7 +67,7 @@
 
   /** Checks the 35-byte header against the vault record and returns the nonce prefix. */
   function checkHeader(header, entry) {
-    for (var i = 0; i < 8; i++) if (header[i] !== MAGIC[i]) throw new Error('Not a Secure Box encrypted file.');
+    if (String.fromCharCode.apply(null, Array.prototype.slice.call(header, 0, 8)) !== MAGIC) throw new Error('Not a Secure Box encrypted file.');
     if (new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(8) !== entry.chunk) throw new Error('File does not match its record.');
     var id = uuidBytes(entry.id);
     for (var j = 0; j < 16; j++) if (header[19 + j] !== id[j]) throw new Error('File belongs to a different record.');
