@@ -58,7 +58,7 @@ The names are the same wherever a vault lives (Google Drive, OneDrive, or a fold
 **Files.** Every file gets its own random 256-bit key, which lives only inside the encrypted vault. Files are encrypted in 1 MiB chunks, using the same streaming scheme as Google's Tink library.
 - Each chunk is authenticated, so any tampering, truncation, reordering or swapping of files is detected.
 - Sizes are padded (at most about 12% extra).
-- Photo and video thumbnails are made on your device and encrypted inside the same blob. They stay hidden unless you turn on the **Thumbnails** switch; until then, none are fetched or decrypted.
+- Photo and video thumbnails are made on your device and encrypted inside the same blob. Turn off the **Thumbnails** switch to hide them: while it's off, none are fetched or decrypted.
 
 **This device.** A vault kept only on your device is encrypted exactly like a cloud vault, with the same key ring. Its vault file is sealed with a key of its own purpose (HKDF), so it can never pass for a cloud vault, or the other way round. Nothing in it is ever uploaded.
 
@@ -83,7 +83,9 @@ The names are the same wherever a vault lives (Google Drive, OneDrive, or a fold
 **Sign-in.**
 - Google sign-in uses only the `drive.file` scope, so Secure Box can see the files it created and nothing else in your Drive.
 - Google's access lasts one hour. After that you click **Reconnect** once, and your vault stays unlocked. One reconnect serves every open Secure Box window.
-- Once you've signed in on a browser, Secure Box reconnects to Google by itself when you open it, so only your master password is asked. It remembers only which Google account you used. To switch, choose **Use a different Google account** on the unlock screen.
+- OneDrive sign-in uses Microsoft's authorization code flow with PKCE, and asks only for `Files.ReadWrite.AppFolder`: Secure Box sees its own folder (`Apps/Secure Box`) and nothing else. Access is renewed in the background for up to 24 hours, Microsoft's limit for apps in a browser; then you sign in once more.
+- Once you've signed in on a browser, Secure Box signs in again by itself when you open it, so only your master password is asked. It remembers only which account you used. To switch, choose **Use a different Google account** (or Microsoft account) on the unlock screen.
+- If you close a sign-in pop-up without signing in, Secure Box notices and takes you back to where you were.
 
 **Session.** Secure Box auto-locks after 10 minutes of inactivity, and after 8 hours in any case. Locking reloads the page, which drops every key and secret from memory. Copied passwords are cleared from the clipboard after 30 seconds.
 - Uploads, downloads and work on the vault on this device (a move, backup or restore) still running, in any window, hold both automatic locks until they finish. A download that has moved no data for two minutes stops counting, and an upload paused until you reconnect doesn't hold the lock: it stops with it, and the unlock screen says so.
@@ -96,14 +98,14 @@ The names are the same wherever a vault lives (Google Drive, OneDrive, or a fold
 - The key passes between windows in memory only, over a browser channel that only Secure Box's own pages can use. It is never written to disk.
 - Once every window is closed or locked, the next one asks for your master password again.
 
-**What Google can see:** that you store some encrypted blobs, with their approximate sizes and when they change. Google never sees names, folders, contents or keys.
+**What Google or Microsoft can see:** that you store some encrypted blobs, with their approximate sizes and when they change. Neither sees names, folders, contents or keys.
 
 **What the web host (Firebase Hosting) can see:** requests for the static app files. Nothing else.
 
 **Honest caveats**
 
 - **Without your master password *and* your Emergency Kit, your data is gone.** Nobody can recover it, including you. Keep the kit offline, never in Drive or email.
-- Use a strong master password and protect your Google account with 2-Step Verification. An attacker needs both.
+- Use a strong master password and protect your Google or Microsoft account with two-step verification. An attacker needs both.
 - Like any web app, Secure Box can't protect you from malware on your device or a malicious browser extension. Your browser's own process memory may also be paged out by the operating system.
 - Sign-in uses Google's OpenID Connect *implicit* flow, which needs no Google script in the page. Google still documents this flow but calls it legacy. If they ever retire it, only `src/core/google.js` needs to change.
 - Secure Box hasn't had an independent security audit yet. To report a problem, see [SECURITY.md](SECURITY.md).
@@ -112,9 +114,9 @@ The names are the same wherever a vault lives (Google Drive, OneDrive, or a fold
 
 | Service | Monthly cost |
 |---|---|
-| Firebase Hosting, free Spark plan (≈ 300 KB of static files) | $0; includes 10 GB of storage and 360 MB of downloads a day, and needs no billing account |
+| Firebase Hosting, free Spark plan (about 5 MB of static files, most of it PDF.js, which loads only when a PDF needs it) | $0; includes 10 GB of storage and 360 MB of downloads a day, and needs no billing account |
 | Google Drive or OneDrive | Free; uses your normal quota (15 GB on a free Google account, 5 GB on a free Microsoft account) |
-| Google Cloud OAuth client and Drive API | Free |
+| Google Cloud OAuth client and Drive API, Microsoft app registration | Free |
 
 The web host never touches your data, and nothing bills by the hour.
 
@@ -125,7 +127,7 @@ The web host never touches your data, and nothing bills by the hour.
 Secure Box is hosted on **Firebase Hosting**: it's free, serves HTTPS on its own address, and sends the full set of security headers. It only serves the app's files: your data lives in Google Drive, OneDrive or on your device.
 
 **You need:**
-- a Google account;
+- a Google account (and, to offer OneDrive, a Microsoft account);
 - Windows PowerShell 5.1 or PowerShell 7;
 - [Node.js](https://nodejs.org/) 22 or later, for the build and the Firebase CLI.
 
@@ -158,7 +160,16 @@ Keep using the same client once you have vaults: Google lets Secure Box see only
 - While the app is in *Testing*, only the test users you add there can sign in (up to 100), and Google may ask them to re-approve weekly.
 - **Publish** the app to let anyone with a Google account use it. Each person's data still stays in their own Drive.
 
-### 3. Deploy
+### 3. Add OneDrive (optional)
+
+Skip this step to offer Google Drive and **This device** only. In the [Microsoft Entra admin center](https://entra.microsoft.com/), open **App registrations → New registration**:
+
+1. **Name:** for example "Secure Box". **Supported account types:** accounts in any organizational directory *and* personal Microsoft accounts.
+2. **Redirect URI:** choose the **Single-page application** platform and enter `https://<site>.web.app/index.html`. Then, under **Authentication**, add `https://<site>.firebaseapp.com/index.html` and `http://localhost:8080/index.html` to the same platform. It must be *Single-page application*, not *Web*: Secure Box finishes signing in from the browser.
+3. **API permissions → Add a permission → Microsoft Graph → Delegated permissions:** `Files.ReadWrite.AppFolder`. Sign-in also asks for `openid`, `profile`, `email` and `offline_access`, which need no setup.
+4. Copy the **Application (client) ID** for the deploy step.
+
+### 4. Deploy
 
 Install the Firebase CLI and sign in once:
 
@@ -176,6 +187,8 @@ Then deploy:
 .\deploy-firebase.ps1 -Project <project-id> -GoogleClientId <client-id>
 ```
 
+With OneDrive, add `-MicrosoftClientId <application-id>`.
+
 The script writes `public/assets/config.json`, builds the app (`npm ci`, `npm run build` with its check), then runs `firebase deploy`, which publishes `dist/` with the security headers from `firebase.json`. It remembers its settings in `deploy.settings.json`, so later deploys are just `.\deploy-firebase.ps1`.
 
 If Windows refuses to run scripts, use this form instead. It applies to that one run and doesn't change any settings:
@@ -184,7 +197,7 @@ If Windows refuses to run scripts, use this form instead. It applies to that one
 powershell -ExecutionPolicy Bypass -File .\deploy-firebase.ps1
 ```
 
-### 4. First sign-in
+### 5. First sign-in
 
 1. Open the app URL. On the **Vault** tab, choose **Google Drive**, **OneDrive** or **This device**.
 2. **Create your master password.** Use 12+ characters; a short sentence only you would think of works well. Don't save it in your browser.
@@ -196,7 +209,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy-firebase.ps1
 
 **Where your vault lives.** The first time, Secure Box asks where to keep your vault:
 - **Google Drive** or **OneDrive** (recommended): on all your devices, and safe if you lose one.
-- **Only on this device**: no account needed, but nothing syncs, so you back it up yourself.
+- **This device**: no account needed, but nothing syncs, so you back it up yourself.
 
 **A place with no vault yet** asks one question: **Is this your first Secure Box vault?**
 - **Yes, it's my first:** create a master password. It opens this vault and any you add later.
@@ -225,21 +238,20 @@ Your browser's **Back** and **Forward** buttons move between tabs and folders, c
 - **Open** a file or folder with a click (a tap on a phone or tablet). **Select** items with their checkbox, Ctrl/⌘-click or Shift-click (on a phone, long-press one, then tap more), or by dragging a box around them, then Download, Move or Delete them together. The keys work as in Google Drive; press **?** to see them all.
 - **Download** a single file as itself. Several items, folders included, download as one **.zip** that keeps their folders, and a folder's ⋯ menu has **Download as .zip**. The ZIP is built and decrypted while it downloads, so it never sits in memory, and your browser shows its real size and progress.
 - **Move** items by dragging them onto a folder or a breadcrumb.
-- **Thumbnails** are off by default. Turn on the **Thumbnails** switch above your files to see previews of photos and videos. Secure Box makes them on your device when you upload, so they're ready whenever you switch them on.
+- **Thumbnails** show previews of photos and videos. Secure Box makes them on your device when you upload. Turn the **Thumbnails** switch above your files off to hide them.
+- Your view is remembered in this browser: the tab you were on, grid or list, sorting, thumbnails, and the password generator's settings.
 - **Viewer:** use ← and → to move through a folder, or swipe left and right on a phone or tablet.
   - **Images:** zoom with + and −, Ctrl/⌘ + scroll, or a double-click; press R to rotate. On touch screens, pinch to zoom, double-tap to zoom in or back out, and drag to move around.
   - **Video and audio:** players with seeking.
   - **Documents:** PDFs in the browser's own viewer, or drawn by the built-in PDF.js reader where the browser has none (Android, iPhone and iPad), and reader views for Word, Excel, PowerPoint, OpenDocument, EPUB, RTF, Markdown, CSV and JSON.
   - **Text and code:** text files open as a clean page, like other documents. Switch on **Monospace** for a fixed-width font; code and config files start in monospace, and your choice is remembered. Files without a known extension, such as `README` or `LICENSE`, are checked and shown as plain text when they contain text.
-  - Formats your browser can't play natively (for example `.mkv` or `.heic` in Chrome) offer a download instead.
+  - Formats your browser can't play (for example `.heic` in Chrome) say so, and offer **Download**, or **Open in another app** where the browser can hand files over. A video that plays without sound, often an `.mkv`, `.avi` or `.mov` whose sound the browser can't decode, says so too.
 
-**Keyboard**
-- <kbd>/</kbd>: search
-- <kbd>N</kbd>: new item, or new folder in Files
-- <kbd>U</kbd>: upload
-- <kbd>Backspace</kbd>: go up a folder
-- <kbd>Delete</kbd>: delete the selection
-- <kbd>Ctrl</kbd>+<kbd>A</kbd>: select all
+**Keyboard** (press <kbd>?</kbd> in Secure Box for the full list)
+- <kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd>: search
+- <kbd>N</kbd>: new item, or a new folder in Files; <kbd>U</kbd>: upload
+- In Files: the arrow keys, <kbd>Home</kbd> and <kbd>End</kbd> move, and select with <kbd>Shift</kbd>; <kbd>Space</kbd> selects one, <kbd>Ctrl</kbd>+<kbd>A</kbd> all and <kbd>Esc</kbd> none; <kbd>Enter</kbd> opens, <kbd>F2</kbd> renames, <kbd>Delete</kbd> deletes, <kbd>Backspace</kbd> goes up a folder
+- In the viewer: <kbd>←</kbd> <kbd>→</kbd> move through the folder, <kbd>+</kbd> <kbd>−</kbd> zoom, <kbd>0</kbd> fits, <kbd>R</kbd> rotates, <kbd>Esc</kbd> closes
 
 **Menu (⋯)**
 - Sync now
@@ -247,7 +259,7 @@ Your browser's **Back** and **Forward** buttons move between tabs and folders, c
 - **Change master password** (your Emergency Kit keeps working)
 - **New Emergency Kit** (the old one stops working)
 - **Key ring backup** (below)
-- **Tools:** encrypt files to `.sbox`, decrypt `.sbox` files, encrypt or decrypt text (below)
+- **Keyboard shortcuts**, **Source code** and **Lock**
 
 **A vault on this device**
 
@@ -258,7 +270,7 @@ Passwords and files kept only here: nothing is uploaded. It works like a cloud v
 - **Keeping it safe in the browser.** The browser deletes this storage if someone clears this site's data, or uninstalls the browser. It may also clear it by itself when space runs low, unless it grants Secure Box *persistent storage*. Browsers decide that themselves, and usually agree for an installed app (see [Install as an app](#install-as-an-app)). The bar above your files shows whether it's protected, and has **Protect** to ask again.
 - **On iPhone and iPad** a vault on this device works only in the Secure Box app on your Home Screen. Safari deletes the data of websites you haven't opened for 7 days, and only Home Screen apps are safe from that.
 - **Back up** saves the whole vault as one `.zip`, exactly as stored and still encrypted, so you can keep it anywhere. The bar reminds you when it's out of date.
-- **Restore a backup.** On a new phone or computer, choose **Keep it only on this device → Restore a backup…** on the first screen, then unlock with your master password. In an open vault, **⋯ → Restore a backup…** adds back whatever is missing.
+- **Restore a backup.** On a new phone or computer, choose **This device → Restore a backup…** on the first screen, then unlock with your master password. In an open vault, **⋯ → Restore a backup…** adds back whatever is missing.
 - **Files put in by hand.** If someone copies plain files into a folder vault's `Secure Box` folder, the bar lists them and offers **Encrypt them**. Each one is encrypted into the vault, and then the unencrypted original is deleted.
 - **Move this vault.** **⋯ → Move this vault…** moves it between this browser and a folder, or from one folder to another, wherever folders can be chosen.
   - Secure Box copies it exactly as stored, still encrypted, and checks the copy. It opens the copy, then deletes the old one.
@@ -270,17 +282,18 @@ Passwords and files kept only here: nothing is uploaded. It works like a cloud v
   - It can't be undone, except from a backup.
   - A vault you can't open any more can be deleted too: from **Forgot master password? → Delete this vault and start over…**, or from the error screen if it can't be read.
 
-**Tools (⋯ menu)**
+**Encrypt & decrypt**
 
-These work on your computer or phone and upload nothing.
-- **Encrypt files:** choose files or a folder. Each file becomes its own `.sbox`, and a folder becomes one `.sbox`. Your originals aren't changed: delete them yourself once you've checked the encrypted copies.
+A tab of its own, there whether or not a vault is open. Everything happens on your computer or phone, and nothing is uploaded.
+- **Files:** drop files or a folder in, or choose them. Each file becomes its own `.sbox`, and a folder becomes one `.sbox`. Your originals aren't changed: delete them yourself once you've checked the encrypted copies.
   - In Chrome and Edge on a computer, and in Chrome on Android, you pick a folder to save into, and big files are written a piece at a time.
   - Other browsers save the results as downloads. Each one is put together in memory first, so very large files may not fit, especially on phones.
+- **Who can open it.** With a vault open, you can, with your master password, and you can add a **sharing password** for someone else. With no vault open, a password is required. Generate one with a click, and send it separately from the files.
 - **Hide file names** is on by default and gives each `.sbox` a random name.
-- **Add a sharing password** lets someone without your account open the files: they go to Secure Box, choose **Open a .sbox file** on the sign-in screen, and enter the password. Send the password separately from the files. Your own account can always open them too.
-- **Decrypt .sbox files:** files made with your account open straight away. Others ask for their sharing password, or for the key ring backup of the account that made them. A folder is unpacked into the folder you choose, or downloaded as a `.zip`.
-- **Encrypt text:** type or paste text and press **Encrypt** to get a message block to paste anywhere. Paste a message block instead, and the button turns into **Decrypt**. Add a sharing password, and someone without an account can read it with **Read a message** on the sign-in screen.
-- **Key ring backup:** saves a copy of your key ring: your master key, locked with your master password and Emergency Kit. With it you can open your `.sbox` files and messages on any device, and start a new vault with the same master password (**No, I already have one → A key ring backup** when you create one). Keep it private: it keeps opening with the master password and Emergency Kit you have on the day you export it, even after you change them.
+- **Opening `.sbox` files:** drop them in. Files made with a vault that's open come out straight away; others ask for their password. One made with your vault while it's locked offers **Unlock your vault**, which brings you back with it ready. Without your vault, **Use a key ring backup** opens your own files on any device. A folder is unpacked into the folder you choose, or downloaded as a `.zip`.
+- **Text:** switch to **Text** to turn a message into a block you can paste anywhere (**Encrypt**), or to read one (**Decrypt**). Pasting a message block switches to **Decrypt** by itself.
+- **Anyone can open what you send them** at your Secure Box address, in this tab: no account, no vault, just the password.
+- **Key ring backup** (**⋯ → Key ring backup**): saves a copy of your key ring, your master key locked with your master password and Emergency Kit. With it you can open your `.sbox` files and messages on any device, and start a new vault with the same master password (**No, I already have one → A key ring backup** when you create one). Keep it private: it keeps opening with the master password and Emergency Kit you have on the day you export it, even after you change them.
 
 ### Install as an app
 
@@ -300,7 +313,7 @@ Secure Box can be installed like an app. It opens in its own window, and browser
 | Deleted the vault's folder on this device | Restore it from the Recycle Bin (the Trash on a Mac), then choose **Try again**. If you moved it instead, choose **Find the folder…**. |
 | Deleted it while it was open, for good | Choose **Save it again**: your passwords, notes and folders come back from what's open. Its files can come back only from a backup. |
 | A bad change to the vault | In Drive, right-click `Secure Box Vault.json` → **Manage versions** and download an earlier version. |
-| No access to Google Drive, but you need your `.sbox` files | On the sign-in screen, choose **Open a .sbox file**, load your key ring backup, and enter your master password or Emergency Kit recovery key. |
+| No access to your vault, but you need your `.sbox` files | Open the **Encrypt & decrypt** tab (no sign-in needed), drop the files in, choose **Use a key ring backup**, and enter your master password or Emergency Kit recovery key. |
 | The vault on this device is gone (site data cleared, new phone) | Secure Box says so when you open it: choose **Restore a backup…** with your latest backup, then unlock with your master password. |
 | Lost both the master password and the Emergency Kit | The data can't be recovered. That's the point of the encryption. For a vault on this device, **Forgot master password? → Delete this vault and start over…** clears it away. |
 
@@ -313,6 +326,9 @@ Secure Box can be installed like an app. It opens in its own window, and browser
 | Google shows "Access blocked" | Add that Gmail address under Google Auth Platform → Audience → Test users, or publish the app. |
 | "Turn on the Google Drive API" | Enable it in the Cloud project and wait a minute. |
 | "Reconnect Google Drive" appears | Normal after an hour: one click, and your vault stays unlocked. Allow pop-ups for the site. |
+| OneDrive asks you to sign in again | Normal once a day: Microsoft lets apps in a browser renew their access for 24 hours at most. |
+| Microsoft sign-in: "Cross-origin token redemption is permitted only for the 'Single-Page Application' client-type" | Move the redirect URIs to the **Single-page application** platform (step 3 of Setup), not *Web*. |
+| Microsoft sign-in: "The redirect URI … does not match" | Add the exact address, ending in `/index.html`, for each of web.app, firebaseapp.com and localhost. |
 | A video won't play | The browser doesn't support that codec. Download it, or convert it to MP4 (H.264) or WebM. |
 | `firebase.ps1 cannot be loaded` | PowerShell is blocking npm's script wrapper. Run `firebase.cmd login` instead; the deploy script already uses `firebase.cmd`. |
 | Firebase deploy fails: not signed in, or project not found | Run `firebase login`. Check the project ID under Firebase console → Project settings, and open Hosting → Get started once. |
@@ -328,8 +344,9 @@ npm run preview      # serves dist/ at http://localhost:8081, under the real CSP
 ```
 
 - Secure Box is built with **React** and **Vite**. The page keeps its strict Content-Security-Policy in development too: no inline scripts or styles (styles are one linked stylesheet chain, never injected), and the only Trusted Types policy lets through just Secure Box's own scripts.
-- `npm run build` writes `dist/` and runs `scripts/check-build.mjs`: the page's CSP must match `firebase.json`'s, nothing may be inline, and every file the page and the service worker load must be there. Both deploy scripts build with `npm ci --ignore-scripts` and stop if the check fails.
-- `npm test` runs 58 unit tests, covering the key ring and its revisions (including changes made in two places, ties, recovery keys typed by hand, files picked in the wrong place and old key ring backups), encryption formats, `.sbox` files, encrypted messages, the local vault's index key and backups, moving and deleting it, and a vault folder moved or deleted outside Secure Box (against a stand-in for a chosen folder), tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive), and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
+- `npm run build` writes `dist/` and runs `scripts/check-build.mjs`: the page's CSP must match `firebase.json`'s, nothing may be inline, and every file the page and the service worker load must be there. The deploy script builds with `npm ci --ignore-scripts` and stops if the check fails.
+- `npm test` runs 68 unit tests, covering the key ring and its revisions (including changes made in two places, ties, recovery keys typed by hand, files picked in the wrong place and old key ring backups), encryption formats, `.sbox` files, encrypted messages, the local vault's index key and backups, moving and deleting it, and a vault folder moved or deleted outside Secure Box (against a stand-in for a chosen folder), tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive), uploads resuming after a lost piece, a cloud vault put in the bin or deleted while open, and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
+- The demo can rehearse failures: add `&faults=` with any of `quota`, `expire`, `trash`, `save` (uploads and saves going wrong) or `bin`, `deleted`, `trashed`, `gone` (a vault deleted outside Secure Box), for example http://localhost:8080/?demo&faults=trashed.
 
 ```
 index.html              the page: Content-Security-Policy, the root element, the stylesheet
@@ -376,7 +393,7 @@ tests/                  node --test suite
 
 1. Take the app offline: run `firebase hosting:disable --project <project-id>`, or delete the Firebase project.
 2. Each person can delete the `Secure Box` folder from their Google Drive, or `Apps/Secure Box` from their OneDrive, and the vault on their device from the ⋯ menu. Export anything they need first.
-3. Remove the app's access at myaccount.google.com → Security → Third-party connections.
+3. Remove the app's access at myaccount.google.com → Security → Third-party connections, and for OneDrive at account.live.com/consent/Manage. Delete the Microsoft app registration too, if you made one.
 
 ## Contributing and security
 
