@@ -21,13 +21,16 @@ hosting it, you must offer them its source code. The app's ⋯ menu has a **Sour
 point it at your fork.
 
 ```bash
-npm run dev     # http://localhost:8080/index.html?demo
+npm install     # the locked dependencies, with install scripts off
+npm run dev     # http://localhost:8080/?demo
 npm test
+npm run build   # dist/, then the build check
 ```
 
 The code follows a few rules:
 
-- No third-party JavaScript, fonts or images, and no build step: everything in `app/` is served as is.
-- The Content-Security-Policy and Trusted Types stay strict: no inline scripts or styles, no `eval`.
-- Documents are rendered with DOM calls, never as HTML strings.
+- Few dependencies, each pinned exactly in `package-lock.json`: React, PDF.js and the Vite build tool. Nothing is loaded from another address at run time.
+- Encryption and storage live in `src/core/` and the app's logic in `src/session/`, both without React; components in `src/ui/` only show the session and call it.
+- The Content-Security-Policy and Trusted Types stay strict, in development too: no inline scripts or styles (no CSS imported from JavaScript), no `eval`, and workers start only through `src/core/trusted.js`.
+- Documents are rendered from plain data with React, never as HTML strings; `tests/source.test.mjs` fails on any HTML or code sink in `src/`.
 - Every change to the encryption formats comes with tests in `tests/`.

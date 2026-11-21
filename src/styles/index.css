@@ -1,0 +1,9 @@
+/* Secure Box styles: one stylesheet chain, linked from index.html (never injected by scripts,
+   so the strict style-src 'self' holds in development too). */
+@import './base.css';
+@import './shell.css';
+@import './home.css';
+@import './tools.css';
+@import './passwords.css';
+@import './files.css';
+@import './viewer.css';

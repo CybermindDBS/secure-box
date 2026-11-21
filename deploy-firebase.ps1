@@ -3,11 +3,12 @@
   Deploys Secure Box to Firebase Hosting (Windows PowerShell 5.1+ or PowerShell 7).
 
 .DESCRIPTION
-  Writes app/assets/config.json and runs "firebase deploy --only hosting" with the security
+  Writes public/assets/config.json, builds the app (npm ci, npm run build) and runs
+  "firebase deploy --only hosting" to publish dist/ with the security
   headers from firebase.json. Settings are remembered in deploy.settings.json.
 
-  IMPORTANT: keep using the SAME Google OAuth client ID as before (it is remembered from
-  deploy.ps1) and add the Firebase addresses to it. Google Drive only shows Secure Box the
+  IMPORTANT: keep using the SAME Google OAuth client ID once you have vaults (it is remembered
+  in deploy.settings.json), with the Firebase addresses added to it. Google Drive only shows Secure Box the
   files created through that client's Google Cloud project, so a client from another project
   would not see existing vaults. Any Firebase project can host the files; adding Firebase to
   that same Google Cloud project keeps everything in one place.
@@ -38,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 
 $Root = $PSScriptRoot
 $SettingsPath = Join-Path $Root 'deploy.settings.json'
-$ConfigPath = Join-Path $Root 'app\assets\config.json'
+$ConfigPath = Join-Path $Root 'public\assets\config.json'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Write-Step([string]$Text) { Write-Host ''; Write-Host "==> $Text" -ForegroundColor Cyan }
@@ -48,7 +49,7 @@ function Stop-Deploy([string]$Text) {
   exit 1
 }
 
-# --- Remembered settings (shared with deploy.ps1) -----------------------------------
+# --- Remembered settings ------------------------------------------------------------
 $saved = [ordered]@{}
 if (Test-Path $SettingsPath) {
   $json = Get-Content $SettingsPath -Raw | ConvertFrom-Json
@@ -94,14 +95,30 @@ $saved['AutoLockMinutes'] = $AutoLockMinutes
 $saved['SessionHours'] = $SessionHours
 [System.IO.File]::WriteAllText($SettingsPath, ($saved | ConvertTo-Json) + "`n", $Utf8NoBom)
 
-Write-Step 'Writing app/assets/config.json'
+Write-Step 'Writing public/assets/config.json'
 $config = [ordered]@{ googleClientId = $GoogleClientId }
 if ($MicrosoftClientId) { $config['microsoftClientId'] = $MicrosoftClientId }
 $config['autoLockMinutes'] = $AutoLockMinutes
 $config['sessionHours'] = $SessionHours
 [System.IO.File]::WriteAllText($ConfigPath, ($config | ConvertTo-Json) + "`n", $Utf8NoBom)
 
-Write-Step "Deploying to Firebase Hosting (project $Project)"
+# --- Build: exactly the locked dependencies, no install scripts, then the build check ----------
+$npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+if (-not $npm) { $npm = Get-Command npm -ErrorAction SilentlyContinue }
+if (-not $npm) { Stop-Deploy 'Node.js (with npm) is needed to build Secure Box: install Node.js 22 or newer, then run this again.' }
+Push-Location $Root
+try {
+  Write-Step 'Installing the locked dependencies (npm ci)'
+  & $npm.Source ci --ignore-scripts --no-audit --no-fund
+  if ($LASTEXITCODE -ne 0) { Stop-Deploy "npm ci failed (exit code $LASTEXITCODE)." }
+  Write-Step 'Building (vite build, then the build check)'
+  & $npm.Source run build
+  if ($LASTEXITCODE -ne 0) { Stop-Deploy "The build or its check failed (exit code $LASTEXITCODE): nothing was deployed." }
+} finally {
+  Pop-Location
+}
+
+Write-Step "Deploying dist/ to Firebase Hosting (project $Project)"
 Push-Location $Root
 try {
   & $firebase.Source deploy --only hosting --project $Project --non-interactive
@@ -150,6 +167,6 @@ Write-Host "    Authorized redirect URIs:       https://$Site.web.app/index.html
 Write-Host '    (If the console asks you to add the domain to the authorized domains list first, add'
 Write-Host "     $Site.web.app and $Site.firebaseapp.com under Google Auth Platform > Branding.)"
 Write-Host ''
-Write-Host '  Your data stays where it is: in each person''s Google Drive. Use one address consistently;'
-Write-Host '  each address keeps its own settings in the browser.'
+Write-Host '  Your data stays where it is: in each person''s Google Drive or OneDrive, or on their device.'
+Write-Host '  Use one address consistently: each address keeps its own settings and device vault in the browser.'
 Write-Host ''

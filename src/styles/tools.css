@@ -1,0 +1,581 @@
+/* ==========================================================================
+   Encrypt & decrypt: files (.sbox) and messages, with or without a vault
+   ========================================================================== */
+.tools {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 28px 20px 48px;
+}
+
+.tools-inner {
+  display: grid;
+  gap: 18px;
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.tools-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 14px 24px;
+}
+
+.tools-title {
+  margin: 0 0 4px;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.tools-lead {
+  max-width: 520px;
+  margin: 0;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+
+/* ---------- A small switch with a sliding thumb ---------- */
+.seg {
+  position: relative;
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+
+.seg-thumb {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 0;
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow-xs), 0 0 0 1px var(--border);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1),
+    width 0.22s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.15s;
+}
+
+.seg-thumb.is-on {
+  opacity: 1;
+}
+
+.seg-option {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 560;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.seg-option[aria-checked='true'] {
+  color: var(--text);
+}
+
+.seg-option[aria-checked='true'] .icon {
+  color: var(--accent);
+}
+
+.seg-option:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.tool {
+  display: grid;
+  gap: 14px;
+}
+
+.text-modes {
+  justify-self: start;
+}
+
+/* ---------- Drop zone ---------- */
+.drop-zone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 34px 20px;
+  border: 1.5px dashed var(--border-strong);
+  border-radius: 18px;
+  background: var(--surface);
+  text-align: center;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+}
+
+.drop-zone.is-over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.drop-zone-icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.drop-zone-text {
+  display: grid;
+  gap: 2px;
+}
+
+.drop-zone-text strong {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.drop-zone-text small {
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+.drop-zone-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.drop-zone.is-compact {
+  flex-direction: row;
+  justify-content: flex-start;
+  padding: 10px 12px 10px 14px;
+  border-radius: 14px;
+  text-align: left;
+}
+
+.drop-zone.is-compact .drop-zone-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+}
+
+.drop-zone.is-compact .drop-zone-text {
+  flex: 1;
+}
+
+.drop-zone.is-compact .drop-zone-text strong {
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 540;
+}
+
+.drop-zone.is-compact .drop-zone-actions {
+  margin: 0;
+}
+
+/* ---------- Sections: Encrypt, Open, a message ---------- */
+.tool-section {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+  animation: rise 0.24s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.tool-section .field {
+  margin: 0;
+}
+
+.tool-section-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tool-section-head h3 {
+  flex: 1;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 620;
+}
+
+.tool-section-meta {
+  color: var(--text-3);
+  font-weight: 500;
+}
+
+.tool-section-icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+}
+
+.tool-section-icon.is-encrypt {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.tool-section-icon.is-open {
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  color: var(--ok);
+}
+
+.tool-section-tools {
+  display: flex;
+  gap: 6px;
+}
+
+.tool-list {
+  display: grid;
+  gap: 2px;
+  max-height: 260px;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+  list-style: none;
+}
+
+.tool-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 4px 4px 4px 10px;
+  border-radius: 8px;
+}
+
+.tool-item > .icon {
+  flex: none;
+  color: var(--text-3);
+}
+
+.tool-item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-item-meta {
+  flex: none;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+.tool-item-state {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 540;
+}
+
+.tool-item-state.is-ok {
+  background: color-mix(in srgb, var(--ok) 13%, transparent);
+  color: var(--ok);
+}
+
+.tool-item-state.is-info {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.tool-item-state.is-error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.icon-btn.icon-btn-sm {
+  width: 30px;
+  height: 30px;
+}
+
+.tool-label {
+  margin: 0;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.tool-hint,
+.tool-note {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.link-inline {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/* Who can open it */
+.who {
+  display: grid;
+  gap: 10px;
+}
+
+.who-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent-soft) 50%, var(--surface));
+}
+
+.who-icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.who-text {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.who-text strong {
+  font-size: 13.5px;
+  font-weight: 580;
+}
+
+.who-text small {
+  overflow: hidden;
+  color: var(--text-3);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.who-check {
+  flex: none;
+  color: var(--accent);
+}
+
+.sharing-password {
+  display: grid;
+  gap: 8px;
+}
+
+.sharing-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Made with a vault: how to open it */
+.tool-callout {
+  display: flex;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-2);
+}
+
+.tool-callout > .icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--accent);
+}
+
+.tool-callout strong {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.tool-callout p {
+  margin: 2px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.tool-callout-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.tool-backup {
+  display: grid;
+  gap: 10px;
+}
+
+/* Working, done */
+.tool-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.tool-progress > span:not(.spinner) {
+  flex: 1;
+}
+
+.tool-progress .link-btn {
+  margin: 0;
+}
+
+.tool-done {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--border));
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--ok) 8%, var(--surface));
+  animation: rise 0.24s ease-out;
+}
+
+.tool-done-icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+  color: var(--ok);
+}
+
+.tool-done > div {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+}
+
+.tool-done strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.tool-done small {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.tool-clear {
+  justify-self: center;
+  margin: 0;
+}
+
+/* Messages */
+.message-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.message-status.is-ok {
+  color: var(--ok);
+}
+
+.message-status.is-error {
+  color: var(--danger);
+}
+
+.tool .text-area {
+  min-height: 120px;
+  resize: vertical;
+}
+
+.text-result .text-area {
+  min-height: 150px;
+}
+
+@media (max-width: 760px) {
+  .tools {
+    padding: 16px 12px 24px;
+  }
+
+  .tools-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .tools-modes {
+    display: flex;
+  }
+
+  .tools-modes .seg-option {
+    flex: 1;
+  }
+
+  .tool-section {
+    padding: 14px;
+    border-radius: 16px;
+  }
+
+  .drop-zone {
+    padding: 24px 14px;
+  }
+
+  .drop-zone.is-compact {
+    flex-wrap: wrap;
+  }
+
+  .tool-item-meta {
+    display: none;
+  }
+}

@@ -26,8 +26,8 @@ Out of scope:
 - Attacks that need malware on the device, a malicious browser extension, or someone holding both
   the Google account *and* the master password or Emergency Kit.
 - Copies hosted with a changed configuration or changed code.
-- Headers that a host can't send (for example plain Amazon S3), which the page's built-in policy
-  already covers.
+- Copies hosted somewhere that can't send the security headers in `firebase.json`; the page's
+  built-in policy covers most of them, but only Firebase Hosting is supported.
 
 ## Status
 

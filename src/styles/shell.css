@@ -1,0 +1,431 @@
+/* ==========================================================================
+   The shell: top bar, the tabs (the vault's pill, a divider, Encrypt & decrypt),
+   the vault switcher, and on phones the tab bar at the bottom of the screen
+   ========================================================================== */
+.shell {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.shell.is-unlocked {
+  height: 100vh;
+  height: 100dvh;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr); /* never wider than the screen */
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.shell.is-unlocked > .topbar {
+  grid-row: 1;
+}
+
+.shell.is-unlocked > .vault-status {
+  grid-row: 2;
+}
+
+.shell.is-unlocked > .view {
+  grid-row: 3;
+}
+
+.view {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.shell.is-locked > .view {
+  flex: 1;
+}
+
+.view-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.view-panel[hidden] {
+  display: none !important;
+}
+
+.view-panel > * {
+  flex: 1;
+  min-height: 0;
+}
+
+/* ---------- Top bar ---------- */
+.topbar {
+  position: relative;
+  z-index: 5;
+  gap: 14px;
+  min-height: 60px;
+}
+
+.shell.is-locked .topbar {
+  border-bottom-color: transparent;
+  background: transparent;
+}
+
+.top-actions {
+  flex: none;
+  margin-left: auto;
+}
+
+.brand {
+  flex: none;
+  white-space: nowrap;
+}
+
+.topbar .search {
+  flex: 1 1 240px;
+}
+
+/* Narrower desktops: the brand shrinks to its mark, and search opens from a button across the bar. */
+@media (max-width: 1180px) {
+  .shell.is-unlocked .brand-name,
+  .shell.is-unlocked .brand .badge {
+    display: none;
+  }
+}
+
+@media (min-width: 761px) and (max-width: 1080px) {
+  .shell.is-unlocked .topbar .search {
+    display: none;
+    max-width: none;
+    margin: 0;
+  }
+
+  .shell.is-unlocked .search-open {
+    display: inline-grid;
+  }
+
+  .topbar.is-searching > :not(.search):not(.search-close) {
+    display: none;
+  }
+
+  .shell.is-unlocked .topbar.is-searching .search {
+    display: flex;
+    flex: 1 1 auto;
+  }
+
+  .topbar.is-searching .search-close {
+    display: inline-grid;
+  }
+}
+
+.top-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 11px;
+  border-radius: 9px;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 520;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.top-link:hover,
+.top-link:focus-visible {
+  outline: none;
+  background: var(--hover);
+  color: var(--text);
+}
+
+/* ---------- Tabs ---------- */
+.tabs {
+  display: flex;
+  flex: none;
+  align-items: center;
+  min-width: 0;
+}
+
+.shell.is-locked .tabs {
+  margin: 0 auto;
+}
+
+.tablist {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tab-pill {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+/* With the vault switcher in front, the two read as one pill. */
+.tab-pill-vault.has-switcher {
+  padding-left: 3px;
+  border-left: 0;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.tab-thumb {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 0;
+  width: 0;
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow-xs), 0 0 0 1px var(--border);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1),
+    width 0.24s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.16s ease;
+}
+
+.tab-thumb.is-on {
+  opacity: 1;
+}
+
+.tab {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 540;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab[aria-selected='true'] {
+  color: var(--text);
+}
+
+.tab .icon {
+  transition: color 0.15s;
+}
+
+.tab[aria-selected='true'] .icon {
+  color: var(--accent);
+}
+
+.tab:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.tab:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The ┊ between the vault's tabs and the tools. */
+.tab-divider {
+  width: 1px;
+  height: 22px;
+  border-radius: 1px;
+  background: var(--border-strong);
+}
+
+/* ---------- The vault switcher: the start of the vault's pill ---------- */
+.place-pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 40px;
+  padding: 0 11px 0 12px;
+  border: 1px solid var(--border);
+  border-right: 0;
+  border-radius: 12px 0 0 12px;
+  background: var(--surface-2);
+  color: var(--accent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.place-pill::after {
+  position: absolute;
+  top: 10px;
+  right: 0;
+  bottom: 10px;
+  width: 1px;
+  background: var(--border-strong);
+  content: '';
+}
+
+.place-pill:hover,
+.place-pill:focus-visible {
+  outline: none;
+  background: var(--surface);
+}
+
+.place-pill:focus-visible {
+  box-shadow: var(--ring);
+}
+
+.place-pill-chevron {
+  color: var(--text-3);
+}
+
+.place-pill:disabled {
+  cursor: default;
+}
+
+/* While another vault opens, nothing that acts on the one that's closing can be pressed. */
+.shell.is-switching .list-tools,
+.shell.is-switching .files-tools {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* ---------- Phones: tabs at the bottom ---------- */
+@media (max-width: 760px) {
+  .shell {
+    padding-bottom: calc(66px + env(safe-area-inset-bottom));
+  }
+
+  .topbar {
+    min-height: 56px;
+    gap: 8px;
+    padding: 8px 8px 8px 12px;
+  }
+
+  .shell.is-unlocked .brand-name {
+    display: none;
+  }
+
+  .tabs {
+    min-width: 0;
+  }
+
+  .shell.is-locked .tabs {
+    margin: 0;
+  }
+
+  .tablist {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 30;
+    gap: 2px;
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 90%, transparent);
+    -webkit-backdrop-filter: blur(16px) saturate(1.4);
+    backdrop-filter: blur(16px) saturate(1.4);
+  }
+
+  .tab-pill,
+  .tab-pill-vault.has-switcher {
+    flex: 2;
+    padding: 0;
+    border: 0;
+    border-radius: 14px;
+    background: none;
+  }
+
+  .tab-pill-tools {
+    flex: 1;
+  }
+
+  .shell.is-locked .tab-pill-vault {
+    flex: 1;
+  }
+
+  .tab {
+    flex: 1;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    height: 54px;
+    padding: 4px 6px;
+    border-radius: 14px;
+    font-size: 11.5px;
+    font-weight: 580;
+  }
+
+  .tab .icon {
+    width: 22px;
+    height: 22px;
+  }
+
+  .tab[aria-selected='true'] {
+    color: var(--accent);
+  }
+
+  .tab-thumb {
+    top: 0;
+    bottom: 0;
+    border-radius: 14px;
+    background: var(--accent-soft);
+    box-shadow: none;
+  }
+
+  .tab-divider {
+    height: 30px;
+    margin: 0 2px;
+  }
+
+  .place-pill {
+    height: 36px;
+    padding: 0 10px;
+    border-right: 1px solid var(--border);
+    border-radius: 11px;
+  }
+
+  .place-pill::after {
+    display: none;
+  }
+
+  /* Search opens across the top bar; the tabs stay at the bottom. */
+  .topbar.is-searching > .tabs {
+    display: flex !important;
+    flex: 0 0 auto;
+  }
+
+  .topbar.is-searching .place-pill {
+    display: none;
+  }
+
+  .toasts {
+    bottom: calc(78px + env(safe-area-inset-bottom));
+  }
+
+  .transfers {
+    bottom: calc(74px + env(safe-area-inset-bottom));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab-thumb {
+    transition: none;
+  }
+}

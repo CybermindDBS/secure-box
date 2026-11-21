@@ -2,7 +2,7 @@
   "name": "secure-box",
   "version": "2.0.0",
   "private": true,
-  "description": "Secure Box: an end-to-end encrypted vault for passwords, secrets and files. Static site on Firebase Hosting or Amazon S3; everything stored encrypted in each person's own Google Drive.",
+  "description": "Secure Box: an end-to-end encrypted vault for passwords, secrets and files, with tools to encrypt and decrypt files and messages. A static site on Firebase Hosting; everything is stored encrypted in each person's own Google Drive or OneDrive, or only on their device.",
   "license": "AGPL-3.0-only",
   "author": "CybermindDBS",
   "homepage": "https://github.com/CybermindDBS/secure-box#readme",
@@ -15,10 +15,20 @@
   },
   "type": "module",
   "scripts": {
-    "dev": "node scripts/serve.mjs",
+    "dev": "vite",
+    "build": "vite build && node scripts/check-build.mjs",
+    "preview": "vite preview",
     "test": "node --test \"tests/*.test.mjs\""
   },
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "pdfjs-dist": "6.5.438",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "vite": "8.3.8"
   }
 }

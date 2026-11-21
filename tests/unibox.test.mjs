@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { crc32 as zlibCrc32 } from 'node:zlib';
-import '../app/assets/stream-core.js';
-import '../app/assets/zip-core.js';
-import { CHARSETS, generatePassword, padme, passwordEntropyBits } from '../app/assets/crypto.js';
-import { CHUNK_SIZE, HEADER_BYTES, createPieceWriter, decryptFile, encryptFile, layout } from '../app/assets/fileformat.js';
-import { formatBytes, kindOf, viewerFor } from '../app/assets/filetypes.js';
+import '../src/core/stream-core.js';
+import '../src/core/zip-core.js';
+import { CHARSETS, generatePassword, padme, passwordEntropyBits } from '../src/core/crypto.js';
+import { CHUNK_SIZE, HEADER_BYTES, createPieceWriter, decryptFile, encryptFile, layout } from '../src/core/fileformat.js';
+import { formatBytes, kindOf, viewerFor } from '../src/core/filetypes.js';
 import {
   createKeyring,
   decodeRecoveryKey,
@@ -23,11 +23,11 @@ import {
   verifyRevision,
   withNewPassword,
   withNewRecovery,
-} from '../app/assets/keyring.js';
-import { looksLikeMessage, messageAccess, openMessage, readMessage, sealText } from '../app/assets/textbox.js';
-import { OneDrive } from '../app/assets/microsoft.js';
-import { createOneDriveBackend } from '../app/assets/backend.js';
-import { decodeText, extractDocx, extractOdf, extractSheet, extractSlide, looksLikeText, rtfToText } from '../app/assets/readers.js';
+} from '../src/core/keyring.js';
+import { looksLikeMessage, messageAccess, openMessage, readMessage, sealText } from '../src/core/textbox.js';
+import { OneDrive } from '../src/core/microsoft.js';
+import { createOneDriveBackend } from '../src/core/backend.js';
+import { decodeText, extractDocx, extractOdf, extractSheet, extractSlide, looksLikeText, rtfToText } from '../src/core/readers.js';
 import {
   LOCAL_INDEX,
   VaultCipher,
@@ -44,11 +44,11 @@ import {
   parseEnvelope,
   safeHref,
   uniqueName,
-} from '../app/assets/vault.js';
-import { find, parseXml, textOf } from '../app/assets/xml.js';
-import { readZipDirectory, readZipEntry, readZipText, zipStore } from '../app/assets/zip.js';
-import { boxAccess, openContent, readBox, unlockBox, writeBox, zipEntries, zipEntryData, zipFolder } from '../app/assets/localbox.js';
-import { createLocalBackend, readBackup, vaultIn } from '../app/assets/localstore.js';
+} from '../src/core/vault.js';
+import { find, parseXml, textOf } from '../src/core/xml.js';
+import { readZipDirectory, readZipEntry, readZipText, zipStore } from '../src/core/zip.js';
+import { boxAccess, openContent, readBox, unlockBox, writeBox, zipEntries, zipEntryData, zipFolder } from '../src/core/localbox.js';
+import { createLocalBackend, readBackup, vaultIn } from '../src/core/localstore.js';
 
 const S = globalThis.UniboxStream;
 const random = (n) => crypto.getRandomValues(new Uint8Array(n));
@@ -656,8 +656,8 @@ test('a backup of the vault on this device carries its key ring, and only versio
     new Blob([
       zipStore([
         { name: 'backup.json', data: JSON.stringify(m) },
-        ...(keyring ? [{ name: 'keyring.json', data: '{"format":"secure-box-keyring"}' }] : []),
-        { name: 'index.json', data: '{"format":"secure-box-local-index"}' },
+        ...(keyring ? [{ name: 'Secure Box Key Ring.json', data: '{"format":"secure-box-keyring"}' }] : []),
+        { name: 'Secure Box Vault.json', data: '{"format":"secure-box-local-index"}' },
       ]),
     ]);
   const read = await readBackup(backup(manifest));
@@ -783,7 +783,7 @@ test('moving the vault on this device copies it byte for byte, then deletes only
   const own = await documents.getDirectoryHandle('Secure Box');
   await writeText(own, 'notes.txt', 'put here by hand');
   const { 'notes.txt': stray, ...vaultOnly } = snapshot(own);
-  assert.equal(Object.keys(vaultOnly).filter((path) => path.startsWith('files/')).length, 3);
+  assert.equal(Object.keys(vaultOnly).filter((path) => path.startsWith('Encrypted files/')).length, 3);
 
   const synced = new MemDir('Synced');
   const target = inFolder(synced);
@@ -817,7 +817,7 @@ test('a move is refused where a vault already is or inside the vault, and a fail
   assert.equal(inner.children.size, 0, 'nothing was made inside the vault');
   await own.removeEntry('inner');
 
-  const full = new MemDir('Full', { failWrite: (name) => name === 'index.json' });
+  const full = new MemDir('Full', { failWrite: (name) => name === 'Secure Box Vault.json' });
   await assert.rejects(source.moveTo(inFolder(full), quietly), /Disk full/);
   assert.equal(full.children.size, 0, 'a copy that stopped halfway is cleared away');
   const unopened = new MemDir('Unopened');
