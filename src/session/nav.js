@@ -7,7 +7,7 @@ import { setPref } from './prefs.js';
 import { publish, state } from './store.js';
 import { selectItem } from './passwords.js';
 import { runDeferredSignIn } from './vaults.js';
-import { closeViewer, viewerIsOpen } from './viewer.js';
+import { closeViewer, editingDirty, requestCloseViewer, viewerIsOpen } from './viewer.js';
 
 const narrow = () => window.matchMedia('(max-width: 760px)').matches;
 let restoring = false;
@@ -60,6 +60,14 @@ export function viewerClosed() {
 window.addEventListener('popstate', (event) => {
   const target = event.state;
   if (viewerIsOpen() && !target?.viewer) {
+    if (editingDirty()) {
+      // Back with a text file's changes unsaved: the viewer stays (its entry goes back on), and
+      // closes only once the changes are let go.
+      history.pushState({ ...navState(), viewer: true }, '');
+      viewerEntry = true;
+      requestCloseViewer();
+      return;
+    }
     viewerEntry = false; // Back already took the viewer's entry off
     closeViewer({ fromHistory: true });
   }

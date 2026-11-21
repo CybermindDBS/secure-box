@@ -12,6 +12,7 @@ import { lockedAt, rememberLock, setLockReason } from './memory.js';
 import { companyName, isDevice, providerName } from './places.js';
 import { DEMO, pause, publish, state } from './store.js';
 import { tools } from './tools.js';
+import { editingDirty, editingName } from './viewer.js';
 import { channel } from './windows.js';
 
 // ===========================================================================
@@ -330,11 +331,13 @@ export async function lockWhenAsked() {
   const running = await transfersRunning();
   const uploads = running.uploads + running.paused;
   const what = [counted(uploads, 'upload', 'uploads'), counted(running.downloads, 'download', 'downloads')].filter(Boolean).join(' and ');
-  if (what || running.device) {
+  const unsaved = editingDirty() ? editingName() : '';
+  if (what || running.device || unsaved) {
     const n = uploads + running.downloads;
     const ok = await confirmDialog({
       title: 'Lock now?',
       message: [
+        unsaved && `Your changes to “${unsaved}” aren’t saved, and locking discards them.`,
         what && `${what[0].toUpperCase()}${what.slice(1)} ${n === 1 ? 'hasn’t' : 'haven’t'} finished. Locking now stops ${n === 1 ? 'it' : 'them'}.`,
         running.device && 'Your vault on this device is still being moved, backed up or restored, and locking stops that partway.',
       ]

@@ -6,13 +6,15 @@ import { driveFresh, ensureDrive } from '../../session/cloud.js';
 import { KIND_ICON, deleteEntries, download, fetchBytes, fetchRange, fileForSharing, folderPath, moveEntries, releaseUrls, renameEntry, sourceUrl } from '../../session/files.js';
 import { formatDate } from '../../session/io.js';
 import { pref, setPref } from '../../session/prefs.js';
-import { closeViewer, dropFromViewer, stepViewer, toggleViewerInfo, viewerStore } from '../../session/viewer.js';
+import { canEditText, textStyle } from '../../core/textfile.js';
+import { closeViewer, dropFromViewer, leaveEditing, requestCloseViewer, requestStepViewer, startEditing, toggleViewerInfo, viewerStore } from '../../session/viewer.js';
 import { runTask } from '../../workers/pool.js';
 import { Icon, Spinner } from '../common/Icon.jsx';
 import { Menu, MenuItem } from '../common/Menu.jsx';
 import { useNarrow, useSession, useStore } from '../hooks.js';
 import { run } from '../run.js';
 import { DocumentView } from './DocumentView.jsx';
+import { TextEditor } from './TextEditor.jsx';
 import { PdfView } from './PdfView.jsx';
 
 const SWIPE_DISTANCE = 60; // px a finger must travel sideways to change file
@@ -367,10 +369,13 @@ function DocStage({ file, kind, note }) {
   const [doc, setDoc] = useState(null);
   const [mono, setMono] = useState(pref('textMono') || kind === 'code');
   const textual = kind === 'text' || kind === 'code';
+  const editable = textual && canEditText(file);
+  const bytesHere = useRef(null); // the decrypted text, kept for Edit
   useEffect(() => {
     let alive = true;
     (async () => {
       const bytes = await fetchBytes(file);
+      if (editable && alive) bytesHere.current = bytes;
       // Parsing a big document is work: it happens off the page, in a worker (#21).
       const parsed = await runTask('parseDocument', { kind, buffer: bytes, mono });
       if (alive) setDoc(parsed);
@@ -401,6 +406,12 @@ function DocStage({ file, kind, note }) {
       {textual ? (
         <div className="doc-toolbar">
           {note ? <span className="doc-toolbar-note">{note}</span> : null}
+          {editable && bytesHere.current ? (
+            <button type="button" className="btn btn-ghost btn-sm" title="Edit this text here: it stays encrypted, and nothing is saved to disk" onClick={() => startEditing(file, textStyle(bytesHere.current))}>
+              <Icon name="edit" size={16} />
+              <span>Edit</span>
+            </button>
+          ) : null}
           <label className="switch switch-sm" title="Fixed-width font">
             <input
               type="checkbox"
@@ -550,14 +561,17 @@ function Info({ file }) {
 
 // ---------------------------------------------------------------------------
 export function Viewer() {
-  const { ids, index, info } = useStore(viewerStore);
+  const { ids, index, info, editing } = useStore(viewerStore);
   const vault = useSession((s) => s.vault);
   const narrow = useNarrow();
   const ref = useRef(null);
   const control = useRef(null);
   const [zoomLabel, setZoomLabel] = useState('Fit');
   const id = ids[index];
-  const file = id ? vault?.files.find((f) => f.id === id) : null;
+  const live = id ? vault?.files.find((f) => f.id === id) : null;
+  // A text file being edited stays open even if it's deleted elsewhere meanwhile: saving then keeps the text.
+  const editingThis = Boolean(editing && editing.id === id);
+  const file = live || (editingThis ? editing.base : null);
   const open = index >= 0;
 
   useEffect(() => {
@@ -568,17 +582,17 @@ export function Viewer() {
 
   // Deleted or moved away in another window or device while open: on to the next, or close (#20).
   useEffect(() => {
-    if (open && id && vault && !file) {
+    if (open && id && vault && !live && !editingThis) {
       toast('That file was deleted or moved.');
       dropFromViewer(id);
     }
-  }, [open, id, vault, file]);
+  }, [open, id, vault, live, editingThis]);
 
   const go = useCallback(
     (step) => {
       const next = index + step;
       if (next < 0 || next >= ids.length) return false;
-      stepViewer(step);
+      requestStepViewer(step);
       return true;
     },
     [index, ids.length],
@@ -606,7 +620,9 @@ export function Viewer() {
         download: act(() => download(file)),
         rename: act(() => renameEntry(file, false)),
         move: act(() => moveEntries([], [file.id])),
-        remove: act(() => deleteEntries([], [file.id])),
+        remove: act(async () => {
+          if (await leaveEditing()) await deleteEntries([], [file.id]);
+        }),
       }
     : {};
   const kind = file ? kindOf(file) : 'other';
@@ -619,7 +635,9 @@ export function Viewer() {
       aria-labelledby="viewer-name"
       onCancel={(event) => {
         event.preventDefault();
-        closeViewer();
+        // Esc while editing leaves the editor (asking first if there are unsaved changes); then it closes the viewer.
+        if (viewerStore.get().editing) leaveEditing();
+        else closeViewer();
       }}
       onKeyDown={onKeyDown}
     >
@@ -706,13 +724,13 @@ export function Viewer() {
                   </button>
                 </>
               )}
-              <button type="button" className="icon-btn viewer-close" aria-label="Close" title="Close (Esc)" onClick={() => closeViewer()}>
+              <button type="button" className="icon-btn viewer-close" aria-label="Close" title="Close (Esc)" onClick={() => requestCloseViewer()}>
                 <Icon name="x" />
               </button>
             </div>
           </header>
           <div className="viewer-body">
-            {index > 0 ? (
+            {index > 0 && !editingThis ? (
               <button type="button" className="viewer-nav viewer-prev" aria-label="Previous" title="Previous (←)" onClick={() => go(-1)}>
                 <Icon name="chevronLeft" size={24} />
               </button>
@@ -736,9 +754,9 @@ export function Viewer() {
                 go(dx < 0 ? 1 : -1);
               }}
             >
-              <Stage key={file.id} file={file} control={control} onSwipe={go} />
+              {editingThis ? <TextEditor file={file} deleted={!live} /> : <Stage key={file.id} file={file} control={control} onSwipe={go} />}
             </div>
-            {index < ids.length - 1 ? (
+            {index < ids.length - 1 && !editingThis ? (
               <button type="button" className="viewer-nav viewer-next" aria-label="Next" title="Next (→)" onClick={() => go(1)}>
                 <Icon name="chevronRight" size={24} />
               </button>

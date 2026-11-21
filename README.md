@@ -58,7 +58,8 @@ The names are the same wherever a vault lives (Google Drive, OneDrive, or a fold
 **Files.** Every file gets its own random 256-bit key, which lives only inside the encrypted vault. Files are encrypted in 1 MiB chunks, using the same streaming scheme as Google's Tink library.
 - Each chunk is authenticated, so any tampering, truncation, reordering or swapping of files is detected.
 - Sizes are padded (at most about 12% extra).
-- Photo and video thumbnails are made on your device and encrypted inside the same blob. Turn off the **Thumbnails** switch to hide them: while it's off, none are fetched or decrypted.
+- Photo and video thumbnails are made on your device and encrypted inside the same blob. Turn off **Thumbnails** (under **View**) to hide them: while it's off, none are fetched or decrypted.
+- A `.txt` file edited in Secure Box is saved the same way: the new text is encrypted in memory with a fresh key into a new copy, which replaces the old one, and the old copy is deleted.
 
 **This device.** A vault kept only on your device is encrypted exactly like a cloud vault, with the same key ring. Its vault file is sealed with a key of its own purpose (HKDF), so it can never pass for a cloud vault, or the other way round. Nothing in it is ever uploaded.
 
@@ -231,20 +232,21 @@ Your browser's **Back** and **Forward** buttons move between tabs and folders, c
 - Import and export CSV from Chrome, Firefox, Bitwarden, 1Password, LastPass and others, from the **⋯** button at the top of the list.
 
 **Files**
-- **Upload** several files at once with the Upload button, or a whole folder with **Upload folder** (browsers allow one folder per pick). To upload several folders, or folders and files together, drag them onto the window. Their folder structure is kept.
+- **Upload ▾** sends several files at once (**Files…**, or <kbd>U</kbd>) or a whole folder (**A folder…**; browsers allow one folder per pick). To upload several folders, or folders and files together, drag them onto the window. Their folder structure is kept.
 - While uploading, the panel shows the whole batch at a glance (files done, data done and one progress bar), and the browser tab's title shows the percentage. Fold the file list away with the arrow.
 - Only files uploaded through Secure Box are encrypted. A file you put into the `Secure Box` folder in Google Drive yourself stays as it is, unencrypted. Secure Box can't even see it, because Google only lets it see the files it created. Upload files through Secure Box instead.
-- **Organise** with folders, breadcrumbs, grid or list view, sorting, and search across every folder.
+- **Organise** with folders, breadcrumbs and search across every folder. **View** holds grid or list, sorting and thumbnails. When the path and the buttons don't fit side by side, the path moves below them.
 - **Open** a file or folder with a click (a tap on a phone or tablet). **Select** items with their checkbox, Ctrl/⌘-click or Shift-click (on a phone, long-press one, then tap more), or by dragging a box around them, then Download, Move or Delete them together. The keys work as in Google Drive; press **?** to see them all.
 - **Download** a single file as itself. Several items, folders included, download as one **.zip** that keeps their folders, and a folder's ⋯ menu has **Download as .zip**. The ZIP is built and decrypted while it downloads, so it never sits in memory, and your browser shows its real size and progress.
 - **Move** items by dragging them onto a folder or a breadcrumb.
-- **Thumbnails** show previews of photos and videos. Secure Box makes them on your device when you upload. Turn the **Thumbnails** switch above your files off to hide them.
+- **Thumbnails** show previews of photos and videos. Secure Box makes them on your device when you upload. Turn **View → Thumbnails** off to hide them.
 - Your view is remembered in this browser: the tab you were on, grid or list, sorting, thumbnails, and the password generator's settings.
 - **Viewer:** use ← and → to move through a folder, or swipe left and right on a phone or tablet.
   - **Images:** zoom with + and −, Ctrl/⌘ + scroll, or a double-click; press R to rotate. On touch screens, pinch to zoom, double-tap to zoom in or back out, and drag to move around.
   - **Video and audio:** players with seeking.
   - **Documents:** PDFs in the browser's own viewer, or drawn by the built-in PDF.js reader where the browser has none (Android, iPhone and iPad), and reader views for Word, Excel, PowerPoint, OpenDocument, EPUB, RTF, Markdown, CSV and JSON.
   - **Text and code:** text files open as a clean page, like other documents. Switch on **Monospace** for a fixed-width font; code and config files start in monospace, and your choice is remembered. Files without a known extension, such as `README` or `LICENSE`, are checked and shown as plain text when they contain text.
+  - **Editing `.txt` files:** **Edit** turns the text into a text box, right in the viewer. **Save** (or <kbd>Ctrl</kbd>+<kbd>S</kbd>) encrypts the new text in your browser and stores it as the file's new encrypted copy: it's never written to disk, and the file keeps its encoding and line breaks. **Done** or <kbd>Esc</kbd> goes back to reading. Unsaved changes are never dropped without asking, and if the file changed or was deleted elsewhere while you were editing, your text is saved beside it instead. Spell-check is off in the text box, since some browsers send what you type to an online spelling service. Files up to 2 MB can be edited.
   - Formats your browser can't play (for example `.heic` in Chrome) say so, and offer **Download**, or **Open in another app** where the browser can hand files over. A video that plays without sound, often an `.mkv`, `.avi` or `.mov` whose sound the browser can't decode, says so too.
 
 **Keyboard** (press <kbd>?</kbd> in Secure Box for the full list)
@@ -345,7 +347,7 @@ npm run preview      # serves dist/ at http://localhost:8081, under the real CSP
 
 - Secure Box is built with **React** and **Vite**. The page keeps its strict Content-Security-Policy in development too: no inline scripts or styles (styles are one linked stylesheet chain, never injected), and the only Trusted Types policy lets through just Secure Box's own scripts.
 - `npm run build` writes `dist/` and runs `scripts/check-build.mjs`: the page's CSP must match `firebase.json`'s, nothing may be inline, and every file the page and the service worker load must be there. The deploy script builds with `npm ci --ignore-scripts` and stops if the check fails.
-- `npm test` runs 68 unit tests, covering the key ring and its revisions (including changes made in two places, ties, recovery keys typed by hand, files picked in the wrong place and old key ring backups), encryption formats, `.sbox` files, encrypted messages, the local vault's index key and backups, moving and deleting it, and a vault folder moved or deleted outside Secure Box (against a stand-in for a chosen folder), tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive), uploads resuming after a lost piece, a cloud vault put in the bin or deleted while open, and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
+- `npm test` runs 71 unit tests, covering the key ring and its revisions (including changes made in two places, ties, recovery keys typed by hand, files picked in the wrong place and old key ring backups), encryption formats, `.sbox` files, encrypted messages, the local vault's index key and backups, moving and deleting it, and a vault folder moved or deleted outside Secure Box (against a stand-in for a chosen folder), tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive), uploads resuming after a lost piece, a cloud vault put in the bin or deleted while open, saving an edited text file in its own encoding and line breaks, and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
 - The demo can rehearse failures: add `&faults=` with any of `quota`, `expire`, `trash`, `save` (uploads and saves going wrong) or `bin`, `deleted`, `trashed`, `gone` (a vault deleted outside Secure Box), for example http://localhost:8080/?demo&faults=trashed.
 
 ```
@@ -370,12 +372,14 @@ src/
     localstore.js       the vault on this device: browser storage or a chosen folder, backups
     textbox.js          encrypted text messages
     readers.js          Word/Excel/PowerPoint/OpenDocument/EPUB/RTF/Markdown/CSV/text, as plain data
+    textfile.js         editing .txt files: their encoding and line breaks, kept on save
     filetypes.js, thumbs.js, zip.js, xml.js, demo.js
   session/              the app's logic, no React: what's open, unlocking, switching, saving
     vaults.js           the Vault tab's steps, unlock, create, adopt, Emergency Kit, recovery, switching
     cloud.js            saving and syncing, Reconnect, auto-lock, locking every window
     device.js           the vault on this device: making, opening, backups, moving, deleting
     gone.js             a vault deleted or moved outside Secure Box while open: the ways back
+    textedit.js         saving a .txt file edited in the viewer, and what if it changed meanwhile
     files.js            folders, choosing, uploads (parallel, batched), downloads, deletes
     tools.js            Encrypt & decrypt: .sbox files and messages, with or without a vault
     passwords.js        items, CSV, master password, Emergency Kit, key ring backup

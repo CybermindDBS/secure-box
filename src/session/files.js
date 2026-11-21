@@ -10,7 +10,7 @@
  */
 import { MAX_FILE_SIZE, createPieceWriter, decryptFile, encryptFile, layout } from '../core/fileformat.js';
 import { canThumbnail, formatBytes, guessType, kindOf } from '../core/filetypes.js';
-import { fileUrl, zipUrl } from '../core/stream.js';
+import { fileUrl, forgetStreams, zipUrl } from '../core/stream.js';
 import { makeThumbnail } from '../core/thumbs.js';
 import { runTask } from '../workers/pool.js';
 import { collectTree, folderChain, makeFileEntry, makeFolder, uniqueName } from '../core/vault.js';
@@ -20,6 +20,7 @@ import { downloadFile, pickFiles } from './io.js';
 import { pushNav } from './nav.js';
 import { pref } from './prefs.js';
 import { createStore, state } from './store.js';
+import { editingDirty } from './viewer.js';
 
 const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
 export const ROOT_NAME = 'All files';
@@ -31,11 +32,20 @@ const store = createStore({
   selected: new Set(),
   anchor: null, // where a Shift range starts
   pending: new Map(), // id -> 'deleting' | 'moving' | 'renaming' (#10)
+  added: null, // a folder just made: shown and lit up for a moment, not chosen
   transfers: [], // what the uploads tray shows
   tray: 'open', // 'open' | 'collapsed'
 });
 const get = () => store.get();
 const set = (patch) => store.set((v) => ({ ...v, ...patch }));
+
+/** Lights up `id` for a moment where it now is (a folder just made), without choosing it. */
+function markAdded(id) {
+  set({ added: id });
+  setTimeout(() => {
+    if (get().added === id) set({ added: null });
+  }, 1800);
+}
 
 const vault = () => state.vault;
 const isLocal = () => state.backend?.kind === 'local';
@@ -319,7 +329,7 @@ export async function newFolder() {
   const siblings = vault().folders.filter((f) => f.parent === parent).map((f) => f.name);
   const folder = makeFolder({ name: uniqueName(name, siblings, { isFolder: true }), parent });
   await commit({ op: 'folder-put', folder });
-  setSelection([folder.id], folder.id);
+  markAdded(folder.id); // shown where it landed; choosing stays the checkbox's job
 }
 
 export async function renameEntry(entry, isFolder) {
@@ -458,6 +468,50 @@ export function deleteSelection() {
   const s = selection();
   if (s.folders.length || s.files.length) return deleteEntries(s.folders, s.files);
   return undefined;
+}
+
+// ===========================================================================
+// Saving an edited text file: in memory only, never on disk
+// ===========================================================================
+/**
+ * Saves new contents (`bytes`) for the text file `base`. They're encrypted here with a fresh key
+ * under the file's own id, into a new encrypted copy with a storage name of its own, so the old
+ * copy is never overwritten in place. The file then points to the new copy, and the old one is
+ * deleted like any deleted file (a later sync finishes the job if that fails now).
+ * With `asNew` (the file changed or went away elsewhere meanwhile) the text becomes a new file in
+ * the same folder. Resolves with the saved file's entry.
+ */
+export async function saveTextFile(base, bytes, { asNew = false } = {}) {
+  await ensureDrive();
+  const current = asNew ? null : fileById(base.id);
+  const folder = current ? current.folder : folderById(base.folder) ? base.folder : null;
+  const id = current ? current.id : crypto.randomUUID();
+  const name = current ? current.name : uniqueName(base.name, vault().files.filter((f) => f.folder === folder).map((f) => f.name));
+  const type = base.type || 'text/plain';
+  const file = new File([bytes], name, { type, lastModified: Date.now() });
+  const plan = layout({ size: file.size, thumbBytes: 0 });
+  const backend = state.backend;
+  const send = await backend.openUpload({ fid: crypto.randomUUID(), size: plan.total });
+  const writer = createPieceWriter({ total: plan.total, send, pieceSize: send.pieceSize });
+  let meta;
+  try {
+    meta = await encryptFile({ file, fileId: id, thumbnail: null, write: (piece) => writer.write(piece) });
+  } catch (err) {
+    await send.abort?.();
+    throw err;
+  }
+  const entry = makeFileEntry({ id, name, type, size: file.size, folder, driveId: writer.result, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes }, current);
+  const old = current?.driveId;
+  try {
+    await commit({ op: 'batch', changes: [{ op: 'file-put', file: entry }, ...(old ? [{ op: 'trash-add', ids: [old] }] : [])] });
+  } catch (err) {
+    // Not saved: the new copy goes again, and the file stays as it was.
+    if (state.backend === backend) await backend.trash(writer.result).catch(() => {});
+    throw err;
+  }
+  forgetStreams(); // the open file now reads from its new copy
+  if (old) deleteCopies([old]).catch((err) => console.warn('Old copy:', err));
+  return entry;
 }
 
 // ===========================================================================
@@ -790,10 +844,11 @@ export async function stopAll() {
 
 const unfinished = () => tasks.some((t) => ACTIVE.has(t.status));
 
-// Leaving the page while files are still uploading (or saving here) asks first. A lock never
-// asks: it must always go through, and the lock button has asked already when it should.
+// Leaving the page while files are still uploading (or saving here), or with a text file's
+// changes unsaved, asks first. A lock never asks: it must always go through, and the lock button
+// has asked already when it should.
 window.addEventListener('beforeunload', (event) => {
-  if (state.unlocked && (unfinished() || state.device.busy)) event.preventDefault();
+  if (state.unlocked && (unfinished() || state.device.busy || editingDirty())) event.preventDefault();
 });
 
 // ===========================================================================

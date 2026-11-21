@@ -1704,7 +1704,9 @@ a.menu-item {
 
 .files-bar {
   display: flex;
-  flex-wrap: wrap; /* tools drop below the breadcrumbs when both don't fit (tablets) */
+  /* When the path and the tools don't fit side by side, the path goes below the tools, right
+     above the files it leads to (wrap-reverse stacks the lines from the bottom up). */
+  flex-wrap: wrap-reverse;
   align-items: center;
   gap: 8px 12px;
   padding: 12px 20px 8px;
@@ -2937,34 +2939,64 @@ a.menu-item {
   min-width: 0;
 }
 
-/* Phone-only controls (search button, View options button and the sheet's labels). */
+/* Phone-only controls (the search button). */
 .search-open,
-.search-close,
-.view-toggle,
-.view-options-title,
-.view-options-label {
+.search-close {
   display: none;
 }
 
-/* Sort, layout and thumbnails: inline in the toolbar here; a sheet on phones (below). */
+/* Upload ▾ */
+.upload-btn .btn-caret {
+  margin-left: -2px;
+  opacity: 0.75;
+}
+
+/* Thumbnails, sorting and layout: a panel under the View button, like a menu (a sheet on phones,
+   below). The toolbar stays short, so the path fits beside it on most screens. */
 .view-options {
-  position: static;
+  position: fixed;
   inset: auto;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: auto;
-  height: auto;
+  width: 264px;
   margin: 0;
-  padding: 0;
-  overflow: visible;
-  border: 0;
-  background: none;
-  color: inherit;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+}
+
+.view-options:popover-open {
+  display: grid;
+  gap: 12px;
+}
+
+.view-options-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 620;
 }
 
 .view-row {
-  display: contents;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.view-options-label {
+  color: var(--text-2);
+  font-size: 13.5px;
+}
+
+.view-options .switch {
+  justify-content: space-between;
+  flex-direction: row-reverse;
+  font-size: 13.5px;
+}
+
+.view-options .segmented {
+  margin: 0;
 }
 
 @media (max-width: 760px) {
@@ -3010,7 +3042,7 @@ a.menu-item {
     padding: 0 9px;
   }
 
-  /* Files bar: the path, then New folder, Upload folder and View options, all on one row. */
+  /* Files bar: the path, then Upload, New folder and View as icons, all on one row. */
   .files-bar {
     flex-wrap: nowrap;
     gap: 4px;
@@ -3037,11 +3069,8 @@ a.menu-item {
     padding: 0;
   }
 
-  .view-toggle {
-    display: inline-grid;
-    border: 1px solid var(--border-strong);
-    background: var(--surface);
-    color: var(--text);
+  .files-tools .btn-caret {
+    display: none;
   }
 
   .view-options:not(:popover-open) {

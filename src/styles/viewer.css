@@ -121,3 +121,79 @@
     display: none;
   }
 }
+
+/* Editing a .txt file (TextEditor.jsx): the text sits on a page like the reader's, and the text
+   area scrolls on its own while the bar above it stays put. */
+.viewer-doc.text-edit {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.text-edit-bar {
+  width: 100%;
+  flex-wrap: wrap;
+}
+
+.text-edit-bar .doc-toolbar-note.is-dirty {
+  color: var(--text-2);
+  font-weight: 560;
+}
+
+.text-edit-error {
+  width: 100%;
+  max-width: 820px;
+  margin: 0 auto 10px;
+}
+
+.text-edit-area {
+  flex: 1;
+  width: 100%;
+  max-width: 820px;
+  min-height: 0;
+  margin: 0 auto;
+  padding: 32px 40px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.65;
+  resize: none;
+  outline: none;
+  tab-size: 4;
+  touch-action: auto;
+}
+
+.text-edit-area.is-mono {
+  font-family: var(--mono);
+  font-size: 14px;
+}
+
+.text-edit-area:focus-visible {
+  border-color: var(--accent);
+}
+
+.text-edit-area[readonly] {
+  opacity: 0.7;
+}
+
+@media (max-width: 760px) {
+  .text-edit-bar {
+    gap: 8px;
+  }
+
+  .text-edit-bar .doc-toolbar-note {
+    flex-basis: 100%;
+  }
+
+  /* 16px keeps phones from zooming in when the text area is tapped. */
+  .text-edit-area,
+  .text-edit-area.is-mono {
+    padding: 18px 16px;
+    border-radius: 10px;
+    font-size: 16px;
+  }
+}

@@ -149,3 +149,28 @@
   background: var(--surface-2);
   font: 12px/1.6 var(--mono);
 }
+
+/* A folder just made lights up for a moment where it landed; it isn't chosen. */
+.tile.is-added,
+.frow.is-added {
+  animation: entry-added 1.8s ease-out;
+}
+
+@keyframes entry-added {
+  0%,
+  40% {
+    background: var(--accent-soft);
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  100% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tile.is-added,
+  .frow.is-added {
+    animation: none;
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+}

@@ -39,6 +39,7 @@ import { PROVIDERS, backendFor, cipherFor, companyName, currentProvider, folderP
 import { pref } from './prefs.js';
 import { DEMO, pause, publish, state } from './store.js';
 import { tools } from './tools.js';
+import { leaveEditing } from './viewer.js';
 import { channel, listenToOtherWindows, requestSession } from './windows.js';
 
 const LOCK_MESSAGES = {
@@ -764,6 +765,7 @@ async function returnToOpenVault() {
 export async function switchVault(provider) {
   if (!PROVIDERS.includes(provider) || provider === state.provider || !state.unlocked || state.switching) return;
   if (tools.busy()) return toast('Finish or cancel the encryption that’s running first.', 'error');
+  if (!(await leaveEditing())) return; // a text file's unsaved changes: only once let go
   if (files.unfinished()) {
     // Unfinished uploads (paused ones too) belong to this vault: stop them before another one opens.
     const ok = await confirmDialog({

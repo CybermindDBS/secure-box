@@ -33,6 +33,7 @@ import { setPref } from '../../session/prefs.js';
 import { state } from '../../session/store.js';
 import { openViewer } from '../../session/viewer.js';
 import { Icon, Spinner } from '../common/Icon.jsx';
+import { Menu, MenuItem } from '../common/Menu.jsx';
 import { Segmented } from '../common/Segmented.jsx';
 import { useNarrow, usePref, useSession, useStore } from '../hooks.js';
 import { SwitchLoader, SyncStatus } from '../passwords/PasswordsView.jsx';
@@ -158,17 +159,56 @@ function Crumbs({ folder, query }) {
 // ---------------------------------------------------------------------------
 // The bar: path, upload, new folder, view options; or what's chosen
 // ---------------------------------------------------------------------------
+/** Upload ▾: files, or a whole folder (U uploads files straight away). */
+function UploadMenu() {
+  return (
+    <Menu
+      label="Upload"
+      button={(props) => (
+        <button {...props} type="button" className="btn btn-primary btn-sm upload-btn" title="Upload files (U) or a whole folder">
+          <Icon name="upload" size={16} />
+          <span>Upload</span>
+          <Icon name="chevronDown" size={14} className="btn-caret" />
+        </button>
+      )}
+    >
+      <MenuItem icon={<Icon name="upload" />} onSelect={() => run(upload)}>
+        Files…
+      </MenuItem>
+      <MenuItem icon={<Icon name="folderUp" />} onSelect={() => run(upload, { directory: true })}>
+        A folder…
+      </MenuItem>
+    </Menu>
+  );
+}
+
+/** View: thumbnails, sorting and grid or list, in a panel under its button (a sheet on phones). */
 function ViewOptions() {
   const thumbnails = usePref('thumbnails');
   const sort = usePref('sort');
   const layout = usePref('layout');
+  const toggle = useRef(null);
+  const panel = useRef(null);
+  useEffect(() => {
+    const el = panel.current;
+    const place = (event) => {
+      if (event.newState !== 'open') return;
+      // Phones get a sheet from the bottom of the screen instead (CSS).
+      const sheet = window.matchMedia('(max-width: 760px)').matches;
+      const rect = toggle.current.getBoundingClientRect();
+      el.style.top = sheet ? '' : `${Math.round(rect.bottom + 8)}px`;
+      el.style.right = sheet ? '' : `${Math.round(Math.max(8, window.innerWidth - rect.right))}px`;
+    };
+    el.addEventListener('beforetoggle', place);
+    return () => el.removeEventListener('beforetoggle', place);
+  }, []);
   return (
     <>
-      <button type="button" className="icon-btn view-toggle" popoverTarget="view-options" aria-label="View options" title="View options">
-        <Icon name="sliders" />
+      <button ref={toggle} type="button" className="btn btn-ghost btn-sm view-toggle" popoverTarget="view-options" aria-label="View options" title="View: thumbnails, sorting, grid or list">
+        <Icon name="sliders" size={16} />
+        <span>View</span>
       </button>
-      {/* Inline on wider screens; on phones a sheet that the View options button opens. */}
-      <div id="view-options" className="view-options" popover="auto">
+      <div ref={panel} id="view-options" className="view-options" popover="auto">
         <p className="view-options-title">View</p>
         <label className="switch" title="Show thumbnails for photos and videos (they are decrypted only while shown)">
           <input type="checkbox" checked={thumbnails} onChange={(e) => setPref('thumbnails', e.target.checked)} />
@@ -273,7 +313,7 @@ function Art({ entry, isFolder, size = 'lg', thumbnails }) {
   );
 }
 
-function EntryCard({ entry, isFolder, layout, selected, focused, pending, thumbnails, events }) {
+function EntryCard({ entry, isFolder, layout, selected, focused, pending, added = false, thumbnails, events }) {
   const [over, setOver] = useState(false);
   const stats = isFolder ? folderStats(entry.id) : null;
   const meta = isFolder ? `${stats.files + stats.folders} ${stats.files + stats.folders === 1 ? 'item' : 'items'}` : `${formatBytes(entry.size)} · ${relativeTime(entry.updated)}`;
@@ -295,7 +335,7 @@ function EntryCard({ entry, isFolder, layout, selected, focused, pending, thumbn
     onDragStart: (e) => events.dragStart(e, entry),
     ...(isFolder ? dropProps(entry.id, setOver) : {}),
   };
-  const state_ = `${selected ? ' is-selected' : ''}${pending ? ' is-pending' : ''}${over ? ' is-drop' : ''}`;
+  const state_ = `${selected ? ' is-selected' : ''}${pending ? ' is-pending' : ''}${over ? ' is-drop' : ''}${added ? ' is-added' : ''}`;
   const check = (
     <span
       className="item-check"
@@ -426,6 +466,7 @@ function ItemMenu({ menu, onClose, fileIds }) {
 function FilesBody({ entries, layout, thumbnails, query, folder }) {
   const selected = useStore(files.store, (v) => v.selected);
   const pending = useStore(files.store, (v) => v.pending);
+  const added = useStore(files.store, (v) => v.added);
   const narrow = useNarrow();
   const bodyRef = useRef(null);
   const [focusId, setFocusId] = useState(null);
@@ -441,6 +482,13 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
   useEffect(() => {
     if (focusId && !order.includes(focusId)) setFocusId(order[0] || null);
   }, [order, focusId]);
+
+  // A folder just made: brought into view, and the keyboard goes on from it (it isn't chosen).
+  useEffect(() => {
+    if (!added) return;
+    setFocusId(added);
+    requestAnimationFrame(() => bodyRef.current?.querySelector(`[data-id="${CSS.escape(added)}"]`)?.scrollIntoView({ block: 'nearest' }));
+  }, [added]);
 
   const focusCard = (id) => {
     setFocusId(id);
@@ -656,7 +704,7 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
             </div>
           ) : null}
           {entries.folders.map((f) => (
-            <EntryCard key={f.id} entry={f} isFolder layout={layout} selected={selected.has(f.id)} focused={f.id === focusable} pending={pending.get(f.id)} thumbnails={thumbnails} events={events} />
+            <EntryCard key={f.id} entry={f} isFolder layout={layout} selected={selected.has(f.id)} focused={f.id === focusable} pending={pending.get(f.id)} added={f.id === added} thumbnails={thumbnails} events={events} />
           ))}
           {entries.files.map((f) => (
             <EntryCard key={f.id} entry={f} isFolder={false} layout={layout} selected={selected.has(f.id)} focused={f.id === focusable} pending={pending.get(f.id)} thumbnails={thumbnails} events={events} />
@@ -761,14 +809,7 @@ export function FilesView() {
           <Crumbs folder={folder} query={query} />
         )}
         <div className="files-tools">
-          <button type="button" className="btn btn-primary btn-sm" title="Upload files (U)" onClick={() => run(upload)}>
-            <Icon name="upload" size={16} />
-            <span>Upload</span>
-          </button>
-          <button type="button" className="btn btn-ghost btn-sm" title="Upload a whole folder" onClick={() => run(upload, { directory: true })}>
-            <Icon name="folderUp" size={16} />
-            <span>Upload folder</span>
-          </button>
+          <UploadMenu />
           <button type="button" className="btn btn-ghost btn-sm" title="New folder (N)" onClick={() => run(newFolder)}>
             <Icon name="folderPlus" size={16} />
             <span>New folder</span>
