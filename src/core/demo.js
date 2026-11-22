@@ -7,7 +7,7 @@ import { createPieceWriter, encryptFile, layout } from './fileformat.js';
 import { canThumbnail, guessType } from './filetypes.js';
 import { createKeyring, serializeKeyring } from './keyring.js';
 import { makeThumbnail } from './thumbs.js';
-import { VaultCipher, applyChange, emptyVault, makeFileEntry, makeFolder, makeItem } from './vault.js';
+import { VaultCipher, applyChange, emptyVault, makeFileEntry, makeFolder, makeItem, parseEnvelope } from './vault.js';
 import { zipStore } from './zip.js';
 
 export const DEMO_PASSWORD = 'secure box demo vault';
@@ -199,11 +199,11 @@ async function sampleFiles() {
 // ---------------------------------------------------------------------------
 // The in-memory "Drive"
 // ---------------------------------------------------------------------------
-export async function createDemoBackend() {
-  const blobs = new Map();
-  let counter = 0;
+/** The demo's stand-in for the clouds, with the sample vault in it; `empty`: with nothing in it yet. */
+export async function createDemoBackend({ empty = false } = {}) {
+  const blobs = new Map(); // the encrypted copies, by name, like a cloud's "Encrypted files" folder
   const store = {
-    async open({ size }) {
+    async open({ name }) {
       const parts = [];
       return async (piece, offset, total) => {
         parts.push(piece);
@@ -214,11 +214,15 @@ export async function createDemoBackend() {
           all.set(p, at);
           at += p.length;
         }
-        const id = `demo-${++counter}`;
-        blobs.set(id, all);
-        return id;
+        blobs.set(name, all);
+        return name;
       };
     },
+  };
+  const blobOf = (name) => {
+    const bytes = blobs.get(name);
+    if (!bytes) throw Object.assign(new Error('This file’s encrypted copy is missing from the demo vault.'), { code: 'not-found' });
+    return bytes;
   };
 
   // A fixed key for the sample data, so demo windows can share an unlocked session like real ones.
@@ -226,7 +230,7 @@ export async function createDemoBackend() {
   const { doc, master } = await createKeyring(DEMO_PASSWORD, { kid: 'de30de30de30de30', key: demoKey });
   const cipher = await VaultCipher.create(master);
   let vault = emptyVault();
-  for (const item of ITEMS) vault = applyChange(vault, { op: 'put', item: makeItem({ ...item, password: item.type === 'login' ? generatePassword({ length: 18 }) : '' }) });
+  if (!empty) for (const item of ITEMS) vault = applyChange(vault, { op: 'put', item: makeItem({ ...item, password: item.type === 'login' ? generatePassword({ length: 18 }) : '' }) });
 
   const folders = new Map();
   const folderFor = (path) => {
@@ -242,24 +246,30 @@ export async function createDemoBackend() {
     });
     return parent;
   };
-  for (const sample of await sampleFiles()) {
+  for (const sample of empty ? [] : await sampleFiles()) {
     const id = crypto.randomUUID();
     const type = guessType(sample.name);
     const file = new File([sample.bytes], sample.name, { type });
     const thumbnail = canThumbnail({ name: sample.name, type }) ? await makeThumbnail(file, type) : null;
     const plan = layout({ size: file.size, thumbBytes: thumbnail?.length || 0 });
-    const writer = createPieceWriter({ total: plan.total, send: await store.open({ size: plan.total }) });
+    const writer = createPieceWriter({ total: plan.total, send: await store.open({ name: id }) });
     const meta = await encryptFile({ file, fileId: id, thumbnail, write: (bytes) => writer.write(bytes) });
     const folder = folderFor(sample.path); // creates folders first, so they aren't lost below
     vault = applyChange(vault, {
       op: 'file-put',
-      file: makeFileEntry({ id, name: sample.name, type, size: file.size, folder, driveId: writer.result, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes }),
+      file: makeFileEntry({ id, name: sample.name, type, size: file.size, folder, blob: id, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes }),
     });
   }
 
-  let keyringText = serializeKeyring(doc);
-  let current = { text: await cipher.seal(vault), rev: '1' };
+  let keyringText = empty ? null : serializeKeyring(doc);
+  let current = empty ? null : { text: await cipher.seal(vault), rev: '1' };
   let revision = 1;
+  const history = new Map(current ? [[current.rev, current.text]] : []); // every save, as Google Drive keeps them
+  const save = (text) => {
+    current = { text, rev: String(++revision) };
+    history.set(current.rev, text);
+    return current.rev;
+  };
 
   return {
     kind: 'demo',
@@ -268,38 +278,69 @@ export async function createDemoBackend() {
     describe: () => ({ source: 'page' }),
     async load() {
       await pause(250);
-      return { keyring: keyringText, vault: { ...current } };
+      return { keyring: keyringText, vault: current ? { ...current } : null };
     },
     async create({ keyringText: text, vaultText }) {
       keyringText = text;
-      current = { text: vaultText, rev: String(++revision) };
-      return current.rev;
+      return save(vaultText);
     },
     async createVault(vaultText) {
-      current = { text: vaultText, rev: String(++revision) };
-      return current.rev;
+      return save(vaultText);
     },
     async saveKeyring(text) {
       await pause(120);
       keyringText = text;
     },
+    putKeyring(text) {
+      return this.saveKeyring(text);
+    },
+    freeSpace: async () => null,
+    /** Its folder's name, as Google Drive's renameFolder (bringover.js): kept, to be seen. */
+    async renameFolder(name) {
+      this.folderName = name;
+    },
+    /** After the vault moved away (migrate.js): a note of where it went takes its place. */
+    async retire(noteText) {
+      keyringText = null;
+      blobs.clear();
+      save(noteText);
+    },
     vaultRevision: async () => current.rev,
     readVault: async () => ({ ...current }),
     async writeVault(text) {
       await pause(150);
-      current = { text, rev: String(++revision) };
-      return current.rev;
+      return save(text);
     },
-    openUpload: ({ size }) => store.open({ size }),
-    async trash(id) {
-      blobs.delete(id);
+    async readRevision(rev) {
+      if (!history.has(rev)) throw new Error('That version of the demo vault isn’t kept.');
+      return history.get(rev);
     },
-    async readRange(id, start, end) {
-      return new Blob([blobs.get(id).subarray(start, end + 1)]).stream();
+    /** For ?demo&faults=race (faults.js): another device saves a change of its own. Resolves with its revision. */
+    async saveFromAnotherDevice() {
+      const theirs = await cipher.open(parseEnvelope(current.text));
+      const item = makeItem({ type: 'note', title: 'Saved on another device', notes: 'Saved at the same moment as a change in this window. Both are kept.' });
+      return save(await cipher.seal(applyChange(theirs, { op: 'put', item })));
     },
-    async readBytes(id, start, end) {
-      const bytes = blobs.get(id);
-      if (!bytes) throw new Error('Missing demo file.');
+    openUpload: ({ name }) => store.open({ name }),
+    async trash(name) {
+      blobs.delete(name);
+    },
+    async listBlobs() {
+      return new Map([...blobs].map(([name, bytes]) => [name, { size: bytes.length }]));
+    },
+    async absent(names) {
+      return names.filter((name) => !blobs.has(name));
+    },
+    async removeAll() {
+      keyringText = null;
+      current = null;
+      blobs.clear();
+    },
+    async readRange(name, start, end) {
+      return new Blob([blobOf(name).subarray(start, end + 1)]).stream();
+    },
+    async readBytes(name, start, end) {
+      const bytes = blobOf(name);
       return bytes.slice(start, Math.min(end + 1, bytes.length)).buffer;
     },
   };

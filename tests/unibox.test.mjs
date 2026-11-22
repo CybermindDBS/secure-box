@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { crc32 as zlibCrc32 } from 'node:zlib';
+import { deflateRawSync, crc32 as zlibCrc32 } from 'node:zlib';
 import '../src/core/stream-core.js';
 import '../src/core/zip-core.js';
 import { CHARSETS, generatePassword, padme, passwordEntropyBits } from '../src/core/crypto.js';
@@ -29,10 +29,11 @@ import { OneDrive } from '../src/core/microsoft.js';
 import { createOneDriveBackend } from '../src/core/backend.js';
 import { decodeText, extractDocx, extractOdf, extractSheet, extractSlide, looksLikeText, rtfToText } from '../src/core/readers.js';
 import {
-  LOCAL_INDEX,
   VaultCipher,
   applyChange,
   collectTree,
+  compareVaults,
+  copiesInUse,
   emptyVault,
   folderChain,
   itemsFromCsv,
@@ -40,6 +41,8 @@ import {
   makeFileEntry,
   makeFolder,
   makeItem,
+  mergeVaults,
+  movedNoteText,
   parseCsv,
   parseEnvelope,
   safeHref,
@@ -49,6 +52,7 @@ import { find, parseXml, textOf } from '../src/core/xml.js';
 import { readZipDirectory, readZipEntry, readZipText, zipStore } from '../src/core/zip.js';
 import { boxAccess, openContent, readBox, unlockBox, writeBox, zipEntries, zipEntryData, zipFolder } from '../src/core/localbox.js';
 import { createLocalBackend, readBackup, vaultIn } from '../src/core/localstore.js';
+import { checkPlace, copyFiles, encryptedSize, lookAt } from '../src/core/transfer.js';
 
 const S = globalThis.UniboxStream;
 const random = (n) => crypto.getRandomValues(new Uint8Array(n));
@@ -125,7 +129,7 @@ test('tampered or foreign vaults are rejected', async () => {
 test('folders and files form a repairable tree', async () => {
   const docs = makeFolder({ name: 'Docs' });
   const taxes = makeFolder({ name: 'Taxes', parent: docs.id });
-  const file = makeFileEntry({ name: 'return.pdf', type: 'application/pdf', size: 10, folder: taxes.id, driveId: 'd1', key: 'A'.repeat(43), chunk: CHUNK_SIZE });
+  const file = makeFileEntry({ name: 'return.pdf', type: 'application/pdf', size: 10, folder: taxes.id, blob: crypto.randomUUID(), key: 'A'.repeat(43), chunk: CHUNK_SIZE });
   let vault = applyChange(emptyVault(), { op: 'batch', changes: [{ op: 'folder-put', folder: docs }, { op: 'folder-put', folder: taxes }, { op: 'file-put', file }] });
   assert.deepEqual(folderChain(vault, taxes.id).map((f) => f.name), ['Docs', 'Taxes']);
   const tree = collectTree(vault, docs.id);
@@ -484,6 +488,53 @@ test('ZIP downloads: paths that could escape the target folder are refused', () 
   assert.doesNotThrow(() => Z.checkPath('Trips/', true));
 });
 
+test('a ZIP download fetches small files ahead, a few at a time and within its memory budget, in order', async () => {
+  const MB = 1024 * 1024;
+  // Folders and empty files (0) have nothing to fetch; 20 MB is too big to fetch ahead.
+  const sizes = [0, MB, MB, 0, 20 * MB, MB, MB, MB, MB, 3 * MB, 3 * MB, 3 * MB, MB];
+  let running = 0;
+  let most = 0;
+  const started = [];
+  const finish = new Map();
+  const ahead = Z.fetchAhead(
+    sizes,
+    (i) => {
+      started.push(i);
+      running++;
+      most = Math.max(most, running);
+      return new Promise((resolve, reject) => finish.set(i, (ok = true) => (running--, ok ? resolve(`file ${i}`) : reject(new Error(`file ${i} failed`)))));
+    },
+    { count: 3, budget: 5 * MB, small: 8 * MB },
+  );
+  const got = [];
+  for (let i = 0; i < sizes.length; i++) {
+    const p = ahead.take(i);
+    if (!p) {
+      got.push(sizes[i] ? `streamed ${i}` : '-');
+      continue;
+    }
+    // The file being written finishes; the ones fetched ahead meanwhile finish in any order.
+    finish.get(i)();
+    got.push(await p);
+  }
+  assert.deepEqual(got, ['-', 'file 1', 'file 2', '-', 'streamed 4', 'file 5', 'file 6', 'file 7', 'file 8', 'file 9', 'file 10', 'file 11', 'file 12']);
+  assert.deepEqual(started, [1, 2, 5, 6, 7, 8, 9, 10, 11, 12], 'each small file once, in order; the big one never');
+  assert.ok(most <= 4 && most >= 3, `the one being written and up to three ahead (${most})`);
+
+  // At most the budget held: three 3 MB files ahead don't all fit in 5 MB.
+  const held = [];
+  const tight = Z.fetchAhead([3 * MB, 3 * MB, 3 * MB], (i) => (held.push(i), Promise.resolve(i)), { count: 3, budget: 5 * MB, small: 8 * MB });
+  assert.equal(await tight.take(0), 0);
+  assert.deepEqual(held, [0, 1], 'the third waits until the first is taken');
+  assert.equal(await tight.take(1), 1);
+  assert.deepEqual(held, [0, 1, 2]);
+
+  // A file that fails fetched ahead fails when its turn comes, not before.
+  const failing = Z.fetchAhead([MB, MB], (i) => (i === 1 ? Promise.reject(new Error('file 1 failed')) : Promise.resolve('file 0')), { count: 2, budget: 5 * MB, small: 8 * MB });
+  assert.equal(await failing.take(0), 'file 0');
+  await assert.rejects(failing.take(1), /file 1 failed/);
+});
+
 // --- Local boxes (.sbox, Tools menu) ------------------------------------------------------
 const masterA = { kid: 'aaaaaaaaaaaaaaaa', key: crypto.getRandomValues(new Uint8Array(32)) };
 const masterB = { kid: 'bbbbbbbbbbbbbbbb', key: crypto.getRandomValues(new Uint8Array(32)) };
@@ -545,6 +596,22 @@ test('local boxes: a sharing password opens them too, and only that password', a
   const passwordOnly = await readBox(await makeBox(file, meta, { password: 'correct horse battery staple' }));
   assert.deepEqual(boxAccess(passwordOnly, masterA), { mine: false, otherAccount: false, password: true });
   await assert.rejects(writeBox({ source: file, meta, write: () => {} }), (e) => e.code === 'no-key');
+});
+
+test('local boxes made with one password each get a salt of their own, so nothing links them', async () => {
+  const password = 'correct horse battery staple';
+  const boxes = [];
+  for (const name of ['one.txt', 'two.txt', 'three.txt']) boxes.push(await readBox(await makeBox(new File([`text of ${name}`], name), { kind: 'file', name }, { password })));
+  const slots = boxes.map((box) => box.header.slots.find((s) => s.type === 'password'));
+  assert.equal(new Set(slots.map((s) => s.salt)).size, 3, 'a salt of its own for each');
+  assert.equal(new Set(slots.map((s) => s.iv)).size, 3);
+  const opened = [];
+  for (const box of boxes) opened.push(await unlockBox(box, { password }));
+  assert.deepEqual(opened.map((o) => o.meta.name), ['one.txt', 'two.txt', 'three.txt']);
+  assert.equal(new Set(opened.map((o) => Buffer.from(o.fileKey).toString('hex'))).size, 3, 'and a file key of its own');
+  // A locked copy of one box's key doesn't open another box made with the same password.
+  const swapped = { ...boxes[1], header: { ...boxes[1].header, slots: [slots[0]] } };
+  await assert.rejects(unlockBox(swapped, { password }), (e) => e.code === 'wrong-password');
 });
 
 test('local boxes: tampering, cut-off files, extra data and swapped key copies are caught', async () => {
@@ -650,23 +717,36 @@ test('key ring revisions: every change counts up, and an old copy can’t pose a
   await assert.rejects(unlockWithPassword(stored, 'correct horse battery staple'));
 });
 
-test('a backup of the vault on this device carries its key ring, and only version 2 is read', async () => {
-  const manifest = { format: 'secure-box-local-backup', version: 2, kid: 'abcdef0123456789' };
-  const backup = (m, { keyring = true } = {}) =>
+test('a backup carries the vault exactly as stored, with its key ring, and only version 1 is read', async () => {
+  const manifest = { format: 'secure-box-backup', version: 1, kid: 'abcdef0123456789' };
+  const sealed = { format: 'secure-box-vault', version: 3, kid: manifest.kid, salt: 's', iv: 'i', ct: 'c' };
+  const backup = (m, { keyring = true, vault = sealed } = {}) =>
     new Blob([
       zipStore([
         { name: 'backup.json', data: JSON.stringify(m) },
         ...(keyring ? [{ name: 'Secure Box Key Ring.json', data: '{"format":"secure-box-keyring"}' }] : []),
-        { name: 'Secure Box Vault.json', data: '{"format":"secure-box-local-index"}' },
+        { name: 'Secure Box Vault.json', data: JSON.stringify(vault) },
+        { name: 'Encrypted files/0f8fad5b-d9cb-469f-a165-70867728950e', data: 'copy' },
+        { name: 'Encrypted files/notes.txt', data: 'not one of the vault’s copies' },
       ]),
     ]);
   const read = await readBackup(backup(manifest));
   assert.equal(read.manifest.kid, manifest.kid);
   assert.match(read.keyring, /secure-box-keyring/);
-  assert.match(read.index, /secure-box-local-index/);
+  assert.match(read.vault, /secure-box-vault/);
+  assert.deepEqual(read.names(), ['0f8fad5b-d9cb-469f-a165-70867728950e']);
   await assert.rejects(readBackup(backup(manifest, { keyring: false })), { code: 'not-backup' });
-  await assert.rejects(readBackup(backup({ ...manifest, version: 1 })), { code: 'not-backup' });
-  await assert.rejects(readBackup(backup({ ...manifest, version: 3 })), { code: 'newer' });
+  await assert.rejects(readBackup(backup({ ...manifest, format: 'something-else' })), { code: 'not-backup', message: /isn’t a Secure Box backup/ });
+  await assert.rejects(readBackup(new Blob(['not a zip at all'])), { code: 'not-backup' });
+  // Backups an earlier version made say so, rather than seem damaged: the older backup format,
+  // an older version of this one, or a vault inside in an older format.
+  const earlier = { code: 'other-version', message: /another version of Secure Box/ };
+  await assert.rejects(readBackup(backup({ ...manifest, format: 'secure-box-local-backup', version: 2 })), earlier);
+  await assert.rejects(readBackup(backup({ ...manifest, version: 0 })), earlier);
+  await assert.rejects(readBackup(backup(manifest, { vault: { ...sealed, version: 2 } })), earlier);
+  await assert.rejects(readBackup(backup(manifest, { vault: { ...sealed, format: 'secure-box-local-index' } })), earlier);
+  await assert.rejects(readBackup(backup(manifest, { vault: { ...sealed, ct: '' } })), { code: 'not-backup' });
+  await assert.rejects(readBackup(backup({ ...manifest, version: 2 })), { code: 'newer' });
 });
 
 // --- The vault on this device: moving and deleting -----------------------------------------
@@ -686,7 +766,7 @@ class MemFile {
   }
   async getFile() {
     ensureThere(this);
-    return new File([this.data], this.name);
+    return new File([this.data], this.name, this.opts.clock ? { lastModified: this.opts.clock } : undefined); // `clock`: a disk that shows every file at one time
   }
   async createWritable() {
     ensureThere(this);
@@ -769,62 +849,168 @@ async function writeText(dir, name, text) {
 /** A vault in a chosen folder (in its "Secure Box" folder), with a few encrypted-file stand-ins. */
 async function folderVault(picked, blobs = 3) {
   const backend = inFolder(picked);
-  await backend.create({ keyringText: JSON.stringify({ format: 'secure-box-keyring', kid: deviceKid }), vaultText: '{"format":"secure-box-local-index"}', kid: deviceKid });
+  await backend.create({ keyringText: JSON.stringify({ format: 'secure-box-keyring', kid: deviceKid }), vaultText: JSON.stringify({ format: 'secure-box-vault', version: 3, kid: deviceKid, salt: 's', iv: 'i', ct: 'c' }), kid: deviceKid });
   for (let i = 0; i < blobs; i++) {
     const bytes = random(1000 + 700 * i);
-    await (await backend.openUpload({ fid: crypto.randomUUID() }))(bytes, 0, bytes.length);
+    await (await backend.openUpload({ name: crypto.randomUUID() }))(bytes, 0, bytes.length);
   }
   return backend;
 }
 
-test('moving the vault on this device copies it byte for byte, then deletes only its own files there', async () => {
-  const documents = new MemDir('Documents');
-  const source = await folderVault(documents);
-  const own = await documents.getDirectoryHandle('Secure Box');
-  await writeText(own, 'notes.txt', 'put here by hand');
-  const { 'notes.txt': stray, ...vaultOnly } = snapshot(own);
-  assert.equal(Object.keys(vaultOnly).filter((path) => path.startsWith('Encrypted files/')).length, 3);
+/** A file encrypted into `backend` as an upload would be; resolves with its vault entry. */
+async function addFile(backend, name, bytes) {
+  const id = crypto.randomUUID();
+  const file = new File([bytes], name, { type: 'application/octet-stream' });
+  const plan = layout({ size: file.size, thumbBytes: 0 });
+  const send = await backend.openUpload({ name: id, size: plan.total });
+  const writer = createPieceWriter({ total: plan.total, send, pieceSize: send.pieceSize });
+  const meta = await encryptFile({ file, fileId: id, write: (b) => writer.write(b) });
+  return makeFileEntry({ id, name, type: file.type, size: file.size, folder: null, blob: id, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes });
+}
 
-  const synced = new MemDir('Synced');
-  const target = inFolder(synced);
+test('a transfer copies encrypted copies by name, picks up where it stopped, and reads it all back', async () => {
+  const cipher = await VaultCipher.create(masterA);
+  const keyringText = serializeKeyring((await createKeyring('transfer test password', { kid: masterA.kid, key: masterA.key })).doc);
+  const from = inFolder(new MemDir('From'));
+  await from.create({ keyringText, vaultText: await cipher.seal(emptyVault()), kid: masterA.kid });
+  const entries = [];
+  for (const [name, size] of [['notes.txt', 3000], ['photo.jpg', 2_500_000], ['gone.txt', 10]]) entries.push(await addFile(from, name, (size > 65536 ? bigRandom : random)(size)));
+  const vault = applyChange(emptyVault(), { op: 'batch', changes: entries.map((file) => ({ op: 'file-put', file })) });
+  const to = createLocalBackend({ where: 'folder', handle: new MemDir('To') });
+  assert.equal(lookAt(await to.load(), masterA.kid).kind, 'empty');
+
+  // A transfer that stopped after its first copy, with the next one cut short...
+  await copyFiles({ from, to, files: [entries[0]] });
+  const cut = random(100);
+  await (await to.openUpload({ name: entries[1].blob }))(cut, 0, cut.length);
+  // ...picks up where it was: a whole copy stays, a short one goes again, one missing at the source is left out.
+  await from.trash(entries[2].blob);
   const progress = [];
-  let opened = false;
-  const leftover = await source.moveTo(target, { onProgress: (p) => progress.push(p), opened: async () => (opened = true) });
-  assert.equal(leftover, null);
-  assert.ok(opened, 'the app opened the copy before the old one was deleted');
-  assert.equal(progress.at(-1), 1);
-  assert.deepEqual(snapshot(await synced.getDirectoryHandle('Secure Box')), vaultOnly, 'key ring, vault and every file, byte for byte');
-  assert.deepEqual(snapshot(documents), { 'Secure Box/notes.txt': stray }, 'only the vault left the old folder');
-  assert.ok((await target.load()).vault, 'the copy opens');
+  const made = [];
+  const result = await copyFiles({ from, to, files: entries, onProgress: (p) => progress.push(p), onCopied: (name) => made.push(name) });
+  assert.deepEqual([result.copied, result.kept, result.missing.map((f) => f.name)], [1, 1, ['gone.txt']]);
+  assert.deepEqual(made, [entries[1].blob], 'only the copy it made is reported, for removing if the transfer is given up');
+  assert.equal(progress.at(-1).done, progress.at(-1).total);
+  const photo = entries[1];
+  const back = await new Blob(await decryptFile(await to.readRange(photo.blob, 0, encryptedSize(photo) - 1), photo)).arrayBuffer();
+  assert.equal(back.byteLength, photo.size, 'the copy opens there, whole');
+
+  // Then the vault and key ring; reading back finds a copy that isn't there.
+  await to.create({ keyringText, vaultText: await cipher.seal(vault), kid: masterA.kid });
+  await assert.rejects(checkPlace({ backend: to, cipher, kid: masterA.kid, files: entries }), /gone\.txt/);
+  const checked = await checkPlace({ backend: to, cipher, kid: masterA.kid, files: entries, skip: new Set([entries[2].id]) });
+  assert.equal(checked.vault.files.length, 3);
+  assert.equal(lookAt(await to.load(), masterA.kid).kind, 'same');
 });
 
-test('a move is refused where a vault already is or inside the vault, and a failed one leaves nothing behind', async () => {
-  const documents = new MemDir('Documents');
-  const source = await folderVault(documents);
-  const before = snapshot(documents);
-  const quietly = { opened: async () => {} };
+test('a transfer copies a few files at once, and one copy failing stops the rest before it ends', async () => {
+  const cipher = await VaultCipher.create(masterA);
+  const from = inFolder(new MemDir('From'));
+  await from.create({ keyringText: JSON.stringify({ format: 'secure-box-keyring', kid: masterA.kid }), vaultText: await cipher.seal(emptyVault()), kid: masterA.kid });
+  const entries = [];
+  for (let i = 0; i < 7; i++) entries.push(await addFile(from, `file ${i}.txt`, random(5000 + i)));
+  // A destination whose uploads take a while, like a cloud's: how many go at once?
+  const slow = (to, { failOn = null } = {}) => {
+    let open = 0;
+    const seen = { most: 0, after: 0 };
+    let failed = false;
+    return Object.assign(Object.create(to), {
+      seen,
+      async openUpload(options) {
+        const send = await to.openUpload(options);
+        open++;
+        seen.most = Math.max(seen.most, open);
+        return Object.assign(
+          async (piece, offset, total) => {
+            await new Promise((r) => setTimeout(r, 15));
+            if (failed) seen.after++;
+            if (options.name === failOn) {
+              failed = true;
+              throw new Error('The cloud refused it.');
+            }
+            const id = await send(piece, offset, total);
+            if (id) open--;
+            return id;
+          },
+          { pieceSize: send.pieceSize, abort: async () => (open--, send.abort?.()) },
+        );
+      },
+    });
+  };
+  // A new, empty folder to copy into, looked at first (as Move or copy does).
+  const place = async (name, options) => {
+    const to = createLocalBackend({ where: 'folder', handle: new MemDir(name) });
+    await to.load();
+    return slow(to, options);
+  };
+  const fast = await place('To');
+  const result = await copyFiles({ from, to: fast, files: entries });
+  assert.deepEqual([result.copied, result.missing.length], [7, 0]);
+  assert.equal(fast.seen.most, 3, 'three copies at once');
+  const one = await place('To one');
+  await copyFiles({ from, to: one, files: entries, parallel: 1 });
+  assert.equal(one.seen.most, 1);
 
-  const taken = new MemDir('Taken');
-  await folderVault(taken, 1);
-  const takenBefore = snapshot(taken);
-  await assert.rejects(source.moveTo(inFolder(taken), quietly), { code: 'exists' });
-  assert.deepEqual(snapshot(taken), takenBefore, 'the vault that was there is untouched');
+  // One failing: the others stop, and nothing is still going once it throws.
+  const failing = await place('To failing', { failOn: entries[1].blob });
+  const made = [];
+  await assert.rejects(copyFiles({ from, to: failing, files: entries, onCopied: (name) => made.push(name) }), /refused/);
+  const settled = failing.seen.after;
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(failing.seen.after, settled, 'nothing still going after it ended');
+  assert.ok(made.length < entries.length - 1, 'the rest weren’t copied');
 
-  await assert.rejects(source.moveTo(inFolder(documents), quietly), { code: 'same' });
-  const own = await documents.getDirectoryHandle('Secure Box');
-  const inner = await own.getDirectoryHandle('inner', { create: true });
-  await assert.rejects(source.moveTo(inFolder(inner), quietly), { code: 'inside' });
-  assert.equal(inner.children.size, 0, 'nothing was made inside the vault');
-  await own.removeEntry('inner');
+  // Stopped from outside: an AbortError, once every copy under way has stopped.
+  const stop = new AbortController();
+  const stopping = await place('To stopped');
+  setTimeout(() => stop.abort(), 20);
+  await assert.rejects(copyFiles({ from, to: stopping, files: entries, signal: stop.signal }), { name: 'AbortError' });
+});
 
-  const full = new MemDir('Full', { failWrite: (name) => name === 'Secure Box Vault.json' });
-  await assert.rejects(source.moveTo(inFolder(full), quietly), /Disk full/);
-  assert.equal(full.children.size, 0, 'a copy that stopped halfway is cleared away');
-  const unopened = new MemDir('Unopened');
-  await assert.rejects(source.moveTo(inFolder(unopened), { opened: async () => { throw new Error('could not open'); } }), /could not open/);
-  assert.equal(unopened.children.size, 0, 'a copy the app couldn’t open is cleared away');
+test('a place is seen for what it holds: nothing, a note, the same vault, another, or what can’t be read', async () => {
+  const mine = await createKeyring('look test one', { kid: masterA.kid, key: masterA.key });
+  const theirs = await createKeyring('look test two');
+  const sealedMine = await (await VaultCipher.create(masterA)).seal(emptyVault());
+  const sealedTheirs = await (await VaultCipher.create(theirs.master)).seal(emptyVault());
+  const look = (keyring, vault, extra = {}) => lookAt({ keyring: keyring && serializeKeyring(keyring.doc), vault: vault && { text: vault, rev: 'r1' }, ...extra }, masterA.kid);
+  assert.equal(look(null, null).kind, 'empty');
+  assert.equal(look(null, null, { inBin: true }).inBin, true);
+  assert.equal(look(null, movedNoteText('microsoft')).note.to, 'microsoft', 'a note that a vault moved away: nothing there');
+  assert.equal(look(mine, sealedMine).kind, 'same');
+  assert.equal(look(mine, null).kind, 'same', 'its vault file missing: the key ring is enough');
+  assert.equal(look(null, sealedMine).kind, 'same', 'its key ring missing: this master key opens it anyway');
+  assert.equal(look(theirs, sealedTheirs).kind, 'other');
+  assert.equal(look(null, sealedTheirs).kind, 'unreadable', 'another key, and no key ring to open it');
+  assert.equal(look(mine, sealedTheirs).kind, 'unreadable', 'a key ring and vault of different keys');
+  assert.equal(look(mine, JSON.stringify({ ...JSON.parse(sealedMine), version: 2 })).code, 'other-version');
+});
 
-  assert.deepEqual(snapshot(documents), before, 'the vault stayed where it was, untouched');
+test('two vaults are combined with nothing lost: the latest version of the same thing, folders of one name as one', () => {
+  const file = (name, folder) => makeFileEntry({ name, type: 'text/plain', size: 1, folder, blob: crypto.randomUUID(), key: 'A'.repeat(43), chunk: CHUNK_SIZE });
+  // "there": a copy of this vault made earlier, then changed on its own; "here": this vault.
+  const bank = makeItem({ title: 'Bank', password: 'old' });
+  const there = applyChange(emptyVault(), { op: 'put', item: bank });
+  const here = applyChange(there, { op: 'put', item: makeItem({ title: 'Mail' }) });
+  assert.ok(compareVaults(there, here).earlierCopy, 'nothing there that isn’t here: an earlier copy');
+  const changed = applyChange(there, { op: 'put', item: { ...bank, password: 'new', updated: bank.updated + 1000 } });
+  const compare = compareVaults(changed, here);
+  assert.deepEqual([compare.earlierCopy, compare.newerThere.items, compare.onlyThere.items], [false, 1, 0]);
+  const merged = mergeVaults(changed, here);
+  assert.deepEqual(merged.items.map((it) => [it.title, it.password]).sort(), [['Bank', 'new'], ['Mail', '']], 'the version changed last wins');
+
+  // A folder of the same name in the same place becomes one; a clashing file name is kept apart.
+  const scansThere = makeFolder({ name: 'Scans' });
+  const scansHere = makeFolder({ name: 'scans' });
+  const inner = makeFolder({ name: 'Old', parent: scansHere.id });
+  const a = applyChange(emptyVault(), { op: 'batch', changes: [{ op: 'folder-put', folder: scansThere }, { op: 'file-put', file: file('a.pdf', scansThere.id) }] });
+  const b = applyChange(emptyVault(), { op: 'batch', changes: [{ op: 'folder-put', folder: scansHere }, { op: 'folder-put', folder: inner }, { op: 'file-put', file: file('a.pdf', scansHere.id) }, { op: 'file-put', file: file('b.pdf', inner.id) }] });
+  const both = mergeVaults(a, b);
+  assert.deepEqual(both.folders.map((f) => [f.name, f.parent === scansThere.id]), [['Scans', false], ['Old', true]]);
+  assert.deepEqual(both.files.map((f) => [f.name, f.folder === scansThere.id]), [['a.pdf', true], ['a (2).pdf', true], ['b.pdf', false]]);
+  assert.equal(both.files.find((f) => f.name === 'b.pdf').folder, inner.id);
+  // Its list of copies to delete is the one there, never naming a copy in use.
+  const listed = { ...a, trash: [a.files[0].blob, crypto.randomUUID()] };
+  assert.deepEqual(mergeVaults(listed, b).trash, [listed.trash[1]]);
 });
 
 test('a folder vault moved or deleted outside Secure Box says so, and is never quietly made again', async () => {
@@ -861,16 +1047,287 @@ test('deleting the vault on this device removes only its own files, and its fold
   assert.deepEqual(Object.keys(snapshot(photos)), ['Secure Box/notes.txt'], 'what someone else put there stays');
 });
 
-test('the local vault index has its own key: it can never pass for the vault, or the other way round', async () => {
-  const vaultCipher = await VaultCipher.create(masterA);
-  const indexCipher = await VaultCipher.create(masterA, LOCAL_INDEX);
-  const sealedIndex = await indexCipher.seal(emptyVault());
-  const sealedVault = await vaultCipher.seal(emptyVault());
-  assert.deepEqual((await indexCipher.open(parseEnvelope(sealedIndex, LOCAL_INDEX.format))).files, []);
-  assert.throws(() => parseEnvelope(sealedIndex), { code: 'bad-vault' });
-  await assert.rejects(vaultCipher.open({ ...JSON.parse(sealedIndex), format: 'secure-box-vault' }), { code: 'decrypt-failed' });
-  await assert.rejects(indexCipher.open(JSON.parse(sealedVault)), { code: 'bad-vault' });
-  await assert.rejects(indexCipher.open({ ...JSON.parse(sealedVault), format: LOCAL_INDEX.format }), { code: 'decrypt-failed' });
+test('a vault is the same in every place: one format and key, and files named, never a place’s own ids', async () => {
+  const name = crypto.randomUUID();
+  const file = makeFileEntry({ name: 'a.txt', type: 'text/plain', size: 3, folder: null, blob: name, driveId: 'GOOGLE-ID', key: 'A'.repeat(43), chunk: CHUNK_SIZE });
+  assert.equal(file.blob, name);
+  assert.ok(!('driveId' in file), 'a place’s own file id is never kept');
+  const vault = applyChange(emptyVault(), { op: 'batch', changes: [{ op: 'file-put', file }, { op: 'trash-add', names: [crypto.randomUUID()] }] });
+  // What any place seals, any other opens: there's one format and one key for the vault.
+  const sealed = await (await VaultCipher.create(masterA)).seal(vault);
+  assert.equal(JSON.parse(sealed).format, 'secure-box-vault');
+  assert.equal(JSON.parse(sealed).version, 3);
+  assert.deepEqual(await (await VaultCipher.create(masterA)).open(parseEnvelope(sealed)), vault);
+  // Entries without a stored name (or with one that isn't a random id) aren't files of the vault.
+  const reopened = await (await VaultCipher.create(masterA)).open(parseEnvelope(await (await VaultCipher.create(masterA)).seal({ ...vault, files: [{ ...file, blob: undefined }, { ...file, id: 'x', blob: '../../key ring' }] })));
+  assert.deepEqual(reopened.files, []);
+  // Vaults from earlier builds are refused plainly, not half read.
+  assert.throws(() => parseEnvelope(JSON.stringify({ ...JSON.parse(sealed), format: 'secure-box-local-index' })), { code: 'other-version' });
+  assert.throws(() => parseEnvelope(JSON.stringify({ ...JSON.parse(sealed), version: 2 })), { code: 'other-version', message: /another version of Secure Box/ });
+  assert.throws(() => parseEnvelope(JSON.stringify({ ...JSON.parse(sealed), version: 4 })), { code: 'bad-vault', message: /newer version/ });
+  assert.throws(() => parseEnvelope(JSON.stringify({ ...JSON.parse(sealed), format: 'something-else' })), { code: 'bad-vault' });
+});
+
+/** A ZIP whose entries are deflated, as Google Drive and OneDrive pack the downloads of a folder. */
+function zipDeflated(files) {
+  const parts = [];
+  const central = [];
+  let offset = 0;
+  for (const { name, data } of files) {
+    const bytes = Buffer.from(typeof data === 'string' ? Buffer.from(data) : data);
+    const packed = deflateRawSync(bytes);
+    const path = Buffer.from(name);
+    const crc = zlibCrc32(bytes);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(packed.length, 18);
+    local.writeUInt32LE(bytes.length, 22);
+    local.writeUInt16LE(path.length, 26);
+    parts.push(local, path, packed);
+    const record = Buffer.alloc(46);
+    record.writeUInt32LE(0x02014b50, 0);
+    record.writeUInt16LE(20, 4);
+    record.writeUInt16LE(20, 6);
+    record.writeUInt16LE(0x0800, 8);
+    record.writeUInt16LE(8, 10);
+    record.writeUInt32LE(crc, 16);
+    record.writeUInt32LE(packed.length, 20);
+    record.writeUInt32LE(bytes.length, 24);
+    record.writeUInt16LE(path.length, 28);
+    record.writeUInt32LE(offset, 42);
+    central.push(record, path);
+    offset += 30 + path.length + packed.length;
+  }
+  const directory = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return new Blob([...parts, directory, end]);
+}
+
+test('a vault’s folder downloaded from a cloud’s website restores like a backup, in one ZIP or several', async () => {
+  const keyringText = serializeKeyring((await createKeyring('download test password', { kid: masterA.kid, key: masterA.key })).doc);
+  const vaultText = await (await VaultCipher.create(masterA)).seal(emptyVault());
+  const copies = [0, 1, 2].map((i) => ({ name: crypto.randomUUID(), data: random(3000 + i * 1000) }));
+  const at = (prefix) => [
+    { name: `${prefix}Secure Box Key Ring.json`, data: keyringText },
+    { name: `${prefix}Secure Box Vault.json`, data: vaultText },
+    ...copies.map((c) => ({ name: `${prefix}Encrypted files/${c.name}`, data: c.data })),
+  ];
+  const file = (blob, name) => new File([blob], name);
+
+  // Google Drive: the folder itself, deflated.
+  const download = await readBackup(file(zipDeflated(at('Secure Box/')), 'Secure Box-20261122T101530Z-001.zip'));
+  assert.equal(download.from, 'download');
+  assert.equal(download.manifest.kid, masterA.kid);
+  assert.equal(download.keyring, keyringText);
+  assert.equal(download.vault, vaultText);
+  assert.deepEqual(download.names().sort(), copies.map((c) => c.name).sort());
+
+  // ...restored into a vault on this device, byte for byte (unpacked on the way).
+  const target = inFolder(new MemDir('Restored'));
+  await target.create({ keyringText: download.keyring, vaultText: download.vault, kid: masterA.kid });
+  for (const name of download.names()) assert.equal(await target.restoreBlob(download, name), true);
+  for (const c of copies) assert.ok(Buffer.from(await target.readBytes(c.name, 0, c.data.length - 1)).equals(Buffer.from(c.data)), 'the same bytes');
+
+  // Split over several ZIP files, as Google Drive does with big folders: all of them together.
+  const all = at('Secure Box/');
+  const first = file(zipDeflated(all.slice(0, 3)), 'part-001.zip');
+  const second = file(zipStore(all.slice(3)), 'part-002.zip');
+  assert.deepEqual((await readBackup([first, second])).names().sort(), copies.map((c) => c.name).sort());
+  // Only a part without the key ring: says what to do.
+  await assert.rejects(readBackup([second]), { code: 'no-keyring', message: /choose all of them/ });
+  // The key ring without the vault.
+  await assert.rejects(readBackup(file(zipDeflated(all.filter((e) => !e.name.endsWith('Vault.json'))), 'x.zip')), { code: 'no-vault' });
+
+  // OneDrive, or a folder's contents chosen one by one: everything at the top of the ZIP.
+  assert.deepEqual((await readBackup(file(zipStore(at('')), 'OneDrive.zip'))).names().length, 3);
+
+  // A vault an earlier version made, a key ring of another vault, and anything else: each says so.
+  const older = JSON.stringify({ ...JSON.parse(vaultText), version: 2 });
+  await assert.rejects(readBackup(file(zipDeflated(at('Secure Box/').map((e) => (e.name.endsWith('Vault.json') ? { ...e, data: older } : e))), 'old.zip')), {
+    code: 'other-version',
+    message: /That vault was made by another version/,
+  });
+  const otherRing = serializeKeyring((await createKeyring('another test password')).doc);
+  await assert.rejects(readBackup(file(zipDeflated(at('').map((e) => (e.name.endsWith('Ring.json') ? { ...e, data: otherRing } : e))), 'mixed.zip')), { code: 'mismatch' });
+  await assert.rejects(readBackup(file(zipDeflated([{ name: 'holiday.jpg', data: 'not a vault' }]), 'photos.zip')), { code: 'not-backup' });
+  await assert.rejects(readBackup([file(new Blob(['not a zip at all']), 'notes.txt'), first]), { code: 'not-backup', message: /“notes\.txt”/ });
+
+  // Copies listed where they are (the vault not open to say what's in them) copy by their size.
+  const onward = createLocalBackend({ where: 'folder', handle: new MemDir('Onward') });
+  await onward.load();
+  const listed = await target.listBlobs();
+  const result = await copyFiles({ from: target, to: onward, files: [...listed].map(([blob, { size }]) => ({ blob, name: blob, bytes: size })) });
+  assert.deepEqual([result.copied, result.kept, result.missing.length], [3, 0, 0]);
+  assert.deepEqual(new Map([...(await onward.listBlobs())].sort()), new Map([...listed].sort()));
+});
+
+test('a backup holds the vault exactly as stored, and restores it elsewhere byte for byte', async () => {
+  const documents = new MemDir('Documents');
+  const source = await folderVault(documents, 2);
+  const names = [...(await source.listBlobs()).keys()];
+  const { blob, missing } = await source.backup(names.map((name) => ({ blob: name })));
+  assert.deepEqual(missing, []);
+  // Packed elsewhere (in a worker, in the app), or here when that can't be done: the same ZIP.
+  let packedThere = 0;
+  const there = await source.backup(names.map((name) => ({ blob: name })), { pack: async (items, options) => (packedThere++, zipFolder(items, options)) });
+  const fallback = await source.backup(names.map((name) => ({ blob: name })), { pack: async () => Promise.reject(new Error('no workers here')) });
+  assert.equal(packedThere, 1);
+  assert.deepEqual((await readBackup(new File([there.blob], 'a.zip'))).names().sort(), [...names].sort());
+  assert.deepEqual((await readBackup(new File([fallback.blob], 'b.zip'))).names().sort(), [...names].sort());
+  const backup = await readBackup(new File([blob], 'backup.zip'));
+  assert.equal(backup.manifest.format, 'secure-box-backup');
+  assert.deepEqual(backup.names().sort(), [...names].sort());
+
+  const elsewhere = new MemDir('Elsewhere');
+  const target = inFolder(elsewhere);
+  await target.create({ keyringText: backup.keyring, vaultText: backup.vault, kid: deviceKid });
+  for (const name of backup.names()) assert.equal(await target.restoreBlob(backup, name), true);
+  assert.equal(await target.restoreBlob(backup, crypto.randomUUID()), false, 'a copy the backup lacks');
+  const own = (dir) => snapshot(dir.children.get('Secure Box'));
+  assert.deepEqual(own(elsewhere), own(documents), 'key ring, vault and every copy, the same bytes under the same names');
+});
+
+test('encrypted copies deleted outside Secure Box are found missing on this device, left out of backups, and put back from one', async () => {
+  const documents = new MemDir('Documents');
+  const vault = await folderVault(documents, 3);
+  const names = [...(await vault.listBlobs()).keys()];
+  const entries = names.map((name, i) => ({ id: `f${i}`, name: `File ${i}.jpg`, blob: name }));
+  const { blob: whole } = await vault.backup(entries);
+  assert.deepEqual(await vault.absent(names), []);
+  assert.deepEqual(await vault.absent([...names, ...names].slice(0, 9)), [], 'many names: one listing');
+
+  // One copy deleted by hand, in the vault's "Encrypted files" folder.
+  const files = documents.children.get('Secure Box').children.get('Encrypted files');
+  await files.removeEntry(names[1]);
+  assert.deepEqual(await vault.absent(names), [names[1]]);
+  assert.deepEqual(await vault.absent([...names, ...names, ...names]), [names[1], names[1], names[1]], 'many names: one listing');
+  await assert.rejects(vault.readBytes(names[1], 0, 9), { code: 'not-found' });
+  // The vault itself is still there, so this is no "vault gone".
+  const { missing } = await vault.backup(entries);
+  assert.deepEqual(missing.map((e) => e.name), ['File 1.jpg'], 'a backup says what it couldn’t hold');
+
+  // A backup from before has that very copy: it goes back, byte for byte.
+  const backup = await readBackup(new File([whole], 'backup.zip'));
+  assert.equal(await vault.restoreBlob(backup, names[1]), true);
+  assert.deepEqual(await vault.absent(names), []);
+
+  // The whole folder of encrypted copies deleted: every copy is missing, and the vault stays.
+  await documents.children.get('Secure Box').removeEntry('Encrypted files', { recursive: true });
+  assert.deepEqual(await vault.absent(names), names);
+  assert.deepEqual(await vault.absent([...names, ...names, ...names]).then((n) => n.length), 9);
+  assert.ok((await vault.load()).vault, 'the vault itself is still there');
+});
+
+test('a change made from an out-of-date view applies to things as they are now', () => {
+  const [b1, b2, b3] = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+  const docs = makeFolder({ name: 'Docs' });
+  const notes = makeFileEntry({ name: 'Notes.txt', type: 'text/plain', size: 10, folder: docs.id, blob: b1, key: 'A'.repeat(43), chunk: CHUNK_SIZE });
+  const start = applyChange(emptyVault(), { op: 'batch', changes: [{ op: 'folder-put', folder: docs }, { op: 'file-put', file: notes }] });
+  const rename = { op: 'file-update', id: notes.id, fields: { name: 'Renamed.txt' } };
+
+  // Deleted on another device, then renamed or moved here: it stays deleted.
+  const deleted = applyChange(start, { op: 'batch', changes: [{ op: 'remove', files: [notes.id] }, { op: 'trash-add', names: [b1] }] });
+  assert.deepEqual(applyChange(deleted, rename).files, []);
+  assert.deepEqual(applyChange(deleted, { op: 'file-update', id: notes.id, fields: { folder: null } }).files, []);
+
+  // Edited on another device (a new copy), renamed here: the rename lands on the edit.
+  const edited = applyChange(start, { op: 'batch', changes: [{ op: 'file-update', id: notes.id, fields: { blob: b2, key: 'B'.repeat(43), size: 20 } }, { op: 'trash-add', names: [b1] }] });
+  const both = applyChange(edited, rename).files[0];
+  assert.deepEqual([both.name, both.blob, both.size], ['Renamed.txt', b2, 20]);
+
+  // A saved edit never replaces one saved elsewhere meanwhile; over a file deleted meanwhile, it comes back.
+  const mine = { op: 'file-update', id: notes.id, ifBlob: b1, fields: { blob: b3 }, orAdd: { ...notes, blob: b3 } };
+  assert.equal(applyChange(edited, mine).files[0].blob, b2);
+  assert.equal(applyChange(deleted, mine).files[0].blob, b3);
+  assert.ok(!applyChange(deleted, mine).trash.includes(b3));
+
+  // Names stay apart from what's there now; a move into a folder deleted meanwhile goes to the top.
+  const crowded = applyChange(start, { op: 'file-put', file: makeFileEntry({ name: 'Renamed.txt', folder: docs.id, blob: b2, key: 'B'.repeat(43), size: 1, chunk: CHUNK_SIZE }) });
+  assert.equal(applyChange(crowded, rename).files.find((f) => f.id === notes.id).name, 'Renamed (2).txt');
+  const noDocs = applyChange(start, { op: 'remove', folders: [docs.id] });
+  assert.equal(applyChange(noDocs, { op: 'file-update', id: notes.id, fields: { folder: docs.id } }).files[0].folder, null);
+
+  // A folder moved into one of its own folders (after a move elsewhere meanwhile) stays put.
+  const inner = makeFolder({ name: 'Inner', parent: docs.id });
+  const nested = applyChange(start, { op: 'folder-put', folder: inner });
+  assert.equal(applyChange(nested, { op: 'folder-update', id: docs.id, fields: { parent: inner.id } }).folders.find((f) => f.id === docs.id).parent, null);
+  assert.equal(applyChange(nested, { op: 'folder-update', id: inner.id, fields: { name: 'Docs 2' } }).folders.find((f) => f.id === inner.id).name, 'Docs 2');
+});
+
+test('a password edit sends only what changed, so edits to other fields elsewhere stay', () => {
+  const login = makeItem({ type: 'login', title: 'Bank', username: 'jane', password: 'old secret', url: 'https://bank.example' });
+  const start = applyChange(emptyVault(), { op: 'put', item: login });
+  // The phone changed the password; this window, behind, changes the notes.
+  const phone = applyChange(start, { op: 'item-update', item: makeItem({ ...login, password: 'new secret' }, login), fields: { password: 'new secret' } });
+  const here = makeItem({ ...login, notes: 'Branch: Main St.' }, login);
+  const merged = applyChange(phone, { op: 'item-update', item: here, fields: { notes: 'Branch: Main St.' } }).items[0];
+  assert.deepEqual([merged.password, merged.notes], ['new secret', 'Branch: Main St.']);
+  // Deleted elsewhere meanwhile: the edit brings it back, so nothing typed is lost.
+  assert.deepEqual(applyChange(applyChange(start, { op: 'delete', id: login.id }), { op: 'item-update', item: here, fields: { notes: here.notes } }).items, [here]);
+});
+
+test('the list of copies to delete never holds one a file uses', () => {
+  const name = crypto.randomUUID();
+  const file = makeFileEntry({ name: 'a.pdf', type: 'application/pdf', size: 1, folder: null, blob: name, key: 'A'.repeat(43), chunk: CHUNK_SIZE });
+  const live = applyChange(emptyVault(), { op: 'file-put', file });
+  assert.deepEqual(applyChange(live, { op: 'trash-add', names: [name] }).trash, [], 'a copy in use isn’t listed');
+  // Deleted (its copy listed), then restored from a backup before the copy went: it comes off the list.
+  const listed = applyChange(live, { op: 'batch', changes: [{ op: 'remove', files: [file.id] }, { op: 'trash-add', names: [name] }] });
+  assert.deepEqual(listed.trash, [name]);
+  const restored = applyChange(listed, { op: 'file-put', file });
+  assert.deepEqual(restored.trash, []);
+  assert.ok(copiesInUse(restored).has(name));
+});
+
+test('files that are Secure Box’s own are never taken for files put in by hand', async () => {
+  const picked = new MemDir('Documents');
+  await folderVault(picked, 0);
+  const own = picked.children.get('Secure Box');
+  const encrypted = new Uint8Array(64);
+  encrypted.set(new TextEncoder().encode('SECBOXF1'));
+  await writeText(own, 'notes.txt', 'put here by hand');
+  await writeText(own, 'Secure Box Vault (1).json', '{"format":"secure-box-vault"}'); // a sync service's copy
+  await writeText(own, 'Secure Box Key Ring-LAPTOP.json', '{}');
+  await writeText(own, crypto.randomUUID(), encrypted); // an encrypted copy moved out of its folder
+  await writeText(own, 'renamed.bin', encrypted); // and one renamed
+  await writeText(await own.getDirectoryHandle('Scans', { create: true }), 'receipt.pdf', 'also by hand');
+  const strays = await inFolder(picked).strays();
+  assert.deepEqual(strays.map((s) => [...s.path, s.name].join('/')).sort(), ['Scans/receipt.pdf', 'notes.txt']);
+});
+
+test('two saves to the vault on this device are told apart, however coarse the disk’s clock', async () => {
+  // FAT32 keeps 2-second times, and vault sizes are padded: two saves can match in both.
+  const usb = new MemDir('USB', { clock: 1_700_000_000_000 });
+  const sealed = (salt) => JSON.stringify({ format: 'secure-box-vault', version: 3, kid: deviceKid, salt, iv: 'iv', ct: 'x'.repeat(64) });
+  const one = inFolder(usb);
+  await one.create({ keyringText: JSON.stringify({ format: 'secure-box-keyring', kid: deviceKid }), vaultText: sealed('salt-one'), kid: deviceKid });
+  const two = inFolder(usb);
+  const seen = (await two.load()).vault.rev;
+  await one.writeVault(sealed('salt-two'), await one.vaultRevision()); // the same size, at the same time
+  await assert.rejects(two.writeVault(sealed('salt-xyz'), seen), { code: 'conflict' });
+  assert.equal(String(seen).split(':')[0], '1700000000000', 'it still starts with when it was saved');
+});
+
+test('the vault on this device stores and finds encrypted copies by their names', async () => {
+  const backend = await folderVault(new MemDir('Documents'), 0);
+  const name = crypto.randomUUID();
+  const bytes = random(5000);
+  assert.equal(await (await backend.openUpload({ name }))(bytes, 0, bytes.length), name);
+  assert.deepEqual([...(await backend.listBlobs())], [[name, { size: 5000 }]]);
+  assert.deepEqual(new Uint8Array(await backend.readBytes(name, 10, 19)), bytes.slice(10, 20));
+  await backend.trash(name);
+  await backend.trash(name); // gone already counts as deleted
+  assert.equal((await backend.listBlobs()).size, 0);
+  await assert.rejects(backend.openUpload({ name: '../Secure Box Key Ring.json' }), /Not a file of this device/);
 });
 
 test('only http(s) links are clickable', () => {
@@ -1042,17 +1499,17 @@ test('OneDrive: if making the files folder is refused, the first upload goes in 
   await withFakeFetch(
     [
       ['/special/approot/children?', () => jsonReply({ value: [] })],
-      ['/special/approot:/Encrypted%20files/abc:/createUploadSession', () => jsonReply({ uploadUrl: link })],
+      ['/special/approot:/Encrypted%20files/0f8fad5b-d9cb-469f-a165-70867728950e:/createUploadSession', () => jsonReply({ uploadUrl: link })],
       ['/me/drive/special/approot', () => jsonReply({ id: 'ROOT!1' })],
       ['/me/drive/items/ROOT!1/children', () => new Response(JSON.stringify({ error: { code: 'invalidRequest', message: 'Invalid request' } }), { status: 400 })],
       [link, () => jsonReply({ id: 'NEW' })],
     ],
     async (calls) => {
       const backend = createOneDriveBackend({ accessToken: 't' });
-      const send = await backend.openUpload({ fid: 'abc', size: 4 });
+      const send = await backend.openUpload({ name: '0f8fad5b-d9cb-469f-a165-70867728950e', size: 4 });
       assert.equal(await send(new Uint8Array(4), 0, 4), 'NEW');
       const session = calls.find((c) => c.url.includes('createUploadSession'));
-      assert.deepEqual(JSON.parse(session.body), { item: { '@microsoft.graph.conflictBehavior': 'fail', name: 'abc' } });
+      assert.deepEqual(JSON.parse(session.body), { item: { '@microsoft.graph.conflictBehavior': 'fail', name: '0f8fad5b-d9cb-469f-a165-70867728950e' } });
     },
   );
 });

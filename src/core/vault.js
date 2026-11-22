@@ -12,8 +12,10 @@
  */
 import { decryptAesGcm, deriveAesKey, encryptAesGcm, fromBase64, fromUtf8, importHkdfKey, padme, randomBytes, toBase64, utf8 } from './crypto.js';
 
+// One vault format for every place (Google Drive, OneDrive, this device): a vault's file can move
+// from one to another exactly as it is.
 const VAULT_FORMAT = 'secure-box-vault';
-const VAULT_VERSION = 2;
+const VAULT_VERSION = 3;
 const HKDF_INFO = 'secure-box/vault-encryption/v1';
 
 export class VaultError extends Error {
@@ -27,15 +29,19 @@ export class VaultError extends Error {
 // ---------------------------------------------------------------------------
 // Encrypted envelope
 // ---------------------------------------------------------------------------
-export function parseEnvelope(text, format = VAULT_FORMAT) {
+export function parseEnvelope(text) {
   let env;
   try {
     env = JSON.parse(text);
   } catch {
     throw new VaultError('bad-vault', 'The vault file is not valid JSON.');
   }
-  if (!env || env.format !== format) throw new VaultError('bad-vault', 'The file is not a Secure Box vault.');
-  if (env.version !== VAULT_VERSION) throw new VaultError('bad-vault', 'This vault was written by a newer version of Secure Box.');
+  // The vault moved away from here: the note says where to (see movedNote below).
+  if (env?.format === MOVED_FORMAT) throw Object.assign(new VaultError('moved', 'This vault was moved to another place, so nothing more can be saved here.'), { note: movedNote(text) });
+  // Intact, but in a format this version doesn't read (Secure Box is still changing its formats).
+  const otherVersion = () => new VaultError('other-version', 'This vault was made by another version of Secure Box, so this one can’t open it.');
+  if (env?.format !== VAULT_FORMAT) throw typeof env?.format === 'string' && env.format.startsWith('secure-box-') ? otherVersion() : new VaultError('bad-vault', 'The file is not a Secure Box vault.');
+  if (env.version !== VAULT_VERSION) throw env.version > VAULT_VERSION ? new VaultError('bad-vault', 'This vault was written by a newer version of Secure Box.') : otherVersion();
   for (const field of ['kid', 'salt', 'iv', 'ct']) {
     if (typeof env[field] !== 'string' || !env[field]) throw new VaultError('bad-vault', 'The vault file is incomplete.');
   }
@@ -45,9 +51,6 @@ export function parseEnvelope(text, format = VAULT_FORMAT) {
 // Binds the header (format, version, key id, salt) to the ciphertext, so swapping any of it is detected.
 const aadFor = (format, version, kid, salt) => utf8(`${format}:${version}:${kid}:${salt}`);
 
-/** The local vault's index (localstore.js) uses its own format and key, so it can't pass for the vault. */
-export const LOCAL_INDEX = { format: 'secure-box-local-index', info: 'secure-box/local-index/v1' };
-
 // The same names in every place a vault lives (Google Drive, OneDrive, this device), so a vault
 // looks the same wherever you find it: the key ring, the vault, and a folder of encrypted files.
 export const VAULT_FILE_NAME = 'Secure Box Vault.json';
@@ -55,29 +58,27 @@ export const FILES_FOLDER = 'Encrypted files';
 
 export class VaultCipher {
   /** Holds only a non-extractable HKDF handle to the master key. */
-  static async create(master, purpose = { format: VAULT_FORMAT, info: HKDF_INFO }) {
-    return new VaultCipher(master.kid, await importHkdfKey(master.key), purpose);
+  static async create(master) {
+    return new VaultCipher(master.kid, await importHkdfKey(master.key));
   }
 
-  constructor(kid, baseKey, purpose = { format: VAULT_FORMAT, info: HKDF_INFO }) {
+  constructor(kid, baseKey) {
     this.kid = kid;
     this.baseKey = baseKey;
-    this.format = purpose.format;
-    this.info = purpose.info;
   }
 
   async seal(data) {
     // Fresh salt => a brand-new AES-256 key for every save, so nonce limits never come into play.
     const salt = randomBytes(16);
-    const key = await deriveAesKey(this.baseKey, salt, this.info);
+    const key = await deriveAesKey(this.baseKey, salt, HKDF_INFO);
     const saltText = toBase64(salt);
     const json = utf8(JSON.stringify(data));
     // Pad with spaces (valid trailing JSON whitespace) to a Padmé length, so the size leaks little.
     const padded = new Uint8Array(padme(json.length)).fill(0x20);
     padded.set(json);
-    const { iv, ciphertext } = await encryptAesGcm(key, padded, aadFor(this.format, VAULT_VERSION, this.kid, saltText));
+    const { iv, ciphertext } = await encryptAesGcm(key, padded, aadFor(VAULT_FORMAT, VAULT_VERSION, this.kid, saltText));
     return JSON.stringify({
-      format: this.format,
+      format: VAULT_FORMAT,
       version: VAULT_VERSION,
       kid: this.kid,
       salt: saltText,
@@ -87,11 +88,11 @@ export class VaultCipher {
   }
 
   async open(env) {
-    if (env.format !== this.format) throw new VaultError('bad-vault', 'The file is not a Secure Box vault.');
+    if (env.format !== VAULT_FORMAT) throw new VaultError('bad-vault', 'The file is not a Secure Box vault.');
     if (env.kid !== this.kid) throw new VaultError('wrong-key', 'This key does not belong to the vault.');
     let plain;
     try {
-      const key = await deriveAesKey(this.baseKey, fromBase64(env.salt), this.info);
+      const key = await deriveAesKey(this.baseKey, fromBase64(env.salt), HKDF_INFO);
       plain = await decryptAesGcm(key, fromBase64(env.iv), fromBase64(env.ct), aadFor(env.format, env.version, env.kid, env.salt));
     } catch {
       throw new VaultError('decrypt-failed', 'The vault could not be decrypted: the key does not match or the data was altered.');
@@ -131,6 +132,128 @@ function cleanItem(raw) {
 
 const cleanName = (value) => text(value, 255).replace(/[\u0000-\u001f\u007f]/g, '').trim();
 const isId = (value) => typeof value === 'string' && value.length > 0 && value.length <= 64;
+const BLOB_NAME = /^[0-9a-f-]{36}$/i;
+
+// ---------------------------------------------------------------------------
+// Two vaults made one (moving a vault into a place that already has one)
+// ---------------------------------------------------------------------------
+const changedLater = (a, b) => (b.updated || 0) > (a.updated || 0);
+
+/**
+ * What `there` (the vault at the place this one is going) has that `here` doesn't: items,
+ * folders and files only it has, and ones both have that it changed later. All zero: it's an
+ * earlier copy of `here`, which `here` simply brings up to date.
+ */
+export function compareVaults(there, here) {
+  const count = (kind) => {
+    const mine = new Map(here[kind].map((x) => [x.id, x]));
+    let only = 0;
+    let newer = 0;
+    for (const x of there[kind]) {
+      const own = mine.get(x.id);
+      if (!own) only++;
+      else if (changedLater(own, x)) newer++;
+    }
+    return { only, newer };
+  };
+  const items = count('items');
+  const folders = count('folders');
+  const files = count('files');
+  return {
+    onlyThere: { items: items.only, folders: folders.only, files: files.only },
+    newerThere: { items: items.newer, folders: folders.newer, files: files.newer },
+    earlierCopy: !items.only && !folders.only && !files.only && !items.newer && !folders.newer && !files.newer,
+  };
+}
+
+/**
+ * `base` (the vault already at a place) and `incoming` (the one arriving) made one, so nothing in
+ * either is lost. Something both have (one was copied from the other once: the same id) keeps
+ * whichever version was changed last. A folder with the same name in the same place as one
+ * already there becomes that one, like folders merged in a file manager; files whose names clash
+ * there are renamed ("Report (2).pdf"). The list of copies to delete is `base`'s.
+ */
+export function mergeVaults(base, incoming) {
+  const items = new Map(base.items.map((it) => [it.id, it]));
+  for (const it of incoming.items) if (!items.has(it.id) || changedLater(items.get(it.id), it)) items.set(it.id, it);
+
+  // Folders, parents first, so each one's place is known before its own folders come.
+  const folders = new Map(base.folders.map((f) => [f.id, { ...f }]));
+  const became = new Map(); // an incoming folder's id -> the id of the folder it's now part of
+  const placeOf = (id) => (id ? (became.get(id) ?? (folders.has(id) ? id : null)) : null);
+  const fromIncoming = new Set();
+  const pending = new Map(incoming.folders.map((f) => [f.id, f]));
+  const visit = (f) => {
+    pending.delete(f.id);
+    if (f.parent && pending.has(f.parent)) visit(pending.get(f.parent));
+    const parent = placeOf(f.parent);
+    const have = folders.get(f.id);
+    if (have) {
+      became.set(f.id, f.id);
+      if (changedLater(have, f)) {
+        folders.set(f.id, { ...f, parent });
+        fromIncoming.add(f.id);
+      }
+      return;
+    }
+    const twin = [...folders.values()].find((g) => (g.parent ?? null) === parent && g.name.toLowerCase() === f.name.toLowerCase());
+    if (twin) {
+      became.set(f.id, twin.id);
+      return;
+    }
+    folders.set(f.id, { ...f, parent });
+    became.set(f.id, f.id);
+    fromIncoming.add(f.id);
+  };
+  while (pending.size) visit(pending.values().next().value);
+
+  const files = new Map(base.files.map((f) => [f.id, f]));
+  for (const f of incoming.files) {
+    const have = files.get(f.id);
+    if (have && !changedLater(have, f)) continue;
+    files.set(f.id, { ...f, folder: placeOf(f.folder) });
+    fromIncoming.add(f.id);
+  }
+
+  // What came in keeps clear of the names already beside it.
+  const rename = (list, keyOf, isFolder) => {
+    const taken = new Map();
+    for (const x of list) if (!fromIncoming.has(x.id)) (taken.get(keyOf(x)) || taken.set(keyOf(x), []).get(keyOf(x))).push(x.name);
+    for (const x of list) {
+      if (!fromIncoming.has(x.id)) continue;
+      const names = taken.get(keyOf(x)) || taken.set(keyOf(x), []).get(keyOf(x));
+      x.name = uniqueName(x.name, names, { isFolder });
+      names.push(x.name);
+    }
+  };
+  const folderList = [...folders.values()];
+  const fileList = [...files.values()].map((f) => ({ ...f }));
+  rename(folderList, (f) => f.parent ?? '', true);
+  rename(fileList, (f) => f.folder ?? '', false);
+  repairTree(folderList, fileList);
+  const inUse = new Set(fileList.map((f) => f.blob));
+  return { ...base, items: [...items.values()], folders: folderList, files: fileList, trash: (base.trash || []).filter((name) => !inUse.has(name)) };
+}
+
+// ---------------------------------------------------------------------------
+// Where a vault was moved away from: a short note in place of the vault
+// ---------------------------------------------------------------------------
+// Left in the old place when a vault moves away from a cloud (migrate.js), so another device
+// that still looks there learns where it went, rather than finding it "deleted". It holds only
+// that: the place it went to (google, microsoft, local) and when.
+const MOVED_FORMAT = 'secure-box-moved';
+
+export const movedNoteText = (to, at = new Date()) => JSON.stringify({ format: MOVED_FORMAT, version: 1, to, at: at.toISOString() });
+
+/** The note's { to, at }, if `text` is one. */
+export function movedNote(text) {
+  try {
+    const note = JSON.parse(text);
+    return note?.format === MOVED_FORMAT && typeof note.to === 'string' ? { to: note.to, at: Date.parse(note.at) || 0 } : null;
+  } catch {
+    return null;
+  }
+}
 
 function cleanFolder(raw) {
   const now = Date.now();
@@ -151,7 +274,9 @@ function cleanFile(raw) {
     type: text(raw.type, 200),
     size: raw.size,
     folder: isId(raw.folder) ? raw.folder : null,
-    driveId: raw.driveId,
+    // The name its encrypted copy is stored under, the same in every place (never a place's own
+    // file id): the file's own id, or a new name once it was saved again (an edited text file).
+    blob: raw.blob,
     key: raw.key,
     chunk: raw.chunk,
     thumbBytes: Number.isInteger(raw.thumbBytes) && raw.thumbBytes > 0 ? raw.thumbBytes : 0,
@@ -160,8 +285,11 @@ function cleanFile(raw) {
   };
 }
 
+/** A stored copy's name: a random id, so the same in every place and safe in any query or path. */
+export const isBlobName = (name) => typeof name === 'string' && BLOB_NAME.test(name);
+
 const validFile = (f) =>
-  f && isId(f.id) && typeof f.driveId === 'string' && f.driveId && typeof f.key === 'string' && /^[A-Za-z0-9_-]{43}$/.test(f.key) &&
+  f && isId(f.id) && isBlobName(f.blob) && typeof f.key === 'string' && /^[A-Za-z0-9_-]{43}$/.test(f.key) &&
   Number.isSafeInteger(f.size) && f.size >= 0 && Number.isSafeInteger(f.chunk) && f.chunk > 0;
 
 /** Re-homes anything whose parent folder is missing, and breaks accidental cycles. */
@@ -223,7 +351,7 @@ export function makeItem(fields, previous = null) {
 const fingerprint = (it) => JSON.stringify([it.type, it.title, it.username, it.password, it.url, it.notes]);
 
 // ---------------------------------------------------------------------------
-// Folders and files (the encrypted index of what is stored in Google Drive)
+// Folders and files (each file's encrypted copy is stored under its `blob` name)
 // ---------------------------------------------------------------------------
 export function makeFolder({ name, parent = null }, previous = null) {
   const now = Date.now();
@@ -282,20 +410,70 @@ export function collectTree(vault, folderId) {
   return { folderIds: [...folderIds], files };
 }
 
-/** Changes are replayed on top of the latest stored vault when another device saved first. */
+/** The names of the encrypted copies the vault's files use. */
+export const copiesInUse = (vault) => new Set(vault.files.map((f) => f.blob));
+
+/** A copy a file uses again (a restore, a change from elsewhere) comes off the list of copies to delete. */
+const keepCopy = (vault, name) => (vault.trash?.includes(name) ? { ...vault, trash: vault.trash.filter((n) => n !== name) } : vault);
+
+/**
+ * Changes are replayed on top of the latest stored vault when another device saved first, so a
+ * change to something already there names only what changed ('item-update', 'file-update',
+ * 'folder-update'): it applies to that thing as it is now, never to a copy of it from before.
+ */
 export function applyChange(vault, change) {
   switch (change.op) {
     case 'put':
       return { ...vault, items: vault.items.filter((it) => it.id !== change.item.id).concat(change.item) };
+    case 'item-update': {
+      // The fields that were edited (`fields`), over another device's edits to the others meanwhile.
+      // Deleted elsewhere meanwhile: the edited item (`item`) comes back, so nothing typed is lost.
+      const current = vault.items.find((it) => it.id === change.item.id);
+      if (!current) return { ...vault, items: vault.items.concat(change.item) };
+      const item = cleanItem({ ...current, ...change.fields, updated: change.item.updated });
+      return { ...vault, items: vault.items.map((it) => (it.id === item.id ? item : it)) };
+    }
     case 'delete':
       return { ...vault, items: vault.items.filter((it) => it.id !== change.id) };
     case 'folder-put':
       return { ...vault, folders: vault.folders.filter((f) => f.id !== change.folder.id).concat(change.folder) };
+    case 'folder-update': {
+      // A rename or move. One deleted meanwhile stays deleted; one moved into a folder deleted
+      // meanwhile goes to the top; a move into itself (after another move meanwhile) is left out.
+      const current = vault.folders.find((f) => f.id === change.id);
+      if (!current) return vault;
+      const fields = { ...change.fields };
+      if (fields.parent && !vault.folders.some((f) => f.id === fields.parent)) fields.parent = null;
+      if (fields.parent && collectTree(vault, current.id).folderIds.includes(fields.parent)) return vault;
+      if ('name' in fields || 'parent' in fields) {
+        const parent = 'parent' in fields ? fields.parent : current.parent;
+        fields.name = uniqueName(fields.name ?? current.name, vault.folders.filter((f) => f.parent === parent && f.id !== current.id).map((f) => f.name), { isFolder: true });
+      }
+      const folder = cleanFolder({ ...current, ...fields });
+      return { ...vault, folders: vault.folders.map((f) => (f.id === folder.id ? folder : f)) };
+    }
     case 'file-put': {
       // A folder deleted meanwhile (in another window or device): the file lands in All files.
       const lost = change.file.folder && !vault.folders.some((f) => f.id === change.file.folder);
       const file = lost ? { ...change.file, folder: null } : change.file;
-      return { ...vault, files: vault.files.filter((f) => f.id !== file.id).concat(file) };
+      return keepCopy({ ...vault, files: vault.files.filter((f) => f.id !== file.id).concat(file) }, file.blob);
+    }
+    case 'file-update': {
+      // A rename, a move, or a saved edit (a new encrypted copy). One deleted meanwhile stays
+      // deleted, unless the change brings the whole file back (`orAdd`: a saved edit, so what was
+      // typed isn't lost). `ifBlob`: only while its copy is still that one, so an edit saved
+      // elsewhere meanwhile is never replaced (the editor then asks what to do).
+      const current = vault.files.find((f) => f.id === change.id);
+      if (!current) return change.orAdd ? applyChange(vault, { op: 'file-put', file: change.orAdd }) : vault;
+      if (change.ifBlob && current.blob !== change.ifBlob) return vault;
+      const fields = { ...change.fields };
+      if (fields.folder && !vault.folders.some((f) => f.id === fields.folder)) fields.folder = null;
+      if ('name' in fields || 'folder' in fields) {
+        const folder = 'folder' in fields ? fields.folder : current.folder;
+        fields.name = uniqueName(fields.name ?? current.name, vault.files.filter((f) => f.folder === folder && f.id !== current.id).map((f) => f.name));
+      }
+      const file = cleanFile({ ...current, ...fields });
+      return keepCopy({ ...vault, files: vault.files.map((f) => (f.id === file.id ? file : f)) }, file.blob);
     }
     case 'remove': {
       const folders = new Set(change.folders || []);
@@ -304,13 +482,15 @@ export function applyChange(vault, change) {
     }
     case 'batch':
       return change.changes.reduce((acc, next) => applyChange(acc, next), vault);
-    // Encrypted copies that couldn't be deleted yet (offline, say): kept here, inside the encrypted
-    // vault, and tried again on a later sync from any device.
-    case 'trash-add':
-      return { ...vault, trash: [...new Set([...(vault.trash || []), ...change.ids])] };
+    // Encrypted copies that couldn't be deleted yet (offline, say), by name: kept here, inside the
+    // encrypted vault, and tried again on a later sync from any device.
+    case 'trash-add': {
+      const inUse = copiesInUse(vault); // never one a file uses (it may have come back meanwhile)
+      return { ...vault, trash: [...new Set([...(vault.trash || []), ...change.names.filter((name) => !inUse.has(name))])] };
+    }
     case 'trash-done': {
-      const done = new Set(change.ids);
-      return { ...vault, trash: (vault.trash || []).filter((id) => !done.has(id)) };
+      const done = new Set(change.names);
+      return { ...vault, trash: (vault.trash || []).filter((name) => !done.has(name)) };
     }
     case 'import': {
       const seen = new Set(vault.items.map(fingerprint));

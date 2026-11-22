@@ -13,14 +13,14 @@ import { canThumbnail, formatBytes, guessType, kindOf } from '../core/filetypes.
 import { fileUrl, forgetStreams, zipUrl } from '../core/stream.js';
 import { makeThumbnail } from '../core/thumbs.js';
 import { runTask } from '../workers/pool.js';
-import { collectTree, folderChain, makeFileEntry, makeFolder, uniqueName } from '../core/vault.js';
+import { collectTree, copiesInUse, folderChain, makeFileEntry, makeFolder, uniqueName } from '../core/vault.js';
 import { ask, confirmDialog, toast } from './bridge.js';
 import { commit, driveFresh, ensureDrive } from './cloud.js';
 import { downloadFile, pickFiles } from './io.js';
 import { pushNav } from './nav.js';
 import { pref } from './prefs.js';
-import { createStore, state } from './store.js';
-import { editingDirty } from './viewer.js';
+import { DEMO, createStore, state } from './store.js';
+import { dropFromViewer, editingDirty } from './viewer.js';
 
 const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
 export const ROOT_NAME = 'All files';
@@ -32,6 +32,7 @@ const store = createStore({
   selected: new Set(),
   anchor: null, // where a Shift range starts
   pending: new Map(), // id -> 'deleting' | 'moving' | 'renaming' (#10)
+  missing: new Set(), // names of encrypted copies that aren't where the vault is (deleted outside Secure Box, say)
   added: null, // a folder just made: shown and lit up for a moment, not chosen
   transfers: [], // what the uploads tray shows
   tray: 'open', // 'open' | 'collapsed'
@@ -165,7 +166,7 @@ const objectUrls = new Map();
 async function decryptHere(file, part = 'content') {
   const plan = layout({ size: file.size, thumbBytes: file.thumbBytes, chunk: file.chunk });
   const end = part === 'thumb' ? plan.contentStart - 1 : plan.total - 1;
-  const stream = await state.backend.readRange(file.driveId, 0, end);
+  const stream = await state.backend.readRange(file.blob, 0, end);
   return decryptFile(stream, file, { part });
 }
 
@@ -180,7 +181,7 @@ const readError = async (res) => (res.status === 401 ? 'Access to your cloud dri
 export async function fetchBytes(file) {
   if (state.streaming) {
     const res = await fetch(fileUrl(file.id), { cache: 'no-store' });
-    if (!res.ok) throw new Error(await readError(res));
+    if (!res.ok) throw Object.assign(new Error(await readError(res)), { status: res.status });
     return res.arrayBuffer();
   }
   return new Blob(await decryptHere(file)).arrayBuffer();
@@ -190,10 +191,76 @@ export async function fetchBytes(file) {
 export async function fetchRange(file, start, end) {
   if (state.streaming) {
     const res = await fetch(fileUrl(file.id), { headers: { Range: `bytes=${start}-${end}` }, cache: 'no-store' });
-    if (!res.ok) throw new Error(await readError(res));
+    if (!res.ok) throw Object.assign(new Error(await readError(res)), { status: res.status });
     return new Uint8Array(await res.arrayBuffer());
   }
   return new Uint8Array(await new Blob(await decryptHere(file)).arrayBuffer()).subarray(start, end + 1);
+}
+
+// ===========================================================================
+// Encrypted copies that went missing (deleted outside Secure Box, say)
+// ===========================================================================
+/** A "not found" for a file's encrypted copy, from wherever it was read. */
+export const isMissingCopy = (err) => err?.code === 'not-found' || err?.status === 404;
+
+/** Notes that a file's encrypted copy is missing (`there` false), or there after all. */
+export function noteCopy(file, there) {
+  const missing = get().missing;
+  if (missing.has(file.blob) !== there) return;
+  const next = new Set(missing);
+  if (there) next.delete(file.blob);
+  else next.add(file.blob);
+  set({ missing: next });
+}
+
+/**
+ * Looks for files whose encrypted copy isn't where the vault is: deleted by hand from the
+ * vault's folder, say, or in the cloud's own app. Their entries stay (only an entry can open a
+ * copy that's put back), marked missing, so they can be put back or removed. A file added or
+ * changed in the last few minutes isn't counted yet: a sync service, or a cloud's search, may
+ * still be catching up with it.
+ */
+export async function checkCopies() {
+  const backend = state.backend;
+  const v = vault();
+  if (!backend?.absent || !v?.files.length) return;
+  const settled = Date.now() - 2 * 60_000;
+  const names = v.files.filter((f) => timeOf(f) < settled).map((f) => f.blob);
+  let gone;
+  try {
+    gone = await backend.absent(names);
+  } catch (err) {
+    console.warn('Checking the encrypted copies:', err);
+    return;
+  }
+  if (state.backend !== backend) return;
+  const checked = new Set(names);
+  set({ missing: new Set([...[...get().missing].filter((name) => !checked.has(name)), ...gone]) });
+}
+
+/** Is this file's encrypted copy missing? One found missing before is asked about afresh: it may be back. */
+export async function copyGone(file) {
+  const backend = state.backend;
+  if (!backend?.absent) return false;
+  const gone = (await backend.absent([file.blob], { fresh: get().missing.has(file.blob) }).catch(() => [])).length > 0;
+  if (state.backend === backend) noteCopy(file, !gone);
+  return gone;
+}
+
+/** What to say about a file whose encrypted copy is missing, for where the vault is. */
+export function missingCopyText() {
+  const folder = state.backend?.where === 'folder';
+  const [where, back] =
+    DEMO && state.provider !== 'local'
+      ? ['in the demo vault', 'put it back']
+      : state.provider === 'microsoft'
+        ? ['in your OneDrive', 'restore it from the OneDrive recycle bin']
+        : state.provider === 'local'
+          ? folder
+            ? ['in the vault’s folder', 'put it back from the Recycle Bin or Trash, or restore a backup']
+            : ['in this browser', 'restore a backup']
+          : ['in your Google Drive', 'take it out of the bin there'];
+  return `It isn’t ${where} any more, so it can’t be opened. If it was deleted by mistake, ${back}, then try again. Otherwise, remove the file from your vault.`;
 }
 
 /** The whole decrypted file as a File (to share it to another app). */
@@ -338,13 +405,11 @@ export async function renameEntry(entry, isFolder) {
   setPending([entry.id], 'renaming');
   try {
     await ensureDrive();
-    if (isFolder) {
-      const siblings = vault().folders.filter((f) => f.parent === entry.parent && f.id !== entry.id).map((f) => f.name);
-      await commit({ op: 'folder-put', folder: makeFolder({ name: uniqueName(name, siblings, { isFolder: true }), parent: entry.parent }, entry) });
-    } else {
-      const siblings = vault().files.filter((f) => f.folder === entry.folder && f.id !== entry.id).map((f) => f.name);
-      await commit({ op: 'file-put', file: makeFileEntry({ name: uniqueName(name, siblings), type: guessType(name, entry.type) }, entry) });
-    }
+    // Only the new name goes: it applies to the folder or file as it is now (another device may
+    // have changed it meanwhile), and is kept apart from the names already beside it there.
+    if (isFolder) await commit({ op: 'folder-update', id: entry.id, fields: { name, updated: Date.now() } });
+    else await commit({ op: 'file-update', id: entry.id, fields: { name, type: guessType(name, entry.type), updated: Date.now() } });
+    if (!(isFolder ? folderById(entry.id) : fileById(entry.id))) toast(`“${entry.name}” was deleted on another device or in another window.`, 'error');
   } finally {
     setPending([entry.id], null);
   }
@@ -365,28 +430,20 @@ export async function moveEntries(folderIds, fileIds, target) {
   setPending(ids, 'moving');
   try {
     await ensureDrive();
-    const v = vault();
-    const changes = [];
-    const takenFolders = v.folders.filter((f) => f.parent === target && !folderIds.includes(f.id)).map((f) => f.name);
-    for (const id of folderIds) {
-      const folder = folderById(id);
-      if (!folder || folder.parent === target) continue;
-      const name = uniqueName(folder.name, takenFolders, { isFolder: true });
-      takenFolders.push(name);
-      changes.push({ op: 'folder-put', folder: makeFolder({ name, parent: target }, folder) });
-    }
-    const takenFiles = v.files.filter((f) => f.folder === target && !fileIds.includes(f.id)).map((f) => f.name);
-    for (const id of fileIds) {
-      const file = fileById(id);
-      if (!file || file.folder === target) continue;
-      const name = uniqueName(file.name, takenFiles);
-      takenFiles.push(name);
-      changes.push({ op: 'file-put', file: makeFileEntry({ name, folder: target }, file) });
-    }
+    // Each move applies to the folder or file as it is now (another device may have renamed,
+    // edited or deleted it meanwhile); names are kept apart from those already in the target.
+    const now = Date.now();
+    const changes = [
+      ...folderIds.filter((id) => folderById(id) && folderById(id).parent !== target).map((id) => ({ op: 'folder-update', id, fields: { parent: target, updated: now } })),
+      ...fileIds.filter((id) => fileById(id) && fileById(id).folder !== target).map((id) => ({ op: 'file-update', id, fields: { folder: target, updated: now } })),
+    ];
     if (!changes.length) return;
     await commit({ op: 'batch', changes });
     clearSelection();
-    toast(`Moved to ${target ? folderById(target).name : ROOT_NAME}`);
+    const gone = changes.filter((c) => !(c.op === 'file-update' ? fileById(c.id) : folderById(c.id))).length;
+    if (target && !folderById(target)) toast(`That folder was deleted on another device or in another window, so they went to ${ROOT_NAME}.`, 'error');
+    else if (gone) toast(`${gone === 1 ? 'One of them was' : `${gone} of them were`} deleted on another device or in another window meanwhile.`, 'error');
+    else toast(`Moved to ${target ? folderById(target).name : ROOT_NAME}`);
   } finally {
     setPending(ids, null);
   }
@@ -400,53 +457,65 @@ export async function deleteEntries(folderIds, fileIds) {
   const allFolders = [...new Set(trees.flatMap((t) => t.folderIds))];
   const allFiles = [...new Map([...trees.flatMap((t) => t.files), ...fileIds.map(fileById).filter(Boolean)].map((f) => [f.id, f])).values()];
   const label = folderIds.length + fileIds.length === 1 ? `“${(folderById(folderIds[0]) || fileById(fileIds[0])).name}”` : `${folderIds.length + fileIds.length} items`;
+  // Files whose encrypted copy is missing just come off the vault's list: there's nothing else to delete.
+  const gone = !folderIds.length && allFiles.length > 0 && allFiles.every((f) => get().missing.has(f.blob));
+  const one = allFiles.length === 1;
   const inside = folderIds.length && allFiles.length ? ` and the ${allFiles.length} ${allFiles.length === 1 ? 'file' : 'files'} inside` : '';
   const ok = await confirmDialog({
-    title: `Delete ${label}?`,
-    message: isLocal() ? `This deletes ${label}${inside} from the vault on this device. It can’t be undone.` : `This removes ${label}${inside} from Secure Box on every device. ${trashNote()}`,
-    confirmLabel: 'Delete',
+    title: gone ? `Remove ${label} from your vault?` : `Delete ${label}?`,
+    message: gone
+      ? `${one ? 'Its encrypted copy is' : 'Their encrypted copies are'} missing, so ${one ? 'it' : 'they'} can’t be opened. This takes ${one ? 'it' : 'them'} off your vault${isLocal() ? '' : ' on every device'}. It can’t be undone.`
+      : isLocal()
+        ? `This deletes ${label}${inside} from the vault on this device. It can’t be undone.`
+        : `This removes ${label}${inside} from Secure Box on every device. ${trashNote()}`,
+    confirmLabel: gone ? 'Remove' : 'Delete',
     danger: true,
   });
   if (!ok) return;
+  // The viewer moves on from them now: they're deleted here, not "deleted elsewhere".
+  for (const f of allFiles) dropFromViewer(f.id);
   const ids = [...folderIds, ...fileIds];
   setPending(ids, 'deleting');
-  const driveIds = allFiles.map((f) => f.driveId).filter(Boolean);
+  const copies = allFiles.map((f) => f.blob);
   try {
     await ensureDrive();
     // Out of the vault first, with a note of the encrypted copies still to delete: if deleting
     // them fails now, a later sync finishes the job.
-    await commit({ op: 'batch', changes: [{ op: 'remove', folders: allFolders, files: allFiles.map((f) => f.id) }, ...(driveIds.length ? [{ op: 'trash-add', ids: driveIds }] : [])] });
+    await commit({ op: 'batch', changes: [{ op: 'remove', folders: allFolders, files: allFiles.map((f) => f.id) }, ...(copies.length ? [{ op: 'trash-add', names: copies }] : [])] });
   } catch (err) {
     setPending(ids, null);
     throw err;
   }
   setPending(ids, null);
   clearSelection();
-  toast(allFiles.length + allFolders.length === 1 ? 'Deleted' : `Deleted ${allFiles.length + allFolders.length} items`);
-  const left = await deleteCopies(driveIds);
+  toast(gone ? 'Removed from your vault' : allFiles.length + allFolders.length === 1 ? 'Deleted' : `Deleted ${allFiles.length + allFolders.length} items`);
+  const left = await deleteCopies(copies);
   if (left.length) toast(`Deleted from Secure Box. ${left.length === 1 ? 'Its encrypted copy' : `${left.length} encrypted copies`} couldn’t be removed yet: Secure Box tries again on the next sync.`, 'error');
 }
 
-/** Deletes encrypted copies; returns the ones that couldn't be deleted (they stay on the vault's list). */
-async function deleteCopies(driveIds) {
-  if (!driveIds.length) return [];
+/** Deletes encrypted copies, by name; returns the ones that couldn't be deleted (they stay on the vault's list). */
+async function deleteCopies(names) {
+  if (!names.length) return [];
   const backend = state.backend;
-  const done = [];
+  // A copy a file uses again (restored from a backup, or brought back by a change from another
+  // device) is never deleted: it just comes off the list.
+  const inUse = copiesInUse(vault());
+  const done = names.filter((name) => inUse.has(name));
   const left = [];
-  for (const id of driveIds) {
+  for (const name of names.filter((n) => !inUse.has(n))) {
     try {
-      await backend.trash(id);
-      done.push(id);
+      await backend.trash(name);
+      done.push(name);
     } catch (err) {
       // Gone already counts as done.
-      if (err?.status === 404 || err?.code === 'not-found') done.push(id);
+      if (err?.status === 404 || err?.code === 'not-found') done.push(name);
       else {
-        console.warn('Delete: the encrypted copy stayed', id, err);
-        left.push(id);
+        console.warn('Delete: the encrypted copy stayed', name, err);
+        left.push(name);
       }
     }
   }
-  if (done.length && state.backend === backend) await commit({ op: 'trash-done', ids: done }).catch((err) => console.warn('Trash list:', err));
+  if (done.length && state.backend === backend) await commit({ op: 'trash-done', names: done }).catch((err) => console.warn('Trash list:', err));
   return left;
 }
 
@@ -454,11 +523,11 @@ let retrying = false;
 
 /** Encrypted copies left over from earlier deletes: try again (after unlocking and syncing). */
 export async function retryTrash() {
-  const ids = vault()?.trash || [];
-  if (!ids.length || retrying || !state.unlocked || !driveFresh(60_000)) return;
+  const names = vault()?.trash || [];
+  if (!names.length || retrying || !state.unlocked || !driveFresh(60_000)) return;
   retrying = true;
   try {
-    await deleteCopies([...ids]);
+    await deleteCopies([...names]);
   } finally {
     retrying = false;
   }
@@ -479,7 +548,8 @@ export function deleteSelection() {
  * copy is never overwritten in place. The file then points to the new copy, and the old one is
  * deleted like any deleted file (a later sync finishes the job if that fails now).
  * With `asNew` (the file changed or went away elsewhere meanwhile) the text becomes a new file in
- * the same folder. Resolves with the saved file's entry.
+ * the same folder. Resolves with the saved file's entry. If an edit was saved elsewhere at the
+ * very same moment, nothing is replaced: this fails with code 'changed' (textedit.js asks).
  */
 export async function saveTextFile(base, bytes, { asNew = false } = {}) {
   await ensureDrive();
@@ -491,7 +561,8 @@ export async function saveTextFile(base, bytes, { asNew = false } = {}) {
   const file = new File([bytes], name, { type, lastModified: Date.now() });
   const plan = layout({ size: file.size, thumbBytes: 0 });
   const backend = state.backend;
-  const send = await backend.openUpload({ fid: crypto.randomUUID(), size: plan.total });
+  const blob = crypto.randomUUID(); // the new copy's name, recorded in the vault (vault.js, cleanFile)
+  const send = await backend.openUpload({ name: blob, size: plan.total });
   const writer = createPieceWriter({ total: plan.total, send, pieceSize: send.pieceSize });
   let meta;
   try {
@@ -500,14 +571,24 @@ export async function saveTextFile(base, bytes, { asNew = false } = {}) {
     await send.abort?.();
     throw err;
   }
-  const entry = makeFileEntry({ id, name, type, size: file.size, folder, driveId: writer.result, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes }, current);
-  const old = current?.driveId;
+  const entry = makeFileEntry({ id, name, type, size: file.size, folder, blob, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes }, current);
+  const old = current?.blob;
+  // The new copy goes into the file as it is now (a rename elsewhere meanwhile stays), and only if
+  // its copy is still the one this edit started from; one deleted meanwhile comes back with it.
+  const change = current
+    ? { op: 'file-update', id, ifBlob: old, fields: { type, size: file.size, blob, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes, updated: entry.updated }, orAdd: entry }
+    : { op: 'file-put', file: entry };
   try {
-    await commit({ op: 'batch', changes: [{ op: 'file-put', file: entry }, ...(old ? [{ op: 'trash-add', ids: [old] }] : [])] });
+    await commit({ op: 'batch', changes: [change, ...(old ? [{ op: 'trash-add', names: [old] }] : [])] });
   } catch (err) {
     // Not saved: the new copy goes again, and the file stays as it was.
-    if (state.backend === backend) await backend.trash(writer.result).catch(() => {});
+    if (state.backend === backend) await backend.trash(blob).catch(() => {});
     throw err;
+  }
+  if (fileById(id)?.blob !== blob) {
+    // Another edit was saved elsewhere at the same moment, and stays: this copy goes again.
+    if (state.backend === backend) await backend.trash(blob).catch(() => {});
+    throw Object.assign(new Error('This file was saved on another device or in another window at the same moment.'), { code: 'changed' });
   }
   forgetStreams(); // the open file now reads from its new copy
   if (old) deleteCopies([old]).catch((err) => console.warn('Old copy:', err));
@@ -709,7 +790,7 @@ async function uploadOne(task) {
   task.status = 'uploading';
   snapshot();
   const { backend } = task;
-  const send = await backend.openUpload({ fid: id, size: plan.total, signal: task.abort.signal });
+  const send = await backend.openUpload({ name: id, size: plan.total, signal: task.abort.signal }); // stored under the file's own id
   const writer = createPieceWriter({
     total: plan.total,
     send,
@@ -726,7 +807,7 @@ async function uploadOne(task) {
     await send.abort?.(); // the upload session (or a half-written file here) goes
     throw err;
   }
-  const entry = makeFileEntry({ id, name: file.name, type, size: file.size, folder, driveId: writer.result, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes });
+  const entry = makeFileEntry({ id, name: file.name, type, size: file.size, folder, blob: id, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes });
   await saveEntry(entry, backend);
 }
 
@@ -761,7 +842,7 @@ async function flush() {
     await commit({ op: 'batch', changes });
   } catch (err) {
     for (const { entry, backend, reject } of items) {
-      backend.trash(entry.driveId).catch(() => {});
+      backend.trash(entry.blob).catch(() => {});
       reject(err);
     }
     return;
@@ -848,7 +929,7 @@ const unfinished = () => tasks.some((t) => ACTIVE.has(t.status));
 // changes unsaved, asks first. A lock never asks: it must always go through, and the lock button
 // has asked already when it should.
 window.addEventListener('beforeunload', (event) => {
-  if (state.unlocked && (unfinished() || state.device.busy || editingDirty())) event.preventDefault();
+  if (state.unlocked && (unfinished() || state.device.busy || state.moving || editingDirty())) event.preventDefault();
 });
 
 // ===========================================================================
@@ -864,9 +945,10 @@ export const files = {
   /** Uploads paused until Reconnect & resume: they never finish by themselves. */
   pausedCount: () => tasks.filter((t) => t.status === 'paused').length,
   stopAll,
+  checkCopies,
   /** Another vault opened: start at the top, nothing chosen. */
   reset() {
-    set({ folder: null, query: '', selected: new Set(), anchor: null, pending: new Map() });
+    set({ folder: null, query: '', selected: new Set(), anchor: null, pending: new Map(), missing: new Set() });
     releaseUrls();
   },
   /** Another vault opened: its finished uploads aren't this vault's to retry. */

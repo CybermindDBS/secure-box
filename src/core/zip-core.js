@@ -179,6 +179,49 @@
     return out;
   }
 
+  /**
+   * Fetches small files ahead of the one being written, a few at a time: one after another,
+   * a ZIP of many small files from a cloud would mostly be waiting on the network. `sizes[i]`:
+   * item i's size (0: nothing to fetch, such as a folder); `fetchWhole(i)` resolves with what
+   * item i holds. A file bigger than `small` isn't fetched ahead: it streams when its turn comes.
+   * At most `count` files are fetched ahead at once, holding at most `budget` bytes between them.
+   * take(i), asked in order: item i's promise if it was fetched ahead, else null.
+   */
+  function fetchAhead(sizes, fetchWhole, options) {
+    var count = options.count;
+    var budget = options.budget;
+    var small = options.small;
+    var waiting = new Map(); // i -> { size, promise }, fetched ahead and not yet taken
+    var held = 0;
+    var next = 0;
+    function fill() {
+      while (next < sizes.length && waiting.size < count) {
+        var size = sizes[next];
+        if (!size || size > small) {
+          next++;
+          continue;
+        }
+        if (held + size > budget) break;
+        var promise = fetchWhole(next);
+        promise.catch(function () {}); // its error comes out when it's taken
+        waiting.set(next, { size: size, promise: promise });
+        held += size;
+        next++;
+      }
+    }
+    return {
+      take: function (i) {
+        fill();
+        var hit = waiting.get(i);
+        if (!hit) return null;
+        waiting.delete(i);
+        held -= hit.size;
+        fill();
+        return hit.promise;
+      },
+    };
+  }
+
   globalThis.UniboxZip = {
     crc32: crc32,
     checkPath: checkPath,
@@ -186,5 +229,6 @@
     localHeader: localHeader,
     dataDescriptor: dataDescriptor,
     centralDirectory: centralDirectory,
+    fetchAhead: fetchAhead,
   };
 })();

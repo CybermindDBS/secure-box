@@ -52,6 +52,7 @@ export const state = {
   rev: null,
   lastSync: 0,
   switching: null, // the vault opening instead, while it opens: { provider, step, since }
+  moving: false, // the open vault is being moved or copied to another place (migrate.js)
   // What the screen shows.
   section: 'vault', // locked: 'vault' | 'tools'; unlocked: 'passwords' | 'files' | 'tools'
   gate: { panel: 'loading' }, // the Vault tab's card while locked

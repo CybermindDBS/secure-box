@@ -108,7 +108,7 @@ async function ask(message, clientId, options) {
 
 /**
  * Asks the Secure Box windows in turn; resolves with { data, clientId } of the first that knows.
- * options: { wait: ms for each window (4 s), errors: an array that collects the windows' errors }.
+ * options: { wait: ms for each window (4 s), errors: an array that collects the windows' error replies ({ error, status }) }.
  */
 async function askWindows(message, clientId, options) {
   var wait = (options && options.wait) || 4000;
@@ -134,7 +134,7 @@ async function askWindows(message, clientId, options) {
       clients[i].postMessage(message, [channel.port2]);
     });
     if (reply && !reply.error) return { data: reply, clientId: clients[i].id };
-    if (reply && reply.error && options && options.errors) options.errors.push(reply.error);
+    if (reply && reply.error && options && options.errors) options.errors.push(reply);
   }
   return null;
 }
@@ -142,8 +142,15 @@ async function askWindows(message, clientId, options) {
 async function describe(fileId, clientId) {
   var hit = known.get(fileId);
   if (hit && hit.expires > Date.now()) return hit.info;
-  var answer = await askWindows({ type: 'unibox-describe', fileId: fileId }, clientId);
-  if (!answer) throw httpError(403, 'Secure Box is locked.');
+  var errors = [];
+  var answer = await askWindows({ type: 'unibox-describe', fileId: fileId }, clientId, { errors: errors });
+  if (!answer) {
+    // A window that has the file but can't reach it says why (its encrypted copy is missing, say).
+    var why = errors.filter(function (e) {
+      return e.error !== 'locked';
+    })[0];
+    throw why ? httpError(why.status || 502, why.error) : httpError(403, 'Secure Box is locked.');
+  }
   var info = answer.data;
   info.plan = S.plan(info.entry);
   info.key = await S.importKey(info.entry);
@@ -158,7 +165,7 @@ async function describe(fileId, clientId) {
 async function encrypted(info, start, end, signal) {
   if (info.source === 'link') return linkBytes(info, start, end, signal);
   if (info.source === 'page') return pageBytes(info, start, end);
-  var res = await fetch('https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(info.entry.driveId) + '?alt=media', {
+  var res = await fetch('https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(info.id) + '?alt=media', {
     headers: { Authorization: 'Bearer ' + info.token, Range: 'bytes=' + start + '-' + end },
     cache: 'no-store',
     credentials: 'omit',
@@ -168,7 +175,8 @@ async function encrypted(info, start, end, signal) {
     known.delete(info.entry.id);
     throw httpError(401, 'Google Drive access expired. Reconnect in Secure Box.');
   }
-  if (!res.ok) throw httpError(res.status === 404 ? 404 : 502, 'Google Drive returned ' + res.status + '.');
+  if (res.status === 404) throw httpError(404, 'This file’s encrypted copy is missing from your Google Drive.');
+  if (!res.ok) throw httpError(502, 'Google Drive returned ' + res.status + '.');
   return res.status === 200 ? window_(res.body, start, end - start + 1) : res.body;
 }
 
@@ -206,7 +214,7 @@ async function linkBytes(info, start, end, signal) {
     }
     if (res.ok) return res.status === 200 ? window_(res.body, start, end - start + 1) : res.body;
     if (res.body) res.body.cancel().catch(function () {});
-    if (res.status === 404) throw httpError(404, 'That file is missing from your OneDrive.');
+    if (res.status === 404) throw httpError(404, 'This file’s encrypted copy is missing from your OneDrive.');
     info.links.shift();
   }
 }
@@ -223,9 +231,12 @@ function pageBytes(info, start, end) {
       pull: async function (controller) {
         var last = Math.min(end, next + PAGE_PIECE - 1);
         var errors = [];
-        var reply = await ask({ type: 'unibox-read', driveId: info.entry.driveId, start: next, end: last }, info.clientId, { wait: READ_WAIT, errors: errors });
+        var reply = await ask({ type: 'unibox-read', name: info.entry.blob, start: next, end: last }, info.clientId, { wait: READ_WAIT, errors: errors });
         if (stopped) return;
-        if (!reply || !reply.bytes || reply.bytes.byteLength !== last - next + 1) throw httpError(502, errors.pop() || 'Could not read the file.');
+        if (!reply || !reply.bytes || reply.bytes.byteLength !== last - next + 1) {
+          var why = errors.pop();
+          throw httpError((why && why.status) || 502, (why && why.error) || 'Could not read the file.');
+        }
         controller.enqueue(new Uint8Array(reply.bytes));
         next = last + 1;
         if (next > end) controller.close();
@@ -454,37 +465,100 @@ async function serveZip(event, url) {
   });
 }
 
+// A ZIP's small files are fetched a few at a time, ahead of the one being written, so many small
+// files don't each wait their turn on the network. Big ones stream when their turn comes.
+var AHEAD = 4; // files fetched ahead at once
+var AHEAD_BYTES = 32 * 1024 * 1024; // the most they hold in memory between them
+var AHEAD_SMALL = 8 * 1024 * 1024; // bigger files aren't fetched ahead
+
 async function* zipParts(layout, clientId) {
+  var items = layout.items;
+  var stop = new AbortController(); // the download stopped: what's fetched ahead stops too
+  var ahead = Z.fetchAhead(
+    items.map(function (item) {
+      return item.dir ? 0 : item.size;
+    }),
+    function (i) {
+      return wholeFile(items[i], clientId, stop.signal);
+    },
+    { count: AHEAD, budget: AHEAD_BYTES, small: AHEAD_SMALL },
+  );
   var crcs = [];
-  for (var i = 0; i < layout.items.length; i++) {
-    var item = layout.items[i];
-    yield Z.localHeader(item);
-    if (item.dir) {
-      crcs.push(0);
-      continue;
-    }
-    var crc = 0;
-    if (item.size > 0) {
-      var info = await describe(item.fileId, clientId);
-      if (info.entry.size !== item.size) throw httpError(409, 'A file changed while it was being zipped. Try again.');
-      await header(info);
-      var reader = plainStream(info, 0, item.size - 1).getReader();
-      var sent = 0;
-      try {
-        for (;;) {
-          var next = await reader.read();
-          if (next.done) break;
-          crc = Z.crc32(crc, next.value);
-          sent += next.value.length;
-          yield next.value;
-        }
-      } finally {
-        reader.cancel().catch(function () {});
+  try {
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      yield Z.localHeader(item);
+      if (item.dir) {
+        crcs.push(0);
+        continue;
       }
-      if (sent !== item.size) throw httpError(502, 'A file ended early while it was being zipped.');
+      var crc = 0;
+      if (item.size > 0) {
+        var fetched = ahead.take(i);
+        if (fetched) {
+          var whole = await fetched;
+          for (var k = 0; k < whole.pieces.length; k++) yield whole.pieces[k];
+          crc = whole.crc;
+        } else crc = yield* streamed(item, clientId);
+      }
+      crcs.push(crc);
+      yield Z.dataDescriptor(item, crc);
     }
-    crcs.push(crc);
-    yield Z.dataDescriptor(item, crc);
+    yield Z.centralDirectory(layout, crcs);
+  } finally {
+    stop.abort();
   }
-  yield Z.centralDirectory(layout, crcs);
+}
+
+/** A file's decrypted bytes for a ZIP, read while it's written; returns its CRC-32. */
+async function* streamed(item, clientId) {
+  var info = await describe(item.fileId, clientId);
+  if (info.entry.size !== item.size) throw httpError(409, 'A file changed while it was being zipped. Try again.');
+  await header(info);
+  var reader = plainStream(info, 0, item.size - 1).getReader();
+  var crc = 0;
+  var sent = 0;
+  try {
+    for (;;) {
+      var next = await reader.read();
+      if (next.done) break;
+      crc = Z.crc32(crc, next.value);
+      sent += next.value.length;
+      yield next.value;
+    }
+  } finally {
+    reader.cancel().catch(function () {});
+  }
+  if (sent !== item.size) throw httpError(502, 'A file ended early while it was being zipped.');
+  return crc;
+}
+
+/** A small file's decrypted bytes for a ZIP, read whole ahead of its turn: { pieces, crc }. */
+async function wholeFile(item, clientId, signal) {
+  var info = await describe(item.fileId, clientId);
+  if (info.entry.size !== item.size) throw httpError(409, 'A file changed while it was being zipped. Try again.');
+  await header(info);
+  var reader = plainStream(info, 0, item.size - 1).getReader();
+  var cancel = function () {
+    reader.cancel().catch(function () {});
+  };
+  signal.addEventListener('abort', cancel);
+  var pieces = [];
+  var crc = 0;
+  var got = 0;
+  try {
+    for (;;) {
+      var next = await reader.read();
+      if (next.done) break;
+      crc = Z.crc32(crc, next.value);
+      got += next.value.length;
+      pieces.push(next.value);
+    }
+  } finally {
+    signal.removeEventListener('abort', cancel);
+    cancel();
+  }
+  if (signal.aborted) throw httpError(499, 'The download stopped.');
+  if (got !== item.size) throw httpError(502, 'A file ended early while it was being zipped.');
+  return { pieces: pieces, crc: crc };
 }

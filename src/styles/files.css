@@ -21,6 +21,37 @@
   opacity: 1;
 }
 
+/* A file whose encrypted copy is missing (deleted outside Secure Box): it can't be opened, so it
+   looks faded, with a mark, and says so where its size was */
+.is-missing .file-art > svg {
+  opacity: 0.4;
+}
+
+.missing-badge {
+  position: absolute;
+  right: 7px;
+  bottom: 7px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+}
+
+.art-sm .missing-badge {
+  right: 1px;
+  bottom: 1px;
+  width: 15px;
+  height: 15px;
+}
+
+.is-missing .tile-meta,
+.is-missing .frow-size {
+  color: var(--danger);
+}
+
 /* Something is happening to this card (#10): dimmed, a small spinner and what it is */
 .tile.is-pending,
 .frow.is-pending {

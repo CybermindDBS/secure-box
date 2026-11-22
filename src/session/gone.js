@@ -6,6 +6,7 @@
  *   Try again       it was put back (from the Recycle Bin, say): carry on with it
  *   Restore it      Google Drive: take it out of the bin
  *   Save it again   write what's open back: passwords, notes and folders, though not its files
+ *   Open it there   it was moved away (from another device): open it in its new place
  *   Lock
  * The save that noticed it goes ahead once the vault is back (cloud.js, commit).
  */
@@ -16,13 +17,33 @@ import { isGone, lock, pullLatest, setSyncStatus } from './cloud.js';
 import { deviceBackend, refreshDeviceStatus } from './device.js';
 import { files } from './files.js';
 import * as memory from './memory.js';
+import { companyName, movedWhere, providerName } from './places.js';
 import { DEMO, publish, state } from './store.js';
+import { switchVault } from './vaults.js';
 
 const NOT_ITS_FILES = 'your passwords, notes and folders come back, but not its files';
 
 /** What the dialog says, and the ways back it offers, for how the open vault went missing. */
 async function describe(err) {
   const backend = state.backend;
+  if (err.code === 'moved') {
+    // Moved away from another window or device: nothing more can be saved here.
+    const note = err.note || { to: '' };
+    const { where, when } = note.to ? movedWhere(note, state.provider) : { where: 'another place', when: '' };
+    const there = note.to && note.to !== state.provider && note.to !== 'local';
+    const next = there
+      ? 'Open it there to carry on, and make your last change again: it wasn’t saved.'
+      : note.to === 'local'
+        ? 'Open it on that device, under This device.'
+        : note.to === state.provider
+          ? `Lock, then sign in with the ${companyName(state.provider)} account it went to.`
+          : 'Lock, then open it in its new place.';
+    return {
+      title: 'Your vault was moved',
+      text: `Another window or device moved it to ${where}${when ? ` ${when}` : ''}, so nothing more can be saved here. ${next}`,
+      actions: there ? [{ id: `open:${note.to}`, label: `Open it in ${providerName(note.to)}`, primary: true, close: true }] : [],
+    };
+  }
   if (backend.kind === 'local') {
     if (backend.where === 'browser') {
       return {
@@ -69,6 +90,10 @@ async function describe(err) {
 export async function recoverVault(err) {
   const choice = await ask('vaultGone', await describe(err));
   if (choice === 'back') return true;
+  if (String(choice).startsWith('open:')) {
+    switchVault(choice.slice(5)); // the change that noticed it wasn't saved: it says so, then the vault opens there
+    return false;
+  }
   if (choice === 'lock') lock('gone');
   return false; // "Not now": the next save asks again
 }

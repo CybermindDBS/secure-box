@@ -27,15 +27,16 @@ import {
 import { LocalError, allowFolder, createLocalBackend, findLocalVaults } from '../core/localstore.js';
 import { MicrosoftError, beginMicrosoftSignIn, reconnectMicrosoftWithPopup, takeMicrosoftRedirect } from '../core/microsoft.js';
 import { forgetStreams, startStreaming } from '../core/stream.js';
-import { VaultError, emptyVault, parseEnvelope } from '../core/vault.js';
+import { VaultError, emptyVault, movedNote, parseEnvelope } from '../core/vault.js';
 import { ask, confirmDialog, crossFade, reducedMotion, toast } from './bridge.js';
 import { driveFresh, ensureDrive, lock, noteActivity, setSyncStatus, startAutoLock } from './cloud.js';
-import { checkStrays, chooseDeviceWhere, deviceBackend, deviceBackendForSession, openDeviceVault, refreshDeviceStatus, relocateDevice, showMissingDevice } from './device.js';
+import { bringOver } from './bringover.js';
+import { checkStrays, chooseDeviceWhere, deviceBackend, deviceBackendForSession, deviceVaultGone, openDeviceVault, refreshDeviceStatus, relocateDevice, showMissingDevice } from './device.js';
 import { files } from './files.js';
 import { copyText, downloadFile } from './io.js';
 import * as memory from './memory.js';
 import { replaceNav } from './nav.js';
-import { PROVIDERS, backendFor, cipherFor, companyName, currentProvider, folderPath, isDevice, knownVaultsElsewhere, microsoftReady, placeOfVault, providerName, yourVault } from './places.js';
+import { PROVIDERS, backendFor, cipherFor, clientIdOf, cloudApp, companyName, currentProvider, folderPath, isDevice, knownVaultsElsewhere, microsoftReady, movedTo, placeOfVault, previousClientId, providerName, yourVault } from './places.js';
 import { pref } from './prefs.js';
 import { DEMO, pause, publish, state } from './store.js';
 import { tools } from './tools.js';
@@ -47,7 +48,7 @@ const LOCK_MESSAGES = {
   expired: 'Your session ended. Unlock to continue.',
   other: 'Locked from another Secure Box window.',
   deleted: 'Your vault on this device was deleted.',
-  moved: 'Your vault on this device moved in another window. Unlock to open it in its new place.',
+  moved: 'Your vault was moved in another window. Unlock to open it in its new place.',
   gone: 'Locked: your vault was deleted or moved while it was open.',
 };
 
@@ -79,9 +80,14 @@ export async function boot() {
 
   if (DEMO) {
     showWorking('Preparing the demo vault…');
-    state.backend = await createDemoBackend();
-    state.demoBackend = state.backend; // the demo's stand-in for the clouds
     const faults = new URLSearchParams(location.search).get('faults');
+    // ?demo&faults=newapp: Secure Box connects to the demo's cloud as a new app, so it finds
+    // nothing there; the sample vault is with its previous connection, to be brought over.
+    // oldgone: likewise, but that previous connection is gone (the download is the way back).
+    const newApp = /(^|,)\s*(newapp|oldgone)\s*(,|$)/.test(faults || '');
+    state.backend = await createDemoBackend({ empty: newApp });
+    if (newApp) state.demoPrevious = { backend: await createDemoBackend(), gone: /(^|,)\s*oldgone\s*(,|$)/.test(faults) };
+    state.demoBackend = state.backend; // the demo's stand-in for the clouds
     if (faults) (await import('./faults.js')).injectFaults(state.backend, faults);
     state.identity = state.backend.identity;
     state.provider = 'google';
@@ -192,10 +198,10 @@ async function describeForStream(fileId, options) {
   return null;
 }
 
-/** Encrypted bytes of a file being streamed, from whichever vault it belongs to. */
-function readForStream(driveId, start, end) {
-  const source = streamSources().find(({ vault }) => vault?.files.some((f) => f.driveId === driveId));
-  return (source?.backend || state.backend).readBytes(driveId, start, end);
+/** Encrypted bytes of a file being streamed (by its copy's name), from whichever vault it belongs to. */
+function readForStream(name, start, end) {
+  const source = streamSources().find(({ vault }) => vault?.files.some((f) => f.blob === name));
+  return (source?.backend || state.backend).readBytes(name, start, end);
 }
 
 // ===========================================================================
@@ -272,6 +278,7 @@ export function problemAction(action) {
     'signin-consent': () => signIn('consent', currentProvider()),
     'device-relocate': () => relocateDevice(),
     'show-welcome': () => showWelcome(),
+    'bring-over': () => bringOver(),
   }[action];
   return (run || retry)();
 }
@@ -287,10 +294,18 @@ export function useAuth(auth) {
   publish();
 }
 
-/** A cloud sign-in in a pop-up, while Secure Box stays unlocked (or on the card). Must come from a click. */
-export async function signInPopup(provider, { signal } = {}) {
-  if (provider === 'microsoft') return reconnectMicrosoftWithPopup({ clientId: state.config.microsoftClientId, loginHint: memory.readHint('microsoft'), signal });
-  return { ...(await reconnectWithPopup({ clientId: state.config.googleClientId, loginHint: memory.readHint('google'), signal })), provider: 'google' };
+/**
+ * A cloud sign-in in a pop-up, while Secure Box stays unlocked (or on the card). Must come from a
+ * click. `chooseAccount`: the account chooser, for an account other than the one used before;
+ * `loginHint`: the account to sign in again (by default the one used last here). `clientId`:
+ * through another of Secure Box's connections to that cloud (its previous one, bringover.js);
+ * `previous` ({ identity }): the Microsoft account it must be.
+ */
+export async function signInPopup(provider, { signal, chooseAccount = false, loginHint = memory.readHint(provider), expectedSub, clientId = clientIdOf(provider), previous } = {}) {
+  const prompt = chooseAccount ? 'select_account' : '';
+  const hint = chooseAccount ? '' : loginHint;
+  if (provider === 'microsoft') return reconnectMicrosoftWithPopup({ clientId, loginHint: hint, prompt, signal, previous });
+  return { ...(await reconnectWithPopup({ clientId, loginHint: hint, expectedSub, prompt, signal })), provider: 'google' };
 }
 
 // ===========================================================================
@@ -301,9 +316,32 @@ export async function openAccount() {
   try {
     state.loaded = await state.backend.load();
     state.keyringDoc = state.loaded.keyring ? parseKeyring(state.loaded.keyring) : null;
-    if (!state.keyringDoc && state.loaded.vault) showPanel('missing-keyring');
+    const note = state.loaded.vault && movedNote(state.loaded.vault.text);
+    // The vault moved away from here (from another device, say): where it went, and the way there.
+    if (note) showPanel('vault-moved', { to: note.to, at: note.at, text: movedTo(note, state.provider) });
+    else if (!state.keyringDoc && state.loaded.vault) showPanel('missing-keyring');
     // Nothing here, but the vault is in the Google Drive bin: it can come back as it was.
     else if (!state.keyringDoc && state.loaded.inBin) showPanel('vault-missing', { kind: 'bin' });
+    // A vault an earlier version of Secure Box made (Google Drive finds it apart, by its old tags).
+    else if (!state.keyringDoc && state.loaded.otherVersion === 'here') {
+      showError({
+        title: 'This vault is from another version',
+        message: `Your ${providerName()} has a vault made by another version of Secure Box, so this one can’t open it. To start over, move the “Secure Box” folder in your Google Drive to the bin, then try again.`,
+      });
+    }
+    // ...and that vault is in the bin now, put there to start over: a new vault can be made here.
+    else if (!state.keyringDoc && state.loaded.otherVersion === 'bin') {
+      memory.forgetCloudVault(state.provider, state.identity?.email);
+      showStart();
+    }
+    // Nothing here while Secure Box moves over from its previous connection to this cloud (a new
+    // Google project or Microsoft app sees nothing the old one made): the vault can be there.
+    else if (!state.keyringDoc && previousClientId(state.provider)) showPanel('vault-missing', { kind: 'previous', had: memory.hadCloudVault(state.provider, state.identity?.email) });
+    // Nothing here, and this browser last opened a vault here as another app: it's still there,
+    // out of this app's sight, and the cloud's own download is the way back.
+    else if (!state.keyringDoc && memory.hadCloudVault(state.provider, state.identity?.email) && ![cloudApp(state.provider), ''].includes(memory.cloudVaultApp(state.provider, state.identity?.email))) {
+      showPanel('vault-missing', { kind: 'app' });
+    }
     // Nothing here, but this account had a vault: it was deleted outside Secure Box.
     else if (!state.keyringDoc && memory.hadCloudVault(state.provider, state.identity?.email)) showPanel('vault-missing', { kind: 'cloud' });
     else if (!state.keyringDoc) showStart();
@@ -377,7 +415,7 @@ export async function openVault(master, { unlockedAt } = {}) {
     showPanel('missing-vault');
     return;
   }
-  const envelope = parseEnvelope(state.loaded.vault.text, cipher.format);
+  const envelope = parseEnvelope(state.loaded.vault.text);
   if (envelope.kid !== master.kid) throw new VaultError('wrong-key', 'Your vault and key ring belong to different keys. Restore the matching files from the trash (recycle bin) where they’re stored.');
   const vault = await cipher.open(envelope);
   enterApp({ master, cipher, vault, rev: state.loaded.vault.rev, unlockedAt });
@@ -642,7 +680,7 @@ export function handleError(err) {
     return showError({ title: err.code === 'drive-disabled' ? 'Turn on the Google Drive API' : 'Google Drive problem', message: err.message });
   }
   if (err instanceof LocalError && err.code === 'gone') return showMissingDevice(err.message);
-  if (err instanceof KeyringError && err.code === 'other-version') {
+  if ((err instanceof KeyringError || err instanceof VaultError) && err.code === 'other-version') {
     const startOver = isDevice()
       ? 'You can delete it below and start over.'
       : state.provider === 'microsoft'
@@ -678,7 +716,7 @@ export function enterApp({ master, cipher, vault, rev, unlockedAt = Date.now() }
   state.masters = new Map([[master.kid, { master, keyringDoc: state.keyringDoc }]]);
   state.kids = { ...state.kids, [state.provider]: master.kid };
   if (isDevice()) memory.rememberDeviceChoice({ kid: master.kid, where: state.backend.where });
-  else memory.rememberCloudVault(state.provider, state.identity?.email, master.kid);
+  else memory.rememberCloudVault(state.provider, state.identity?.email, master.kid, cloudApp(state.provider));
   memory.rememberProvider(state.provider);
   // The tab: back to the tools if they asked for the unlock (or you were there), else the
   // vault's tab you used last.
@@ -696,6 +734,7 @@ export function enterApp({ master, cipher, vault, rev, unlockedAt = Date.now() }
   publish();
   if (fromTools) tools.afterUnlock(); // a message waiting to be read opens now
   files.vaultChanged(); // and encrypted copies still to delete from earlier get another try
+  files.checkCopies(); // and ones deleted outside Secure Box are marked
   // Every copy of the key ring this device can reach goes to the newest revision.
   verifyRevision(state.keyringDoc, master)
     .then((revision) => {
@@ -781,8 +820,9 @@ export async function switchVault(provider) {
   }
   beginSwitching(provider);
   let opened = false;
+  let backend = null;
+  let goneHere = null; // this device's vault turned out deleted or moved outside Secure Box
   try {
-    let backend;
     let auth = null;
     if (provider === 'local') {
       setSwitchStep('find');
@@ -804,6 +844,9 @@ export async function switchVault(provider) {
     setSwitchStep('load');
     const loaded = await backend.load();
     let doc = loaded.keyring ? parseKeyring(loaded.keyring) : null;
+    // The vault that was here moved away: a new one can take its place (backend.create clears the note).
+    const note = loaded.vault && movedNote(loaded.vault.text);
+    if (note) loaded.vault = null;
     if (!doc && loaded.vault) {
       // Every vault keeps its key ring beside it, so this one's was deleted.
       throw new Error(
@@ -830,18 +873,21 @@ export async function switchVault(provider) {
         }
       }
     }
-    const cipher = await cipherFor(entry.master, backend);
+    const cipher = await cipherFor(entry.master);
     let vault;
     let rev;
     if (!doc) {
       // Nothing there yet: set up a vault with the same master password.
       const ok = await confirmDialog({
-        title: `Set up ${providerName(provider)}?`,
-        message:
+        title: note ? `Your vault isn’t in ${DEMO ? 'the demo vault' : providerName(provider)} any more` : `Set up ${providerName(provider)}?`,
+        message: [
+          note ? `It was ${movedTo(note, provider)}.` : '',
           provider === 'local'
             ? 'Your vault on this device starts empty and opens with your current master password and Emergency Kit. Nothing in it is uploaded.'
-            : `Your new ${providerName(provider)} vault starts empty and opens with your current master password and Emergency Kit.`,
-        confirmLabel: 'Set it up',
+            : `${note ? 'A new' : 'Your new'} ${DEMO ? 'demo' : providerName(provider)} vault starts empty and opens with your current master password and Emergency Kit.`,
+        ].filter(Boolean).join(' '),
+        confirmLabel: note ? 'Set up a new vault' : 'Set it up',
+        cancelLabel: note ? 'Not now' : undefined,
       });
       if (!ok) return;
       setSwitchStep('create');
@@ -853,7 +899,7 @@ export async function switchVault(provider) {
       doc = await syncKeyring(doc, backend, entry);
       if (loaded.vault) {
         setSwitchStep('decrypt');
-        const env = parseEnvelope(loaded.vault.text, cipher.format);
+        const env = parseEnvelope(loaded.vault.text);
         vault = await cipher.open(env);
         rev = loaded.vault.rev;
       } else {
@@ -874,15 +920,18 @@ export async function switchVault(provider) {
     toast(`Opened ${yourVault(provider)}`);
   } catch (err) {
     console.error(err);
-    if (err?.code === 'popup-closed') toast(`The ${companyName(provider)} sign-in window was closed. ${yourVault(state.provider).replace(/^y/, 'Y')} stays open.`);
+    if (provider === 'local' && err?.code === 'gone') goneHere = Object.assign(err, { kid: err.kid || backend?.kid || '', where: err.where || backend?.where || 'browser' });
+    else if (err?.code === 'popup-closed') toast(`The ${companyName(provider)} sign-in window was closed. ${yourVault(state.provider).replace(/^y/, 'Y')} stays open.`);
     else if (err?.code !== 'cancelled') toast(err.message || 'Couldn’t open that vault.', 'error');
   } finally {
     if (!opened) await returnToOpenVault();
   }
+  // Asked once the open vault is back in view: the ways on, then this device's vault opens.
+  if (goneHere && (await deviceVaultGone(goneHere).catch((err) => toast(err.message, 'error')))) await switchVault('local');
 }
 
 /** Makes another vault the open one, without a reload. `master` is its master key. */
-function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev, master = state.master }) {
+export function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev, master = state.master }) {
   if (state.backend !== backend) rememberLeftVault(); // its downloads keep going
   if (auth) {
     state.auths = { ...state.auths, [provider]: auth };
@@ -899,7 +948,7 @@ function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev, m
   state.revealed = new Set();
   memory.rememberProvider(provider);
   if (provider === 'local') memory.rememberDeviceChoice({ kid: master.kid, where: backend.where });
-  else memory.rememberCloudVault(provider, state.identity?.email, master.kid);
+  else memory.rememberCloudVault(provider, state.identity?.email, master.kid, cloudApp(provider));
   forgetStreams();
   files.reset();
   files.clearTransfers();
@@ -908,6 +957,7 @@ function enterVault({ provider, backend, auth, keyringDoc, cipher, vault, rev, m
   setSyncStatus('idle');
   refreshDeviceStatus();
   if (provider === 'local') checkStrays();
+  files.checkCopies();
 }
 
 /** A vault with its own key ring: its master password (or recovery key), asked in place. Null if cancelled. */

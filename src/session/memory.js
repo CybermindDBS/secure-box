@@ -13,7 +13,7 @@ const KEYS = {
   backups: `${ns}deviceBackupAt`, // { kid: time } of the last backup of this device's vault
   lockedAt: `${ns}lockedAt`, // last lock in any window
   keyrings: `${ns}keyrings`, // { kid: { revision, changedAt } }: when a master password last changed (#19)
-  cloudVaults: `${ns}cloudVaults`, // { 'google:you@example.com': kid }: cloud accounts that had a vault
+  cloudVaults: `${ns}cloudVaults`, // { 'google:you@example.com': { kid, app } }: cloud accounts that had a vault
   hint: (provider) => `secure-box.loginHint.${provider === 'microsoft' ? 'microsoft' : 'google'}`,
   // Per tab (sessionStorage):
   lockReason: 'secure-box.lockReason',
@@ -61,13 +61,17 @@ export function forgetDeviceChoice(kid) {
   if (deviceChoice()?.kid === kid) write(localStorage, KEYS.device, null);
 }
 
-// Cloud accounts that had a vault opened here: finding nothing there later means it was deleted.
+// Cloud accounts that had a vault opened here: finding nothing there later means it was deleted,
+// or that Secure Box now connects to that cloud as another app (`app`, places.js cloudApp),
+// which sees nothing the one before it made.
 const cloudKey = (provider, email) => `${provider}:${String(email || '').toLowerCase()}`;
-export function rememberCloudVault(provider, email, kid) {
+export function rememberCloudVault(provider, email, kid, app = '') {
   if (!email || provider === 'local') return;
-  write(localStorage, KEYS.cloudVaults, { ...readJson(localStorage, KEYS.cloudVaults, {}), [cloudKey(provider, email)]: kid });
+  write(localStorage, KEYS.cloudVaults, { ...readJson(localStorage, KEYS.cloudVaults, {}), [cloudKey(provider, email)]: { kid, app } });
 }
 export const hadCloudVault = (provider, email) => Boolean(email && readJson(localStorage, KEYS.cloudVaults, {})[cloudKey(provider, email)]);
+/** The app Secure Box connected to that cloud as when this browser last opened the vault there ('' if unknown). */
+export const cloudVaultApp = (provider, email) => String((email && readJson(localStorage, KEYS.cloudVaults, {})[cloudKey(provider, email)]?.app) || '');
 export function forgetCloudVault(provider, email) {
   const all = readJson(localStorage, KEYS.cloudVaults, {});
   delete all[cloudKey(provider, email)];

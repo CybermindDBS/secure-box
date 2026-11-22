@@ -8,6 +8,17 @@ import { createStore } from './store.js';
 // Toasts
 // ---------------------------------------------------------------------------
 export const toasts = createStore([]);
+
+/**
+ * A part of Secure Box loaded only when first needed. If Secure Box was updated since this page
+ * opened, that part's old file is gone from the site: say so plainly, rather than "failed to fetch".
+ */
+export function loadPart(importer) {
+  return importer().catch((err) => {
+    console.error(err);
+    throw new Error('Secure Box was updated while this page was open. Reload the page, then try again.');
+  });
+}
 let toastId = 0;
 
 export function toast(message, tone = 'info') {

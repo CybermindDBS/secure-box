@@ -179,7 +179,7 @@ export async function refreshMicrosoft(clientId, auth) {
 }
 
 /** Must be called straight from a click (pop-up blockers). Resolves with fresh tokens. */
-export function reconnectMicrosoftWithPopup({ clientId, loginHint, previous, signal }) {
+export function reconnectMicrosoftWithPopup({ clientId, loginHint, previous, prompt = '', signal }) {
   // Opened first and pointed at Microsoft afterwards, so the click still counts.
   const popup = window.open('', 'unibox-microsoft', 'popup=yes,width=500,height=680');
   if (!popup) return Promise.reject(new MicrosoftError('popup-blocked', 'Your browser blocked the Microsoft window. Allow pop-ups for this site and try again.'));
@@ -217,7 +217,7 @@ export function reconnectMicrosoftWithPopup({ clientId, loginHint, previous, sig
     };
     challengeFor(verifier).then(
       (challenge) => {
-        popup.location.href = authorizeUrl({ clientId, state, nonce, challenge, loginHint });
+        popup.location.href = authorizeUrl({ clientId, state, nonce, challenge, loginHint, prompt });
       },
       (err) => finish(reject, err),
     );
@@ -472,6 +472,31 @@ export class OneDrive {
   async remove(id) {
     await this.call(`/me/drive/items/${encodeURIComponent(id)}`, { method: 'DELETE' }, { okStatuses: [404] }); // to OneDrive's recycle bin
     this.urls.delete(id);
+  }
+
+  /** Free space in this OneDrive, in bytes, or null when OneDrive doesn't say. */
+  async freeSpace() {
+    const { quota } = await this.json('/me/drive?$select=quota');
+    return Number.isFinite(quota?.remaining) ? quota.remaining : null;
+  }
+
+  /** A file by its path inside Secure Box's folder ("Encrypted files/<name>"): { id, size }, or null if there's none. */
+  async fileAt(path) {
+    const res = await this.call(`${APP_ROOT}:/${path.split('/').map(encodeURIComponent).join('/')}?$select=id,size,file`, {}, { okStatuses: [404] });
+    if (res.status === 404) return null;
+    const item = await res.json();
+    return item.file ? { id: item.id, size: Number(item.size) || 0 } : null;
+  }
+
+  /** The files in a folder (by its id): [{ id, name, size }], every page of them. */
+  async listFolder(id) {
+    const out = [];
+    for (let next = `/me/drive/items/${encodeURIComponent(id)}/children?$select=id,name,size,file&$top=200`; next; ) {
+      const page = await this.json(next);
+      out.push(...(page.value || []).filter((i) => i.file).map((i) => ({ id: i.id, name: i.name, size: Number(i.size) || 0 })));
+      next = page['@odata.nextLink'] || '';
+    }
+    return out;
   }
 
   /**
