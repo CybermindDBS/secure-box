@@ -182,6 +182,16 @@ export function mergeVaults(base, incoming) {
   const became = new Map(); // an incoming folder's id -> the id of the folder it's now part of
   const placeOf = (id) => (id ? (became.get(id) ?? (folders.has(id) ? id : null)) : null);
   const fromIncoming = new Set();
+  // A folder by where it is and its name, to find one with the same name in the same place.
+  const spot = (parent, name) => `${parent ?? ''}/${name.toLowerCase()}`;
+  const bySpot = new Map();
+  for (const f of folders.values()) if (!bySpot.has(spot(f.parent, f.name))) bySpot.set(spot(f.parent, f.name), f.id);
+  const setFolder = (f) => {
+    const before = folders.get(f.id);
+    if (before && bySpot.get(spot(before.parent, before.name)) === f.id) bySpot.delete(spot(before.parent, before.name));
+    folders.set(f.id, f);
+    if (!bySpot.has(spot(f.parent, f.name))) bySpot.set(spot(f.parent, f.name), f.id);
+  };
   const pending = new Map(incoming.folders.map((f) => [f.id, f]));
   const visit = (f) => {
     pending.delete(f.id);
@@ -191,17 +201,17 @@ export function mergeVaults(base, incoming) {
     if (have) {
       became.set(f.id, f.id);
       if (changedLater(have, f)) {
-        folders.set(f.id, { ...f, parent });
+        setFolder({ ...f, parent });
         fromIncoming.add(f.id);
       }
       return;
     }
-    const twin = [...folders.values()].find((g) => (g.parent ?? null) === parent && g.name.toLowerCase() === f.name.toLowerCase());
+    const twin = bySpot.get(spot(parent, f.name));
     if (twin) {
-      became.set(f.id, twin.id);
+      became.set(f.id, twin);
       return;
     }
-    folders.set(f.id, { ...f, parent });
+    setFolder({ ...f, parent });
     became.set(f.id, f.id);
     fromIncoming.add(f.id);
   };
@@ -217,13 +227,16 @@ export function mergeVaults(base, incoming) {
 
   // What came in keeps clear of the names already beside it.
   const rename = (list, keyOf, isFolder) => {
-    const taken = new Map();
-    for (const x of list) if (!fromIncoming.has(x.id)) (taken.get(keyOf(x)) || taken.set(keyOf(x), []).get(keyOf(x))).push(x.name);
+    const taken = new Map(); // where -> the names there, lowercased
+    const counters = new Map(); // where -> how far each name's numbering got
+    const namesAt = (x) => taken.get(keyOf(x)) || taken.set(keyOf(x), new Set()).get(keyOf(x));
+    for (const x of list) if (!fromIncoming.has(x.id)) namesAt(x).add(x.name.toLowerCase());
     for (const x of list) {
       if (!fromIncoming.has(x.id)) continue;
-      const names = taken.get(keyOf(x)) || taken.set(keyOf(x), []).get(keyOf(x));
-      x.name = uniqueName(x.name, names, { isFolder });
-      names.push(x.name);
+      const names = namesAt(x);
+      const numbering = counters.get(keyOf(x)) || counters.set(keyOf(x), new Map()).get(keyOf(x));
+      x.name = uniqueNameWhere(x.name, (lower) => names.has(lower), { isFolder, counters: numbering });
+      names.add(x.name.toLowerCase());
     }
   };
   const folderList = [...folders.values()];
@@ -372,140 +385,344 @@ export function makeFileEntry(fields, previous = null) {
 /** "Report.pdf" -> "Report (2).pdf" when the name is already taken in that folder. */
 export function uniqueName(name, takenNames, { isFolder = false } = {}) {
   const taken = new Set([...takenNames].map((n) => n.toLowerCase()));
-  if (!taken.has(name.toLowerCase())) return name;
+  return uniqueNameWhere(name, (lower) => taken.has(lower), { isFolder });
+}
+
+/**
+ * uniqueName, asking `isTaken(lowercased name)` instead of going through a list of names.
+ * `counters` (a Map, for one folder) remembers where the numbering of each name got to, so
+ * thousands of files with one name don't each count up from 2 again. Every number up to where
+ * it got to must stay taken: forget the counters when a name leaves that folder.
+ */
+export function uniqueNameWhere(name, isTaken, { isFolder = false, counters = null } = {}) {
+  if (!isTaken(name.toLowerCase())) return name;
   const dot = isFolder ? -1 : name.lastIndexOf('.');
   const base = dot > 0 ? name.slice(0, dot) : name;
   const ext = dot > 0 ? name.slice(dot) : '';
-  for (let n = 2; ; n++) {
+  const key = `${base}\u0000${ext}`.toLowerCase();
+  for (let n = (counters?.get(key) ?? 1) + 1; ; n++) {
     const candidate = `${base} (${n})${ext}`;
-    if (!taken.has(candidate.toLowerCase())) return candidate;
+    if (!isTaken(candidate.toLowerCase())) {
+      counters?.set(key, n);
+      return candidate;
+    }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Finding things in a big vault
+// ---------------------------------------------------------------------------
+// A vault is never changed in place (each change makes a new one), so what's worked out about one
+// holds for as long as it's around: its files and folders by id, what each folder holds, and how
+// much is inside each folder at any depth. It's worked out once, the first time it's needed, so
+// thousands of files cost one pass instead of one pass per question.
+const indexes = new WeakMap();
+const NONE = Object.freeze([]);
+
+function listIn(map, key, value) {
+  const list = map.get(key);
+  if (list) list.push(value);
+  else map.set(key, [value]);
+}
+
+/**
+ * { files, folders } (Maps by id), foldersIn(id) and filesIn(id) (what a folder holds directly;
+ * null: the top level), and totals(id) = { folders, files, bytes } inside a folder at any depth.
+ */
+export function vaultIndex(vault) {
+  let index = indexes.get(vault);
+  if (index) return index;
+  const files = new Map();
+  const folders = new Map();
+  const foldersAt = new Map();
+  const filesAt = new Map();
+  for (const f of vault.folders) {
+    if (folders.has(f.id)) continue;
+    folders.set(f.id, f);
+    listIn(foldersAt, f.parent ?? null, f);
+  }
+  for (const f of vault.files) {
+    if (files.has(f.id)) continue;
+    files.set(f.id, f);
+    listIn(filesAt, f.folder ?? null, f);
+  }
+  const foldersIn = (id) => foldersAt.get(id ?? null) || NONE;
+  const filesIn = (id) => filesAt.get(id ?? null) || NONE;
+  /** Folder `id` and every folder inside it, at any depth, each once, with their files. */
+  const walk = (id) => {
+    const folderIds = [id];
+    const inside = [];
+    if (!id) return { folderIds, files: inside };
+    const seen = new Set(folderIds);
+    for (let i = 0; i < folderIds.length; i++) {
+      inside.push(...filesIn(folderIds[i]));
+      for (const sub of foldersIn(folderIds[i])) {
+        if (seen.has(sub.id)) continue;
+        seen.add(sub.id);
+        folderIds.push(sub.id);
+      }
+    }
+    return { folderIds, files: inside };
+  };
+  const sums = new Map();
+  const totals = (id) => {
+    let sum = sums.get(id);
+    if (!sum) {
+      const tree = walk(id);
+      sum = { folders: tree.folderIds.length - 1, files: tree.files.length, bytes: tree.files.reduce((n, f) => n + f.size, 0) };
+      sums.set(id, sum);
+    }
+    return sum;
+  };
+  index = { files, folders, foldersIn, filesIn, totals, walk };
+  indexes.set(vault, index);
+  return index;
 }
 
 /** Folders from the top level down to `folderId` (inclusive). */
 export function folderChain(vault, folderId) {
-  const byId = new Map(vault.folders.map((f) => [f.id, f]));
+  const { folders } = vaultIndex(vault);
   const chain = [];
-  for (let cursor = folderId; cursor && byId.has(cursor); cursor = byId.get(cursor).parent) {
-    chain.unshift(byId.get(cursor));
+  for (let cursor = folderId; cursor && folders.has(cursor); cursor = folders.get(cursor).parent) {
+    chain.unshift(folders.get(cursor));
     if (chain.length > 256) break;
   }
   return chain;
 }
 
 /** Every folder and file inside `folderId`, at any depth (the folder itself included). */
-export function collectTree(vault, folderId) {
-  const folderIds = new Set([folderId]);
-  let grew = true;
-  while (grew) {
-    grew = false;
-    for (const f of vault.folders) {
-      if (f.parent && folderIds.has(f.parent) && !folderIds.has(f.id)) {
-        folderIds.add(f.id);
-        grew = true;
-      }
-    }
-  }
-  const files = vault.files.filter((f) => f.folder && folderIds.has(f.folder));
-  return { folderIds: [...folderIds], files };
-}
+export const collectTree = (vault, folderId) => vaultIndex(vault).walk(folderId);
 
 /** The names of the encrypted copies the vault's files use. */
 export const copiesInUse = (vault) => new Set(vault.files.map((f) => f.blob));
-
-/** A copy a file uses again (a restore, a change from elsewhere) comes off the list of copies to delete. */
-const keepCopy = (vault, name) => (vault.trash?.includes(name) ? { ...vault, trash: vault.trash.filter((n) => n !== name) } : vault);
 
 /**
  * Changes are replayed on top of the latest stored vault when another device saved first, so a
  * change to something already there names only what changed ('item-update', 'file-update',
  * 'folder-update'): it applies to that thing as it is now, never to a copy of it from before.
+ * A batch (thousands of files uploaded or moved at once) is applied in one pass: each change in
+ * it finds what it needs by id and by name instead of going through the whole vault again.
  */
 export function applyChange(vault, change) {
-  switch (change.op) {
-    case 'put':
-      return { ...vault, items: vault.items.filter((it) => it.id !== change.item.id).concat(change.item) };
-    case 'item-update': {
-      // The fields that were edited (`fields`), over another device's edits to the others meanwhile.
-      // Deleted elsewhere meanwhile: the edited item (`item`) comes back, so nothing typed is lost.
-      const current = vault.items.find((it) => it.id === change.item.id);
-      if (!current) return { ...vault, items: vault.items.concat(change.item) };
-      const item = cleanItem({ ...current, ...change.fields, updated: change.item.updated });
-      return { ...vault, items: vault.items.map((it) => (it.id === item.id ? item : it)) };
+  const draft = new Draft(vault);
+  draft.apply(change);
+  return draft.result();
+}
+
+/**
+ * Keeps how many things in each folder have each name (lowercased): parent -> name -> count. A
+ * name leaving a folder makes its numbering counters (uniqueNameWhere) start over.
+ */
+function countName(counts, key, name, by, counters) {
+  let names = counts.get(key);
+  if (!names) counts.set(key, (names = new Map()));
+  const lower = name.toLowerCase();
+  const n = (names.get(lower) || 0) + by;
+  if (n > 0) names.set(lower, n);
+  else names.delete(lower);
+  if (by < 0) counters?.delete(key);
+}
+
+/** A vault being changed: what a change touches is copied once, changed in place, and put back at the end. */
+class Draft {
+  constructor(vault) {
+    this.vault = vault;
+    this.touched = new Set(); // 'items' | 'folders' | 'files' | 'trash'
+  }
+
+  /** id -> thing, in the vault's order (the first of any repeated id). */
+  byId(kind) {
+    const key = `_${kind}`;
+    if (!this[key]) {
+      const map = new Map();
+      for (const x of this.vault[kind]) if (!map.has(x.id)) map.set(x.id, x);
+      this[key] = map;
     }
-    case 'delete':
-      return { ...vault, items: vault.items.filter((it) => it.id !== change.id) };
-    case 'folder-put':
-      return { ...vault, folders: vault.folders.filter((f) => f.id !== change.folder.id).concat(change.folder) };
-    case 'folder-update': {
-      // A rename or move. One deleted meanwhile stays deleted; one moved into a folder deleted
-      // meanwhile goes to the top; a move into itself (after another move meanwhile) is left out.
-      const current = vault.folders.find((f) => f.id === change.id);
-      if (!current) return vault;
-      const fields = { ...change.fields };
-      if (fields.parent && !vault.folders.some((f) => f.id === fields.parent)) fields.parent = null;
-      if (fields.parent && collectTree(vault, current.id).folderIds.includes(fields.parent)) return vault;
-      if ('name' in fields || 'parent' in fields) {
-        const parent = 'parent' in fields ? fields.parent : current.parent;
-        fields.name = uniqueName(fields.name ?? current.name, vault.folders.filter((f) => f.parent === parent && f.id !== current.id).map((f) => f.name), { isFolder: true });
+    return this[key];
+  }
+
+  /** Name counts per folder for `kind` ('folders' by parent, 'files' by folder), made when first needed. */
+  names(kind) {
+    const key = `_${kind}Names`;
+    if (!this[key]) {
+      const counts = new Map();
+      for (const x of this.byId(kind).values()) countName(counts, placeOf(kind, x), x.name, 1);
+      this[key] = counts;
+    }
+    return this[key];
+  }
+
+  /** Puts `next` where `previous` (if any) was, or at the end, keeping the name counts right. */
+  place(kind, previous, next, { last = false } = {}) {
+    const map = this.byId(kind);
+    const counts = this[`_${kind}Names`];
+    if (previous) {
+      if (counts) countName(counts, placeOf(kind, previous), previous.name, -1, this.counters(kind));
+      if (last) map.delete(previous.id);
+    }
+    map.set(next.id, next);
+    if (counts) countName(counts, placeOf(kind, next), next.name, 1);
+    this.touched.add(kind);
+  }
+
+  drop(kind, id) {
+    const map = this.byId(kind);
+    const previous = map.get(id);
+    if (!previous) return;
+    const counts = this[`_${kind}Names`];
+    if (counts) countName(counts, placeOf(kind, previous), previous.name, -1, this.counters(kind));
+    map.delete(id);
+    this.touched.add(kind);
+  }
+
+  /** Where the numbering of names got to, per folder (uniqueNameWhere): parent -> name -> number. */
+  counters(kind) {
+    return (this[`_${kind}Counters`] ??= new Map());
+  }
+
+  /** `name`, or "name (2)" and so on, kept apart from the others at `where` (`self` aside). */
+  freeName(kind, name, where, self) {
+    const at = where ?? null;
+    const here = this.names(kind).get(at);
+    const mine = placeOf(kind, self) === at ? self.name.toLowerCase() : null;
+    // Counting on from where the numbering got to holds only while every number up to it is
+    // taken: not when the name being changed is one of them.
+    const all = this.counters(kind);
+    const counters = mine ? null : all.get(at) || all.set(at, new Map()).get(at);
+    return uniqueNameWhere(name, (lower) => (here?.get(lower) || 0) - (lower === mine ? 1 : 0) > 0, { isFolder: kind === 'folders', counters });
+  }
+
+  /** Is folder `id` inside folder `root` at any depth (or `root` itself)? */
+  inside(id, root) {
+    const folders = this.byId('folders');
+    for (let cursor = id, steps = 0; cursor && steps <= folders.size; cursor = folders.get(cursor)?.parent, steps++) {
+      if (cursor === root) return true;
+    }
+    return false;
+  }
+
+  /** The list of copies to delete, as a Set; null when the vault has none and `create` is false. */
+  trash(create = false) {
+    if (!this._trash && (create || this.vault.trash)) this._trash = new Set(this.vault.trash || []);
+    return this._trash || null;
+  }
+
+  /** A copy a file uses again (a restore, a change from elsewhere) comes off the list of copies to delete. */
+  keepCopy(name) {
+    const trash = this.trash();
+    if (trash?.delete(name)) this.touched.add('trash');
+  }
+
+  apply(change) {
+    switch (change.op) {
+      case 'put': {
+        const items = this.byId('items');
+        this.place('items', items.get(change.item.id), change.item, { last: true });
+        return;
       }
-      const folder = cleanFolder({ ...current, ...fields });
-      return { ...vault, folders: vault.folders.map((f) => (f.id === folder.id ? folder : f)) };
-    }
-    case 'file-put': {
-      // A folder deleted meanwhile (in another window or device): the file lands in All files.
-      const lost = change.file.folder && !vault.folders.some((f) => f.id === change.file.folder);
-      const file = lost ? { ...change.file, folder: null } : change.file;
-      return keepCopy({ ...vault, files: vault.files.filter((f) => f.id !== file.id).concat(file) }, file.blob);
-    }
-    case 'file-update': {
-      // A rename, a move, or a saved edit (a new encrypted copy). One deleted meanwhile stays
-      // deleted, unless the change brings the whole file back (`orAdd`: a saved edit, so what was
-      // typed isn't lost). `ifBlob`: only while its copy is still that one, so an edit saved
-      // elsewhere meanwhile is never replaced (the editor then asks what to do).
-      const current = vault.files.find((f) => f.id === change.id);
-      if (!current) return change.orAdd ? applyChange(vault, { op: 'file-put', file: change.orAdd }) : vault;
-      if (change.ifBlob && current.blob !== change.ifBlob) return vault;
-      const fields = { ...change.fields };
-      if (fields.folder && !vault.folders.some((f) => f.id === fields.folder)) fields.folder = null;
-      if ('name' in fields || 'folder' in fields) {
-        const folder = 'folder' in fields ? fields.folder : current.folder;
-        fields.name = uniqueName(fields.name ?? current.name, vault.files.filter((f) => f.folder === folder && f.id !== current.id).map((f) => f.name));
+      case 'item-update': {
+        // The fields that were edited (`fields`), over another device's edits to the others meanwhile.
+        // Deleted elsewhere meanwhile: the edited item (`item`) comes back, so nothing typed is lost.
+        const current = this.byId('items').get(change.item.id);
+        if (!current) return this.place('items', null, change.item);
+        return this.place('items', current, cleanItem({ ...current, ...change.fields, updated: change.item.updated }));
       }
-      const file = cleanFile({ ...current, ...fields });
-      return keepCopy({ ...vault, files: vault.files.map((f) => (f.id === file.id ? file : f)) }, file.blob);
+      case 'delete':
+        return this.drop('items', change.id);
+      case 'folder-put':
+        return this.place('folders', this.byId('folders').get(change.folder.id), change.folder, { last: true });
+      case 'folder-update': {
+        // A rename or move. One deleted meanwhile stays deleted; one moved into a folder deleted
+        // meanwhile goes to the top; a move into itself (after another move meanwhile) is left out.
+        const folders = this.byId('folders');
+        const current = folders.get(change.id);
+        if (!current) return;
+        const fields = { ...change.fields };
+        if (fields.parent && !folders.has(fields.parent)) fields.parent = null;
+        if (fields.parent && this.inside(fields.parent, current.id)) return;
+        if ('name' in fields || 'parent' in fields) {
+          const parent = 'parent' in fields ? fields.parent : current.parent;
+          fields.name = this.freeName('folders', fields.name ?? current.name, parent, current);
+        }
+        return this.place('folders', current, cleanFolder({ ...current, ...fields }));
+      }
+      case 'file-put': {
+        // A folder deleted meanwhile (in another window or device): the file lands in All files.
+        const lost = change.file.folder && !this.byId('folders').has(change.file.folder);
+        const file = lost ? { ...change.file, folder: null } : change.file;
+        this.place('files', this.byId('files').get(file.id), file, { last: true });
+        return this.keepCopy(file.blob);
+      }
+      case 'file-update': {
+        // A rename, a move, or a saved edit (a new encrypted copy). One deleted meanwhile stays
+        // deleted, unless the change brings the whole file back (`orAdd`: a saved edit, so what was
+        // typed isn't lost). `ifBlob`: only while its copy is still that one, so an edit saved
+        // elsewhere meanwhile is never replaced (the editor then asks what to do).
+        const current = this.byId('files').get(change.id);
+        if (!current) return change.orAdd ? this.apply({ op: 'file-put', file: change.orAdd }) : undefined;
+        if (change.ifBlob && current.blob !== change.ifBlob) return;
+        const fields = { ...change.fields };
+        if (fields.folder && !this.byId('folders').has(fields.folder)) fields.folder = null;
+        if ('name' in fields || 'folder' in fields) {
+          const folder = 'folder' in fields ? fields.folder : current.folder;
+          fields.name = this.freeName('files', fields.name ?? current.name, folder, current);
+        }
+        const file = cleanFile({ ...current, ...fields });
+        this.place('files', current, file);
+        return this.keepCopy(file.blob);
+      }
+      case 'remove':
+        for (const id of change.folders || []) this.drop('folders', id);
+        for (const id of change.files || []) this.drop('files', id);
+        this.touched.add('folders').add('files');
+        return;
+      case 'batch':
+        for (const next of change.changes) this.apply(next);
+        return;
+      // Encrypted copies that couldn't be deleted yet (offline, say), by name: kept here, inside the
+      // encrypted vault, and tried again on a later sync from any device.
+      case 'trash-add': {
+        const inUse = new Set([...this.byId('files').values()].map((f) => f.blob)); // never one a file uses (it may have come back meanwhile)
+        const trash = this.trash(true);
+        for (const name of change.names) if (!inUse.has(name)) trash.add(name);
+        this.touched.add('trash');
+        return;
+      }
+      case 'trash-done': {
+        const trash = this.trash(true);
+        for (const name of change.names) trash.delete(name);
+        this.touched.add('trash');
+        return;
+      }
+      case 'import': {
+        const items = this.byId('items');
+        const seen = new Set([...items.values()].map(fingerprint));
+        for (const it of change.items) {
+          const key = fingerprint(it);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          this.place('items', null, it);
+        }
+        this.touched.add('items');
+        return;
+      }
+      default:
+        throw new Error(`Unknown change: ${change.op}`);
     }
-    case 'remove': {
-      const folders = new Set(change.folders || []);
-      const files = new Set(change.files || []);
-      return { ...vault, folders: vault.folders.filter((f) => !folders.has(f.id)), files: vault.files.filter((f) => !files.has(f.id)) };
-    }
-    case 'batch':
-      return change.changes.reduce((acc, next) => applyChange(acc, next), vault);
-    // Encrypted copies that couldn't be deleted yet (offline, say), by name: kept here, inside the
-    // encrypted vault, and tried again on a later sync from any device.
-    case 'trash-add': {
-      const inUse = copiesInUse(vault); // never one a file uses (it may have come back meanwhile)
-      return { ...vault, trash: [...new Set([...(vault.trash || []), ...change.names.filter((name) => !inUse.has(name))])] };
-    }
-    case 'trash-done': {
-      const done = new Set(change.names);
-      return { ...vault, trash: (vault.trash || []).filter((name) => !done.has(name)) };
-    }
-    case 'import': {
-      const seen = new Set(vault.items.map(fingerprint));
-      const fresh = change.items.filter((it) => {
-        const key = fingerprint(it);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-      return { ...vault, items: vault.items.concat(fresh) };
-    }
-    default:
-      throw new Error(`Unknown change: ${change.op}`);
+  }
+
+  /** The changed vault: a new one when anything changed, with only what changed copied. */
+  result() {
+    if (!this.touched.size) return this.vault;
+    const next = { ...this.vault };
+    for (const kind of ['items', 'folders', 'files']) if (this.touched.has(kind)) next[kind] = [...this.byId(kind).values()];
+    if (this.touched.has('trash')) next.trash = [...this.trash(true)];
+    return next;
   }
 }
+
+/** Where a folder ('folders': its parent) or a file ('files': its folder) is; null at the top. */
+const placeOf = (kind, x) => (kind === 'folders' ? x.parent : kind === 'files' ? x.folder : null) ?? null;
 
 function parseLooseUrl(value) {
   if (!value) return null;

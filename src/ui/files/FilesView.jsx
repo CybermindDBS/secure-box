@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { formatBytes, kindOf, typeLabel } from '../../core/filetypes.js';
-import { fileUrl } from '../../core/stream.js';
 import {
   KIND_ICON,
   ROOT_NAME,
@@ -14,7 +13,6 @@ import {
   fileById,
   files,
   folderById,
-  folderStats,
   goUp,
   moveEntries,
   newFolder,
@@ -29,13 +27,15 @@ import {
   visibleEntries,
 } from '../../session/files.js';
 import { relativeTime } from '../../session/io.js';
+import { holdThumb, keptThumb, wantThumb } from '../../session/thumbs.js';
 import { setPref } from '../../session/prefs.js';
 import { state } from '../../session/store.js';
 import { openViewer } from '../../session/viewer.js';
+import { vaultIndex } from '../../core/vault.js';
 import { Icon, Spinner } from '../common/Icon.jsx';
 import { Menu, MenuItem } from '../common/Menu.jsx';
 import { Segmented } from '../common/Segmented.jsx';
-import { useNarrow, usePref, useSession, useStore } from '../hooks.js';
+import { useIncremental, useNarrow, usePref, useSession, useStore } from '../hooks.js';
 import { SwitchLoader, SyncStatus } from '../passwords/PasswordsView.jsx';
 import { run } from '../run.js';
 
@@ -210,7 +210,7 @@ function ViewOptions() {
       </button>
       <div ref={panel} id="view-options" className="view-options" popover="auto">
         <p className="view-options-title">View</p>
-        <label className="switch" title="Show thumbnails for photos and videos (they are decrypted only while shown)">
+        <label className="switch" title="Show thumbnails for photos and videos (decrypted in this browser and kept only in its memory, until you lock)">
           <input type="checkbox" checked={thumbnails} onChange={(e) => setPref('thumbnails', e.target.checked)} />
           <span className="switch-track" aria-hidden="true" />
           <span className="switch-label">Thumbnails</span>
@@ -287,9 +287,67 @@ function SelectionBar({ order }) {
 // ---------------------------------------------------------------------------
 // A file or folder
 // ---------------------------------------------------------------------------
+// One watcher for all the thumbnails in a list: tells each when it comes within half a screen of
+// view and when it leaves, so only those are loaded (session/thumbs.js).
+const nearWatchers = new WeakMap(); // the list that scrolls -> { observer, calls }
+function watchNear(el, onChange) {
+  const root = el.closest('.files-body');
+  let watcher = nearWatchers.get(root || document);
+  if (!watcher) {
+    const calls = new Map();
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) calls.get(entry.target)?.(entry.isIntersecting);
+    }, { root, rootMargin: '50% 0px' });
+    nearWatchers.set(root || document, (watcher = { observer, calls }));
+  }
+  watcher.calls.set(el, onChange);
+  watcher.observer.observe(el);
+  return () => {
+    watcher.calls.delete(el);
+    watcher.observer.unobserve(el);
+  };
+}
+
+/** A thumbnail for `entry` once it's near the view: { key, url } (url null: none to show). */
+function useThumb(entry, wanted, ref) {
+  const key = `${entry.id}:${entry.blob}`;
+  const [thumb, setThumb] = useState(() => ({ key, url: wanted ? keptThumb(entry) : null }));
+  useEffect(() => {
+    if (!wanted || typeof IntersectionObserver === 'undefined') return undefined;
+    let stopWatching = null;
+    let notWanted = null;
+    let letGo = null;
+    const show = (url) => {
+      stopWatching?.();
+      stopWatching = null;
+      letGo?.();
+      letGo = url ? holdThumb(entry) : null;
+      setThumb({ key, url, failed: !url });
+    };
+    const now = keptThumb(entry);
+    if (now) show(now);
+    else {
+      stopWatching = watchNear(ref.current, (near) => {
+        notWanted?.();
+        notWanted = near ? wantThumb(entry, show) : null;
+      });
+    }
+    return () => {
+      stopWatching?.();
+      notWanted?.();
+      letGo?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wanted, key]);
+  return thumb.key === key && wanted ? thumb : { key, url: null };
+}
+
 function Art({ entry, isFolder, size = 'lg', thumbnails, missing = false }) {
-  const [thumb, setThumb] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const ref = useRef(null);
+  const [loaded, setLoaded] = useState(false);
+  const [broken, setBroken] = useState(false);
+  const wanted = Boolean(!isFolder && thumbnails && entry.thumbBytes && state.streaming && !missing);
+  const thumb = useThumb(entry, wanted, ref);
   if (isFolder) {
     return (
       <span className={`file-art kind-folder art-${size}`}>
@@ -298,12 +356,11 @@ function Art({ entry, isFolder, size = 'lg', thumbnails, missing = false }) {
     );
   }
   const kind = kindOf(entry);
+  const url = broken ? null : thumb.url;
   return (
-    <span className={`file-art kind-${kind} art-${size}${thumb ? ' has-thumb' : ''}`}>
+    <span ref={ref} className={`file-art kind-${kind} art-${size}${url && loaded ? ' has-thumb' : ''}`}>
       <Icon name={KIND_ICON[kind]} size={size === 'lg' ? 34 : 18} />
-      {thumbnails && entry.thumbBytes && state.streaming && !failed && !missing ? (
-        <img src={fileUrl(entry.id, { thumb: true })} alt="" loading="lazy" decoding="async" draggable="false" onLoad={() => setThumb(true)} onError={() => setFailed(true)} />
-      ) : null}
+      {url ? <img src={url} alt="" decoding="async" draggable="false" onLoad={() => setLoaded(true)} onError={() => setBroken(true)} /> : null}
       {kind === 'video' && size === 'lg' && !missing ? (
         <span className="play-badge" aria-hidden="true">
           <Icon name="play" size={14} />
@@ -318,11 +375,15 @@ function Art({ entry, isFolder, size = 'lg', thumbnails, missing = false }) {
   );
 }
 
-function EntryCard({ entry, isFolder, layout, selected, focused, pending, added = false, missing = false, thumbnails, events }) {
+/**
+ * A card is drawn again only when what it shows changes (memo): choosing one of thousands redraws
+ * that one. A folder's counts come from FilesBody (`inside`, `filesInside`), as they change with
+ * what's in it rather than with the folder itself.
+ */
+const EntryCard = memo(function EntryCard({ entry, isFolder, layout, selected, focused, pending, added = false, missing = false, inside = 0, filesInside = 0, thumbnails, events }) {
   const [over, setOver] = useState(false);
-  const stats = isFolder ? folderStats(entry.id) : null;
   // A file whose encrypted copy is missing (deleted outside Secure Box) says so where its size was.
-  const meta = isFolder ? `${stats.files + stats.folders} ${stats.files + stats.folders === 1 ? 'item' : 'items'}` : missing ? 'Encrypted copy missing' : `${formatBytes(entry.size)} · ${relativeTime(entry.updated)}`;
+  const meta = isFolder ? `${inside} ${inside === 1 ? 'item' : 'items'}` : missing ? 'Encrypted copy missing' : `${formatBytes(entry.size)} · ${relativeTime(entry.updated)}`;
   const busyText = { deleting: 'Deleting…', moving: 'Moving…', renaming: 'Renaming…' }[pending];
   const common = {
     'data-id': entry.id,
@@ -399,13 +460,13 @@ function EntryCard({ entry, isFolder, layout, selected, focused, pending, added 
         {entry.name}
       </span>
       <span className="frow-kind">{isFolder ? 'Folder' : typeLabel(entry)}</span>
-      <span className="frow-size">{isFolder ? `${stats.files} ${stats.files === 1 ? 'file' : 'files'}` : missing ? 'Missing' : formatBytes(entry.size)}</span>
+      <span className="frow-size">{isFolder ? `${filesInside} ${filesInside === 1 ? 'file' : 'files'}` : missing ? 'Missing' : formatBytes(entry.size)}</span>
       <span className="frow-date">{relativeTime(entry.updated)}</span>
       {more}
       {loader}
     </div>
   );
-}
+});
 
 /** One menu for every card (its ⋯ button, or a right-click): open, download, rename, move, delete. */
 function ItemMenu({ menu, onClose, fileIds }) {
@@ -469,11 +530,16 @@ function ItemMenu({ menu, onClose, fileIds }) {
 // ---------------------------------------------------------------------------
 // The grid (or list): choosing like Google Drive (#13)
 // ---------------------------------------------------------------------------
-function FilesBody({ entries, layout, thumbnails, query, folder }) {
+// A folder of thousands is drawn a batch at a time as it's scrolled (useIncremental).
+const FIRST_CARDS = 120;
+const MORE_CARDS = 160;
+
+function FilesBody({ entries, layout, thumbnails, query, folder, sort }) {
   const selected = useStore(files.store, (v) => v.selected);
   const pending = useStore(files.store, (v) => v.pending);
   const added = useStore(files.store, (v) => v.added);
   const missing = useStore(files.store, (v) => v.missing);
+  const vault = useSession((s) => s.vault);
   const narrow = useNarrow();
   const bodyRef = useRef(null);
   const [focusId, setFocusId] = useState(null);
@@ -481,114 +547,136 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
   const [box, setBox] = useState(null); // a selection rectangle being drawn
   const press = useRef({ type: 'mouse', timer: 0, x: 0, y: 0, long: false });
   const order = useMemo(() => [...entries.folders.map((f) => f.id), ...entries.files.map((f) => f.id)], [entries]);
+  const places = useMemo(() => new Map(order.map((id, i) => [id, i])), [order]); // id -> where it is in the list
   const fileIds = useMemo(() => entries.files.map((f) => f.id), [entries]);
   const isFolderId = (id) => Boolean(folderById(id));
   const selecting = selected.size > 0;
+  // Another folder, search or order starts again from the first batch.
+  const { count, more, sentinel, reveal } = useIncremental(order.length, { key: `${folder}\u0000${query}\u0000${sort}`, first: FIRST_CARDS, step: MORE_CARDS });
+  const shownFolders = count < entries.folders.length ? entries.folders.slice(0, count) : entries.folders;
+  const shownFiles = entries.files.slice(0, Math.max(0, count - entries.folders.length));
+
+  // The handlers the cards share, made once: they read what they need when called, so a change
+  // (one more card chosen, say) doesn't redraw every card.
+  const latest = useRef(null);
+  latest.current = { selected, pending, selecting, order, places, fileIds };
 
   // Focus goes back to a card when the list changes under it.
   useEffect(() => {
-    if (focusId && !order.includes(focusId)) setFocusId(order[0] || null);
-  }, [order, focusId]);
+    if (focusId && !places.has(focusId)) setFocusId(order[0] || null);
+  }, [places, order, focusId]);
 
   // A folder just made: brought into view, and the keyboard goes on from it (it isn't chosen).
   useEffect(() => {
     if (!added) return;
     setFocusId(added);
+    if (places.has(added)) reveal(places.get(added));
     requestAnimationFrame(() => bodyRef.current?.querySelector(`[data-id="${CSS.escape(added)}"]`)?.scrollIntoView({ block: 'nearest' }));
-  }, [added]);
+  }, [added, places, reveal]);
 
-  const focusCard = (id) => {
-    setFocusId(id);
-    requestAnimationFrame(() => bodyRef.current?.querySelector(`[data-id="${CSS.escape(id)}"]`)?.focus({ preventScroll: false }));
-  };
+  const focusCard = useCallback(
+    (id) => {
+      setFocusId(id);
+      const at = latest.current.places.get(id);
+      if (at !== undefined) reveal(at); // drawn first, if it wasn't yet
+      requestAnimationFrame(() => bodyRef.current?.querySelector(`[data-id="${CSS.escape(id)}"]`)?.focus({ preventScroll: false }));
+    },
+    [reveal],
+  );
 
   /** How many cards fit on a row of the grid, to move up and down. */
   const columns = () => {
     if (layout !== 'grid') return 1;
-    const cards = [...(bodyRef.current?.querySelectorAll('[data-id]') || [])];
+    const cards = [...(bodyRef.current?.querySelectorAll('[data-id]') || [])].slice(0, 64);
     if (cards.length < 2) return 1;
     const top = cards[0].offsetTop;
     const n = cards.findIndex((c) => c.offsetTop !== top);
     return n < 0 ? cards.length : n;
   };
 
-  const events = {
-    pointerDown(event, entry) {
-      press.current.type = event.pointerType;
-      press.current.long = false;
-      if (!touchLike(event.pointerType)) return;
-      press.current.x = event.clientX;
-      press.current.y = event.clientY;
-      clearTimeout(press.current.timer);
-      // Long-press: start (or add to) choosing, like on a phone's file manager.
-      press.current.timer = setTimeout(() => {
-        press.current.long = true;
-        toggleSelected(entry.id);
-        navigator.vibrate?.(12);
-      }, 450);
-    },
-    pointerMove(event) {
-      if (!press.current.timer) return;
-      if (Math.hypot(event.clientX - press.current.x, event.clientY - press.current.y) > 10) {
+  const events = useMemo(
+    () => ({
+      pointerDown(event, entry) {
+        press.current.type = event.pointerType;
+        press.current.long = false;
+        if (!touchLike(event.pointerType)) return;
+        press.current.x = event.clientX;
+        press.current.y = event.clientY;
+        clearTimeout(press.current.timer);
+        // Long-press: start (or add to) choosing, like on a phone's file manager.
+        press.current.timer = setTimeout(() => {
+          press.current.long = true;
+          toggleSelected(entry.id);
+          navigator.vibrate?.(12);
+        }, 450);
+      },
+      pointerMove(event) {
+        if (!press.current.timer) return;
+        if (Math.hypot(event.clientX - press.current.x, event.clientY - press.current.y) > 10) {
+          clearTimeout(press.current.timer);
+          press.current.timer = 0;
+        }
+      },
+      pointerUp() {
         clearTimeout(press.current.timer);
         press.current.timer = 0;
-      }
-    },
-    pointerUp() {
-      clearTimeout(press.current.timer);
-      press.current.timer = 0;
-    },
-    click(event, entry, isFolder) {
-      if (pending.get(entry.id)) return;
-      setFocusId(entry.id);
-      if (touchLike(press.current.type)) {
-        if (press.current.long) {
-          press.current.long = false;
+      },
+      click(event, entry, isFolder) {
+        const { pending: busy, selecting: choosing, order: list, fileIds: ids } = latest.current;
+        if (busy.get(entry.id)) return;
+        setFocusId(entry.id);
+        if (touchLike(press.current.type)) {
+          if (press.current.long) {
+            press.current.long = false;
+            return;
+          }
+          // Choosing on a phone: taps add and remove; otherwise a tap opens.
+          if (choosing) toggleSelected(entry.id);
+          else openEntry(entry, isFolder, ids);
           return;
         }
-        // Choosing on a phone: taps add and remove; otherwise a tap opens.
-        if (selecting) toggleSelected(entry.id);
-        else openEntry(entry, isFolder, fileIds);
-        return;
-      }
-      // A mouse: a click opens, like a tap. Choosing is the checkbox's job, or Ctrl/⌘ and Shift's.
-      if (event.ctrlKey || event.metaKey) toggleSelected(entry.id);
-      else if (event.shiftKey) selectRange(entry.id, order);
-      else if (event.detail < 2) {
-        ignoreRestOfDoubleClick();
-        openEntry(entry, isFolder, fileIds);
-      }
-    },
-    contextMenu(event, entry, isFolder) {
-      if (touchLike(press.current.type)) {
-        event.preventDefault(); // a long-press chooses instead of the browser's menu
-        return;
-      }
-      event.preventDefault();
-      // The menu acts on this item, or on what's chosen when this item is one of them; it
-      // chooses nothing itself.
-      const many = selected.has(entry.id) && selected.size > 1 ? selection() : null;
-      setMenu({ x: event.clientX, y: event.clientY, entry, isFolder, many });
-    },
-    menu(rect, entry, isFolder) {
-      setMenu({ x: rect.right - 220, y: rect.bottom + 6, entry, isFolder, many: null });
-    },
-    focus(id) {
-      setFocusId(id);
-    },
-    dragStart(event, entry) {
-      const ids = selected.has(entry.id) ? [...selected] : [entry.id];
-      event.dataTransfer.setData(MOVE_TYPE, JSON.stringify({ folders: ids.filter(isFolderId), files: ids.filter((id) => fileById(id)) }));
-      event.dataTransfer.effectAllowed = 'move';
-    },
-  };
+        // A mouse: a click opens, like a tap. Choosing is the checkbox's job, or Ctrl/⌘ and Shift's.
+        if (event.ctrlKey || event.metaKey) toggleSelected(entry.id);
+        else if (event.shiftKey) selectRange(entry.id, list);
+        else if (event.detail < 2) {
+          ignoreRestOfDoubleClick();
+          openEntry(entry, isFolder, ids);
+        }
+      },
+      contextMenu(event, entry, isFolder) {
+        if (touchLike(press.current.type)) {
+          event.preventDefault(); // a long-press chooses instead of the browser's menu
+          return;
+        }
+        event.preventDefault();
+        // The menu acts on this item, or on what's chosen when this item is one of them; it
+        // chooses nothing itself.
+        const chosen = latest.current.selected;
+        const many = chosen.has(entry.id) && chosen.size > 1 ? selection() : null;
+        setMenu({ x: event.clientX, y: event.clientY, entry, isFolder, many });
+      },
+      menu(rect, entry, isFolder) {
+        setMenu({ x: rect.right - 220, y: rect.bottom + 6, entry, isFolder, many: null });
+      },
+      focus(id) {
+        setFocusId(id);
+      },
+      dragStart(event, entry) {
+        const chosen = latest.current.selected;
+        const ids = chosen.has(entry.id) ? [...chosen] : [entry.id];
+        event.dataTransfer.setData(MOVE_TYPE, JSON.stringify({ folders: ids.filter((id) => folderById(id)), files: ids.filter((id) => fileById(id)) }));
+        event.dataTransfer.effectAllowed = 'move';
+      },
+    }),
+    [],
+  );
 
   // Keys on a card (#13): arrows (by row in the grid), Shift to extend, Home/End, Space, Enter, F2…
   const onKeyDown = (event) => {
     const card = event.target.closest?.('[data-id]');
     if (!card) return;
     const id = card.dataset.id;
-    const index = order.indexOf(id);
+    const index = places.get(id) ?? -1;
     const step = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: columns(), ArrowUp: -columns() }[event.key];
     const jump = event.key === 'Home' ? 0 : event.key === 'End' ? order.length - 1 : null;
     if (step !== undefined || jump !== null) {
@@ -630,13 +718,16 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
     const start = { x: event.clientX - origin.left + body.scrollLeft, y: event.clientY - origin.top + body.scrollTop };
     const before = event.ctrlKey || event.metaKey || event.shiftKey ? new Set(selected) : new Set();
     let moved = false;
+    let frame = 0;
+    let last = null;
     body.setPointerCapture(event.pointerId);
-    const onMove = (e) => {
+    // Worked out at most once a frame, however fast the pointer moves.
+    const choose = () => {
+      frame = 0;
+      const e = last;
       const now = body.getBoundingClientRect();
       const x = e.clientX - now.left + body.scrollLeft;
       const y = e.clientY - now.top + body.scrollTop;
-      if (!moved && Math.hypot(x - start.x, y - start.y) < 6) return;
-      moved = true;
       const rect = { left: Math.min(x, start.x), top: Math.min(y, start.y), right: Math.max(x, start.x), bottom: Math.max(y, start.y) };
       setBox(rect);
       const chosen = new Set(before);
@@ -647,10 +738,23 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
       }
       setSelection([...chosen]);
     };
+    const onMove = (e) => {
+      const now = body.getBoundingClientRect();
+      const x = e.clientX - now.left + body.scrollLeft;
+      const y = e.clientY - now.top + body.scrollTop;
+      if (!moved && Math.hypot(x - start.x, y - start.y) < 6) return;
+      moved = true;
+      last = e;
+      frame ||= requestAnimationFrame(choose);
+    };
     const onUp = () => {
       body.removeEventListener('pointermove', onMove);
       body.removeEventListener('pointerup', onUp);
       body.removeEventListener('pointercancel', onUp);
+      if (frame) {
+        cancelAnimationFrame(frame);
+        choose();
+      }
       setBox(null);
       if (!moved && !before.size) clearSelection(); // a click on an empty spot chooses nothing
     };
@@ -660,7 +764,8 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
   };
 
   const empty = !order.length;
-  const focusable = focusId && order.includes(focusId) ? focusId : order[0];
+  const focusable = focusId && places.has(focusId) ? focusId : order[0];
+  const totals = vault ? vaultIndex(vault).totals : null;
   return (
     <div
       ref={bodyRef}
@@ -710,12 +815,29 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
               <span />
             </div>
           ) : null}
-          {entries.folders.map((f) => (
-            <EntryCard key={f.id} entry={f} isFolder layout={layout} selected={selected.has(f.id)} focused={f.id === focusable} pending={pending.get(f.id)} added={f.id === added} thumbnails={thumbnails} events={events} />
-          ))}
-          {entries.files.map((f) => (
+          {shownFolders.map((f) => {
+            const inside = totals(f.id);
+            return (
+              <EntryCard
+                key={f.id}
+                entry={f}
+                isFolder
+                layout={layout}
+                selected={selected.has(f.id)}
+                focused={f.id === focusable}
+                pending={pending.get(f.id)}
+                added={f.id === added}
+                inside={inside.files + inside.folders}
+                filesInside={inside.files}
+                thumbnails={thumbnails}
+                events={events}
+              />
+            );
+          })}
+          {shownFiles.map((f) => (
             <EntryCard key={f.id} entry={f} isFolder={false} layout={layout} selected={selected.has(f.id)} focused={f.id === focusable} pending={pending.get(f.id)} missing={missing.has(f.blob)} thumbnails={thumbnails} events={events} />
           ))}
+          {more ? <div ref={sentinel} className="files-more" aria-hidden="true" /> : null}
         </>
       )}
       {box ? <span className="marquee" style={{ left: `${box.left}px`, top: `${box.top}px`, width: `${box.right - box.left}px`, height: `${box.bottom - box.top}px` }} aria-hidden="true" /> : null}
@@ -736,7 +858,9 @@ export function FilesView() {
   const sort = usePref('sort');
   const thumbnails = usePref('thumbnails');
   const [dropping, setDropping] = useState(false);
-  const entries = useMemo(() => visibleEntries(vault, folder, query, sort), [vault, folder, query, sort]);
+  // Typing a search shows in the box at once; the list (of thousands, maybe) follows.
+  const searching = useDeferredValue(query);
+  const entries = useMemo(() => visibleEntries(vault, folder, searching, sort), [vault, folder, searching, sort]);
   const order = useMemo(() => [...entries.folders.map((f) => f.id), ...entries.files.map((f) => f.id)], [entries]);
 
   // Keys anywhere on the Files tab (not in a field): U, N, Backspace, Esc, Ctrl/⌘+A, Delete.
@@ -830,7 +954,7 @@ export function FilesView() {
           <SwitchLoader />
         </div>
       ) : (
-        <FilesBody entries={entries} layout={layout} thumbnails={thumbnails} query={query} folder={folder} />
+        <FilesBody entries={entries} layout={layout} thumbnails={thumbnails} query={searching} folder={folder} sort={sort} />
       )}
       <div className="files-foot">
         <span>{switching ? '' : `${count} ${count === 1 ? 'item' : 'items'}${entries.files.length ? ` · ${formatBytes(bytes)}` : ''}`}</span>

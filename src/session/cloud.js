@@ -370,7 +370,9 @@ export async function lock(reason = 'manual', { fromOtherWindow = false } = {}) 
     rememberLock();
     channel?.postMessage({ type: 'lock', reason });
   }
-  if (reason === 'manual' || fromOtherWindow) await Promise.race([saveChain, pause(4000)]);
+  // Uploads whose encrypted copies are stored go into the vault first, so none is left behind.
+  const waiting = files.saveWaiting().catch(() => {});
+  if (reason === 'manual' || fromOtherWindow) await Promise.race([Promise.all([saveChain, waiting]), pause(4000)]);
   forgetStreams();
   // Uploads that hadn't finished stop with the page: the unlock card says so ("idle:2").
   const kind = reason === 'manual' && fromOtherWindow ? 'other' : reason;
