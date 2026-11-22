@@ -6,6 +6,10 @@ import { trustedScriptUrl } from './trusted.js';
 
 let ready = false;
 const zipJobs = new Map(); // id -> { job, expires }: what a ZIP download contains (paths and file ids, no keys)
+let downloads = 0; // downloads the worker is serving, as it last said (sw.js announceDownloads)
+
+/** Downloads under way, from any window: known right away, for asking before this page closes. */
+export const downloadsUnderWay = () => downloads;
 
 /**
  * `describe(fileId, { fresh })` -> { entry, source: 'drive'|'link'|'page', token?, id?, links? } or null when
@@ -17,6 +21,10 @@ export async function startStreaming({ describe, read }) {
   navigator.serviceWorker.addEventListener('message', async (event) => {
     const port = event.ports?.[0];
     const msg = event.data;
+    if (msg?.type === 'unibox-downloads') {
+      downloads = Math.max(0, Number(msg.running) || 0);
+      return;
+    }
     if (!port || !msg) return;
     try {
       if (msg.type === 'unibox-describe') {

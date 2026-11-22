@@ -10,7 +10,7 @@
  */
 import { MAX_FILE_SIZE, createPieceWriter, decryptFile, encryptFile, layout } from '../core/fileformat.js';
 import { canThumbnail, formatBytes, guessType, kindOf } from '../core/filetypes.js';
-import { fileUrl, forgetStreams, zipUrl } from '../core/stream.js';
+import { downloadsUnderWay, fileUrl, forgetStreams, zipUrl } from '../core/stream.js';
 import { makeThumbnail } from '../core/thumbs.js';
 import { runTask } from '../workers/pool.js';
 import { collectTree, copiesInUse, folderChain, makeFileEntry, makeFolder, uniqueName } from '../core/vault.js';
@@ -925,11 +925,12 @@ export async function stopAll() {
 
 const unfinished = () => tasks.some((t) => ACTIVE.has(t.status));
 
-// Leaving the page while files are still uploading (or saving here), or with a text file's
-// changes unsaved, asks first. A lock never asks: it must always go through, and the lock button
-// has asked already when it should.
+// Leaving the page while files are still uploading or downloading (or saving here), or with a
+// text file's changes unsaved, asks first: a download needs a Secure Box window for its keys
+// (and, from a vault on this device, for its bytes), so closing the last one stops it. A lock
+// never asks: it must always go through, and the lock button has asked already when it should.
 window.addEventListener('beforeunload', (event) => {
-  if (state.unlocked && (unfinished() || state.device.busy || state.moving || editingDirty())) event.preventDefault();
+  if (state.unlocked && (unfinished() || downloadsUnderWay() > 0 || state.device.busy || state.moving || editingDirty())) event.preventDefault();
 });
 
 // ===========================================================================
