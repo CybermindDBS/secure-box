@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { loadPart } from '../../session/bridge.js';
 import { Spinner } from '../common/Icon.jsx';
 
 /**
@@ -15,7 +16,7 @@ export function PdfView({ bytes, name }) {
     let doc = null;
     let observer = null;
     (async () => {
-      const { openPdf } = await import('./pdf.js');
+      const { openPdf } = await loadPart(() => import('./pdf.js'));
       doc = await openPdf(bytes);
       if (cancelled) return;
       setStatus('');

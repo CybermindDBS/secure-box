@@ -6,7 +6,7 @@ import { downloadsRunning, forgetStreams } from '../core/stream.js';
 import { GoogleError, reconnectWithPopup } from '../core/google.js';
 import { MicrosoftError, reconnectMicrosoftWithPopup, refreshMicrosoft } from '../core/microsoft.js';
 import { VaultError, applyChange, parseEnvelope } from '../core/vault.js';
-import { answerAll, ask, confirmDialog, toast } from './bridge.js';
+import { answerAll, ask, confirmDialog, loadPart, toast } from './bridge.js';
 import { files } from './files.js';
 import { lockedAt, rememberLock, setLockReason } from './memory.js';
 import { companyName, isDevice, providerName } from './places.js';
@@ -31,10 +31,17 @@ export function commit(change) {
         const next = applyChange(state.vault, change);
         let rev;
         try {
-          // OneDrive replaces the vault only if it's still the version we read; if not, go round again.
+          // The vault is replaced only if it's still the version we read; if not, go round again.
           rev = await state.backend.writeVault(await state.cipher.seal(next), state.rev);
         } catch (err) {
           if (err?.code === 'conflict') continue;
+          if (err?.code === 'overwrote') {
+            // Google Drive: another device saved at the same moment, and this save replaced it.
+            // Take that save back, and put this change on top of it.
+            state.vault = await state.cipher.open(parseEnvelope(await state.backend.readRevision(err.overwrote)));
+            state.rev = err.rev;
+            continue;
+          }
           throw err;
         }
         state.vault = next;
@@ -63,7 +70,7 @@ export async function pullLatest() {
     state.lastSync = Date.now();
     return false;
   }
-  const envelope = parseEnvelope(text, state.cipher.format);
+  const envelope = parseEnvelope(text);
   if (envelope.kid !== state.cipher.kid) throw new VaultError('wrong-key', 'The vault was re-keyed on another device. Lock and unlock again.');
   state.vault = await state.cipher.open(envelope);
   state.rev = rev;
@@ -94,8 +101,8 @@ export async function syncNow({ quiet = false } = {}) {
   }
 }
 
-/** The open vault was deleted (or put in the bin) outside Secure Box. */
-export const isGone = (err) => err?.code === 'gone' || err?.code === 'trashed';
+/** The open vault was deleted (or put in the bin) outside Secure Box, or moved away (from another device). */
+export const isGone = (err) => err?.code === 'gone' || err?.code === 'trashed' || err?.code === 'moved';
 
 let goneAsking = null;
 
@@ -106,7 +113,7 @@ let goneAsking = null;
  */
 export function vaultGone(err) {
   if (!state.unlocked) return Promise.resolve(false);
-  goneAsking ??= import('./gone.js')
+  goneAsking ??= loadPart(() => import('./gone.js'))
     .then(({ recoverVault }) => recoverVault(err))
     .finally(() => {
       goneAsking = null;
@@ -267,7 +274,7 @@ export async function checkAutoLock() {
   // Another window locked while this one was asleep or in the back/forward cache.
   if (lockedAt() > state.unlockedAt) return lock('other', { fromOtherWindow: true });
   // Uploads, local encryption and playing media count as activity.
-  if (files.busy() || tools.busy() || state.device.busy || mediaPlaying()) noteActivity();
+  if (files.busy() || tools.busy() || state.device.busy || state.moving || mediaPlaying()) noteActivity();
   const reason = Date.now() - lastActivity >= idleLimit() ? 'idle' : Date.now() - state.unlockedAt >= sessionLimit() ? 'expired' : null;
   if (!reason) return;
   checkingLock = true;
@@ -299,7 +306,7 @@ export async function transfersRunning() {
   const [elsewhere, downloads] = await Promise.all([busyElsewhere(), downloadsRunning()]);
   const uploads = files.runningCount() + elsewhere.uploads;
   const paused = files.pausedCount() + elsewhere.paused;
-  const device = (state.device.busy ? 1 : 0) + elsewhere.device;
+  const device = (state.device.busy || state.moving ? 1 : 0) + elsewhere.device;
   return { uploads, paused, downloads, device, total: uploads + downloads + device };
 }
 

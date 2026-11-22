@@ -90,10 +90,12 @@ export async function saveItem(values, previous = null) {
   const loginDetails = values.type === 'login' && (values.username.trim() || values.password || values.url.trim());
   if (!values.title.trim() && !values.notes.trim() && !loginDetails) return 'Add a title or some details first.';
   const item = makeItem(values, previous);
+  // An edit sends only the fields that changed, so another device's edits to the rest stay.
+  const fields = previous && Object.fromEntries(['type', 'title', 'username', 'password', 'url', 'notes'].filter((key) => item[key] !== previous[key]).map((key) => [key, item[key]]));
   setPending(item.id, 'saving');
   try {
     await ensureDrive();
-    await commit({ op: 'put', item });
+    await commit(previous ? { op: 'item-update', item, fields } : { op: 'put', item });
     state.selectedId = item.id;
     state.revealed = new Set();
     publish();
@@ -126,7 +128,11 @@ export async function deleteItem(item) {
 // ===========================================================================
 // CSV
 // ===========================================================================
-const today = () => new Date().toISOString().slice(0, 10);
+// Today where you are (YYYY-MM-DD), not in UTC, which can still be yesterday or already tomorrow.
+const today = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
 
 export async function importCsv() {
   const file = await pickFile('.csv,text/csv');

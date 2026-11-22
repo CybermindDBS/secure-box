@@ -41,7 +41,7 @@ Then open http://localhost:8080/?demo. The demo master password is `secure box d
 | Passwords, notes, file names, folders | `Secure Box Vault.json`, encrypted | Same as above |
 | Files | `Encrypted files/<random id>`, one opaque blob per file | Same as above |
 
-The names are the same wherever a vault lives (Google Drive, OneDrive, or a folder on this device), so a vault looks the same wherever you find it.
+A vault is the same wherever it lives (Google Drive, OneDrive, or this device): the same three parts, under the same names, in the same format. The vault names each file's encrypted copy itself and never records a Google Drive or OneDrive file id. Each place finds a copy by that name in its own way: Google Drive by a private tag Secure Box puts on the copy, and OneDrive and this device by its name in the `Encrypted files` folder.
 
 **Master password.** It is stretched with PBKDF2-SHA-256 (600,000 rounds) into a key that unlocks the master key, which stays in memory only while unlocked. Changing your password re-locks the master key without re-encrypting anything else.
 
@@ -54,6 +54,7 @@ The names are the same wherever a vault lives (Google Drive, OneDrive, or a fold
 - If you unlock a vault that still has an older key ring, your new master password works when this device's vault already has the newer one. Otherwise Secure Box says that this vault still has your previous master password (it remembers when you changed it, nothing secret): enter that once, and the vault takes the new one.
 
 **Vault.** The vault is encrypted with AES-256-GCM. Every save uses a brand-new key derived from the master key with HKDF and a fresh salt. Its size is padded with the Padmé scheme, so the file size gives little away.
+- Saves from several devices or windows don't overwrite each other. A save is made on top of the newest vault, and a change carries only what it changes (a name, a folder, the fields you edited), so another device's edits to the rest stay. Google Drive can't refuse a write that comes second, so after each save Secure Box checks Drive's revision history; if another device saved at the same moment, it saves again on top of that.
 
 **Files.** Every file gets its own random 256-bit key, which lives only inside the encrypted vault. Files are encrypted in 1 MiB chunks, using the same streaming scheme as Google's Tink library.
 - Each chunk is authenticated, so any tampering, truncation, reordering or swapping of files is detected.
@@ -65,13 +66,18 @@ The names are the same wherever a vault lives (Google Drive, OneDrive, or a fold
 
 **Files encrypted on your device (`.sbox`).** The **Encrypt & decrypt** tab turns files, or a folder, into `.sbox` files without uploading anything. A folder becomes a single `.sbox` with a ZIP inside. It works with no vault and no account at all.
 - Each `.sbox` gets its own random 256-bit key and uses the same chunked AES-256-GCM format as your Drive files, so tampering and truncation are detected.
-- The file's header keeps that key only in locked copies: one for your account (when a vault is open), locked with a key derived from your master key (HKDF), and one for a password (PBKDF2-SHA-256, 600,000 rounds). Without a vault, the password is required and is the only way in. Your account's copy keeps working after a password change or an Emergency Kit reset.
+- The file's header keeps that key only in locked copies: one for your account (when a vault is open), locked with a key derived from your master key (HKDF), and one for a password (PBKDF2-SHA-256, 600,000 rounds). Each file gets a salt of its own, even among files encrypted together with one password, so nothing in them shows they belong together. The deliberately slow derivation then runs once per file, when encrypting and when opening. Without a vault, the password is required and is the only way in. Your account's copy keeps working after a password change or an Emergency Kit reset.
 - The name, size and date are encrypted inside. With **Hide file names** on, the `.sbox` file itself gets a random name. What shows from outside is the padded size, that it's a Secure Box file, and whether it has a password.
 - Opening one: files made with any vault unlocked this session open straight away; others ask for their password. One made with your vault while it's locked offers **Unlock your vault**, which brings you back to the tab with the file ready to open. A key ring backup (**⋯ → Key ring backup**) opens your `.sbox` files on any device, together with your master password or Emergency Kit.
 
 **Encrypted messages.** The same tab's **Text** side turns text into a short block starting with `-----BEGIN SECURE BOX MESSAGE-----`, to paste into a chat or an email (pasting one switches it to **Decrypt** by itself). It uses the same design as `.sbox` files: a random key, kept in a copy for your account and/or one for a password. Everything around the text is authenticated, and its length is padded.
 
 **Streaming without disk.** A service worker (`sw.js`), a small background script your browser runs for Secure Box, decrypts each file chunk by chunk as it streams in, using byte ranges so seeking works: straight from Google Drive or OneDrive, or from the Secure Box page a few MiB at a time for a vault on this device. Decrypted data is marked `no-store`, and nothing is written to the browser's storage. Only an explicit **Download** saves a file.
+
+**What runs where.** Encryption uses the browser's own WebCrypto, which works off the page on a thread of its own: about a gigabyte a second for AES-GCM on a laptop, far faster than any network. Chrome runs all of a page's WebCrypto on that one thread, workers included, so more threads wouldn't make it faster. A small pool of workers (one per spare CPU core, up to four) reads documents for the viewer, makes photo thumbnails, and packs folders and backups into ZIPs, so the page stays responsive. With a cloud, the slow part is waiting on the network, so Secure Box keeps several requests going at once:
+- three uploads (two for a vault on this device)
+- three copies when moving or copying a vault
+- up to four small files fetched ahead while a ZIP downloads
 
 **The page itself.**
 - A strict Content-Security-Policy (the same in development and in the build, and checked before every deploy), and Trusted Types that allow exactly Secure Box's own script URLs: the service worker and its workers.
@@ -109,6 +115,8 @@ The names are the same wherever a vault lives (Google Drive, OneDrive, or a fold
 - Use a strong master password and protect your Google or Microsoft account with two-step verification. An attacker needs both.
 - Like any web app, Secure Box can't protect you from malware on your device or a malicious browser extension. Your browser's own process memory may also be paged out by the operating system.
 - Sign-in uses Google's OpenID Connect *implicit* flow, which needs no Google script in the page. Google still documents this flow but calls it legacy. If they ever retire it, only `src/core/google.js` needs to change.
+- Secure Box reaches your cloud through its own Google Cloud project and Microsoft app registration. Google lets it see only the files it made itself, and OneDrive's `Apps/Secure Box` folder belongs to the app. Run under another project or registration, it finds no vault, although yours is still there.
+- OneDrive files are read first through Microsoft Graph's `contentStream`, which is still in beta, then through download links (which Microsoft is retiring) or the `/content` redirect. Those download addresses are allowed by name in the Content-Security-Policy, so a new Microsoft download domain needs an update there.
 - Secure Box hasn't had an independent security audit yet. To report a problem, see [SECURITY.md](SECURITY.md).
 
 ## What it costs
@@ -198,6 +206,12 @@ If Windows refuses to run scripts, use this form instead. It applies to that one
 powershell -ExecutionPolicy Bypass -File .\deploy-firebase.ps1
 ```
 
+**Keep the same Google project and Microsoft app.** What Secure Box can see in a cloud depends on the app it connects as. Google Drive shows it only the files its own Google Cloud project made, and OneDrive only its app registration's folder. If either changes, every vault already made looks gone to Secure Box, though nothing is deleted. So:
+- Keep the Google Cloud project and the Microsoft app registration once people have vaults, and give each a second owner. A new OAuth client in the same Google project is fine: Google deletes OAuth clients that go unused for six months, and a new one there sees everything the old one did.
+- If one is deleted by mistake, restore it within 30 days: a Google project or OAuth client from the Cloud console, a Microsoft app registration from **App registrations → Deleted applications**. Vaults then reappear by themselves (Google says a restored client can take a few days to work again).
+- The deploy script refuses a client ID from another Google project, or another Microsoft app registration. To switch on purpose, keep the old one working and run it with `-NewCloudApps`. The old one becomes Secure Box's previous connection: when the new one finds no vault, Secure Box offers **Bring it over**, signs in through the old one too, and copies the vault across exactly as stored. Once everyone's vault is across, run it with `-ForgetPreviousCloudApps`.
+- If the old one is gone for good, people can still bring their vault back from the cloud's own website (see [Recovery](#recovery)).
+
 ### 5. First sign-in
 
 1. Open the app URL. On the **Vault** tab, choose **Google Drive**, **OneDrive** or **This device**.
@@ -223,6 +237,20 @@ After that, Secure Box opens the vault you used last. The name next to **Passwor
 - **Nothing leaves you stuck.** Every error screen has **Open another vault**. If a vault is deleted or moved outside Secure Box (its folder deleted, this site's data cleared, the Secure Box folder put in the Google Drive bin), Secure Box says so and offers the way back:
   - **When you open it:** **Try again** once it's restored from the Recycle Bin, **Find the folder…** if you moved it, **Restore a backup…**, or start over without it. A Google Drive vault in the bin is found there: **Restore it** takes it out, as it was.
   - **While it's open:** saving stops, and one dialog offers **Try again** (once it's restored), **Restore it** (from the Google Drive bin), **Save it again** (writes what's open back: passwords, notes and folders, though not its files) or **Lock**. The change you were making is saved as soon as the vault is back.
+  - **When you switch to it:** a vault on this device deleted outside Secure Box (its folder deleted, this site's data cleared) says so, and offers **Set up a new vault**, **Restore a backup…** or, for a folder that was moved, **Find the folder…**. The vault you have open stays open.
+  - **From an earlier version** of Secure Box, a vault says so ("This vault is from another version"), in Google Drive, OneDrive or on this device, with how to start over.
+
+**Moving or copying a vault.** **⋯ → Move or copy this vault…** takes the open vault to another place: Google Drive, OneDrive, this device (in this browser, or a folder you choose), or another account of the same cloud.
+- **How.** A vault is the same in every place, so Secure Box copies it as it's stored, encrypted the whole way: every file's encrypted copy, then the vault and its key ring. Then it reads it all back from there and checks it.
+- **Move or copy.** *Move* opens your vault from the new place, and only then clears the old one. *Copy* keeps both: from then on each changes on its own.
+- **The old place after a move.** A cloud keeps a short note of where the vault went, and its files go to its bin (Google Drive and OneDrive keep them 30 days). Your other devices that open it there are told **Your vault moved** and can open it in its new place. On this device, the old copy is deleted.
+- **A place that already has a vault** is never lost:
+  - *An earlier copy of this vault* (one you copied there before) is brought up to date.
+  - *A vault with your master password* that has things of its own: **Combine them** keeps everything in both (where both have the same item or file, the version changed last wins; folders with the same name become one; clashing file names get "(2)"), or **Replace it** sends it to the bin first (on this device it's deleted for good).
+  - *A vault with its own master password*: **Combine them** once its master password (or Emergency Kit) opens it. Everything goes into that vault, which then opens with its own master password. Or **Replace it**.
+  - *Something that can't be read* (another version of Secure Box, or damaged) can only be replaced.
+- **Safe to stop.** Nothing at the old place changes until your vault opens from the new one. If it stops (you press **Stop**, the connection drops, the place is full), **Try again** picks up where it stopped; **Close** removes what was copied so far. Secure Box checks there's enough space first, keeps the screen on while it works, and other Secure Box windows with the vault open lock and open it in its new place when unlocked. If a sign-in runs out on a long transfer, it asks you to sign in again and goes on.
+- **Where:** folders can be chosen in Chrome and Edge on a computer, and in Chrome on Android. On iPhone and iPad, a vault on this device works only in the Secure Box app on your Home Screen.
 
 Your browser's **Back** and **Forward** buttons move between tabs and folders, close the viewer, and on phones close an open password.
 
@@ -237,7 +265,7 @@ Your browser's **Back** and **Forward** buttons move between tabs and folders, c
 - Only files uploaded through Secure Box are encrypted. A file you put into the `Secure Box` folder in Google Drive yourself stays as it is, unencrypted. Secure Box can't even see it, because Google only lets it see the files it created. Upload files through Secure Box instead.
 - **Organise** with folders, breadcrumbs and search across every folder. **View** holds grid or list, sorting and thumbnails. When the path and the buttons don't fit side by side, the path moves below them.
 - **Open** a file or folder with a click (a tap on a phone or tablet). **Select** items with their checkbox, Ctrl/⌘-click or Shift-click (on a phone, long-press one, then tap more), or by dragging a box around them, then Download, Move or Delete them together. The keys work as in Google Drive; press **?** to see them all.
-- **Download** a single file as itself. Several items, folders included, download as one **.zip** that keeps their folders, and a folder's ⋯ menu has **Download as .zip**. The ZIP is built and decrypted while it downloads, so it never sits in memory, and your browser shows its real size and progress.
+- **Download** a single file as itself. Several items, folders included, download as one **.zip** that keeps their folders, and a folder's ⋯ menu has **Download as .zip**. The ZIP is built and decrypted while it downloads, so it never sits in memory whole, and your browser shows its real size and progress. Small files are fetched a few at a time ahead of the one being written (holding at most 32 MB), so a ZIP of many small files doesn't wait on the network for each in turn.
 - **Move** items by dragging them onto a folder or a breadcrumb.
 - **Thumbnails** show previews of photos and videos. Secure Box makes them on your device when you upload. Turn **View → Thumbnails** off to hide them.
 - Your view is remembered in this browser: the tab you were on, grid or list, sorting, thumbnails, and the password generator's settings.
@@ -257,7 +285,8 @@ Your browser's **Back** and **Forward** buttons move between tabs and folders, c
 
 **Menu (⋯)**
 - Sync now
-- For a vault on this device: **Back up this vault**, **Restore a backup…**, **Move this vault…**, **Delete this vault…**, and for a folder, **Stop using this folder…**
+- **Move or copy this vault…** (above)
+- For a vault on this device: **Back up this vault**, **Restore a backup…**, **Delete this vault…**, and for a folder, **Stop using this folder…**
 - **Change master password** (your Emergency Kit keeps working)
 - **New Emergency Kit** (the old one stops working)
 - **Key ring backup** (below)
@@ -268,17 +297,13 @@ Your browser's **Back** and **Forward** buttons move between tabs and folders, c
 Passwords and files kept only here: nothing is uploaded. It works like a cloud vault and opens with the same master password.
 - **Where it lives.** In Chrome and Edge on a computer, and in Chrome on Android, you choose:
   - **In this browser** (the only choice elsewhere, such as Firefox, Safari and any browser on iPhone and iPad): the browser's private storage for Secure Box.
-  - **In a folder you choose**: ordinary encrypted files you can see and copy. It can be a synced folder, such as OneDrive, Dropbox or iCloud Drive. The browser asks once per visit before Secure Box may open it.
+  - **In a folder you choose**: ordinary encrypted files you can see and copy. It can be a synced folder, such as OneDrive, Dropbox or iCloud Drive, used from one computer at a time: the sync service can't merge changes made on two computers at once, so for several devices use a Google Drive or OneDrive vault. The browser asks once per visit before Secure Box may open it.
 - **Keeping it safe in the browser.** The browser deletes this storage if someone clears this site's data, or uninstalls the browser. It may also clear it by itself when space runs low, unless it grants Secure Box *persistent storage*. Browsers decide that themselves, and usually agree for an installed app (see [Install as an app](#install-as-an-app)). The bar above your files shows whether it's protected, and has **Protect** to ask again.
 - **On iPhone and iPad** a vault on this device works only in the Secure Box app on your Home Screen. Safari deletes the data of websites you haven't opened for 7 days, and only Home Screen apps are safe from that.
-- **Back up** saves the whole vault as one `.zip`, exactly as stored and still encrypted, so you can keep it anywhere. The bar reminds you when it's out of date.
-- **Restore a backup.** On a new phone or computer, choose **This device → Restore a backup…** on the first screen, then unlock with your master password. In an open vault, **⋯ → Restore a backup…** adds back whatever is missing.
+- **Back up** saves the whole vault as one `.zip`, exactly as stored and still encrypted, so you can keep it anywhere. The bar reminds you when it's out of date. If a file's encrypted copy is missing (deleted outside Secure Box), the backup can't hold it and says so.
+- **Restore a backup.** On a new phone or computer, choose **This device → Restore a backup…** on the first screen, then unlock with your master password. It also takes a vault's “Secure Box” folder as Google Drive or OneDrive download it from their websites (choose every ZIP file, if there are several): a vault is the same in every place, so that's a whole vault too. In an open vault, **⋯ → Restore a backup…** adds back whatever is missing: passwords, notes, folders and files the vault doesn't have, and encrypted copies deleted outside Secure Box. It never replaces or deletes anything. Only a backup of the same vault (the same master key) can go into an open vault; one of another vault, or one an earlier version of Secure Box made, is refused and says why.
 - **Files put in by hand.** If someone copies plain files into a folder vault's `Secure Box` folder, the bar lists them and offers **Encrypt them**. Each one is encrypted into the vault, and then the unencrypted original is deleted.
-- **Move this vault.** **⋯ → Move this vault…** moves it between this browser and a folder, or from one folder to another, wherever folders can be chosen.
-  - Secure Box copies it exactly as stored, still encrypted, and checks the copy. It opens the copy, then deletes the old one.
-  - If anything goes wrong, nothing is deleted and the vault stays where it was.
-  - It won't move into a place that already has a vault, or into a folder inside its own.
-  - Files someone else put in the old folder stay there.
+- **Move it** between this browser and a folder, from one folder to another, or to a cloud, with **⋯ → Move or copy this vault…** (see [Moving or copying a vault](#using-secure-box)). Files someone else put in the old folder stay there, and it won't move into a folder inside its own.
 - **Delete this vault.** **⋯ → Delete this vault…** deletes its key ring, its vault and every encrypted file from this device, then locks.
   - Anything else in a chosen folder stays.
   - It can't be undone, except from a backup.
@@ -314,6 +339,10 @@ Secure Box can be installed like an app. It opens in its own window, and browser
 | Deleted it from OneDrive | Restore it from the OneDrive recycle bin, then choose **Try again**. |
 | Deleted the vault's folder on this device | Restore it from the Recycle Bin (the Trash on a Mac), then choose **Try again**. If you moved it instead, choose **Find the folder…**. |
 | Deleted it while it was open, for good | Choose **Save it again**: your passwords, notes and folders come back from what's open. Its files can come back only from a backup. |
+| Deleted some encrypted copies by hand (in the `Encrypted files` folder, or Secure Box's folder in a cloud) | Those files stay in your vault, marked **Encrypted copy missing**. Their entry holds the key that opens a copy put back, so nothing is removed for you. Put the copies back from the bin or Recycle Bin (for a vault on this device, or from a backup with **⋯ → Restore a backup…**), then open the file again. Or open it and choose **Remove from vault**. |
+| Secure Box says your vault is with its previous connection | Secure Box now connects to that cloud as a new app. Choose **Bring it over** and approve the sign-in: Secure Box copies your vault across, as it is. The old copy stays until you delete it (on Google Drive, as “Secure Box (old copy)”). |
+| Secure Box can't see your vault, as it now connects as a different app | Your vault is still there. On drive.google.com, right-click the “Secure Box” folder and choose **Download** (or, on onedrive.com, download it from **Apps**). Then choose **This device → Restore a backup…**, pick every ZIP file, unlock, and use **⋯ → Move or copy this vault…** to put it back. |
+| A cloud says **Your vault moved** | It was moved to another place, from another device or window. Choose **Open your … vault** to open it there, or **Start a new vault here** for a new, empty one in that place. |
 | A bad change to the vault | In Drive, right-click `Secure Box Vault.json` → **Manage versions** and download an earlier version. |
 | No access to your vault, but you need your `.sbox` files | Open the **Encrypt & decrypt** tab (no sign-in needed), drop the files in, choose **Use a key ring backup**, and enter your master password or Emergency Kit recovery key. |
 | The vault on this device is gone (site data cleared, new phone) | Secure Box says so when you open it: choose **Restore a backup…** with your latest backup, then unlock with your master password. |
@@ -347,8 +376,8 @@ npm run preview      # serves dist/ at http://localhost:8081, under the real CSP
 
 - Secure Box is built with **React** and **Vite**. The page keeps its strict Content-Security-Policy in development too: no inline scripts or styles (styles are one linked stylesheet chain, never injected), and the only Trusted Types policy lets through just Secure Box's own scripts.
 - `npm run build` writes `dist/` and runs `scripts/check-build.mjs`: the page's CSP must match `firebase.json`'s, nothing may be inline, and every file the page and the service worker load must be there. The deploy script builds with `npm ci --ignore-scripts` and stops if the check fails.
-- `npm test` runs 71 unit tests, covering the key ring and its revisions (including changes made in two places, ties, recovery keys typed by hand, files picked in the wrong place and old key ring backups), encryption formats, `.sbox` files, encrypted messages, the local vault's index key and backups, moving and deleting it, and a vault folder moved or deleted outside Secure Box (against a stand-in for a chosen folder), tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive), uploads resuming after a lost piece, a cloud vault put in the bin or deleted while open, saving an edited text file in its own encoding and line breaks, and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
-- The demo can rehearse failures: add `&faults=` with any of `quota`, `expire`, `trash`, `save` (uploads and saves going wrong) or `bin`, `deleted`, `trashed`, `gone` (a vault deleted outside Secure Box), for example http://localhost:8080/?demo&faults=trashed.
+- `npm test` runs 92 unit tests, covering the key ring and its revisions (including changes made in two places, ties, recovery keys typed by hand, files picked in the wrong place and old key ring backups), encryption formats, `.sbox` files, encrypted messages, one vault format for every place, encrypted copies found by name in each place (against stand-ins for Google Drive and OneDrive), backups restored byte for byte (and ones from another version told apart), encrypted copies deleted outside Secure Box found missing (in a cloud and on this device), left out of backups and put back from one, backups packed in a worker, a vault's folder downloaded from a cloud's website restored like a backup (deflated, split into several ZIP files, with pieces missing), a password salt of its own for every `.sbox` file, small files fetched ahead for a ZIP download (in order, within its memory budget), copies made a few at a time when moving a vault (one failing stops the rest), saves that cross on Google Drive, changes made from an out-of-date view applied to things as they are now, the list of copies to delete, Secure Box's own files never taken for files put in by hand, saves on a disk with a coarse clock, moving and copying a vault (what a place holds, copies picked up where a transfer stopped, two vaults combined, the note left where a vault moved away), deleting a vault on this device, and a vault folder moved or deleted outside Secure Box (against a stand-in for a chosen folder), tamper detection, streaming range decryption, ZIP reading and writing (including ZIP64), XML, document readers, text detection, CSV, OneDrive reads, streaming addresses, folders and uploads (against a stand-in for OneDrive), uploads resuming after a lost piece, a cloud vault put in the bin or deleted while open, saving an edited text file in its own encoding and line breaks, and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
+- The demo can rehearse failures: add `&faults=` with any of `quota`, `expire`, `trash`, `save`, `race` (uploads and saves going wrong, or crossing with another device's save) or `bin`, `deleted`, `trashed`, `gone` (a vault deleted outside Secure Box), or `moved`, `away` (a vault moved away from another device: while open, or found when opening), or `older` (a vault an earlier version made), or `lost` (a file's encrypted copy deleted outside Secure Box), or `newapp`, `oldgone` (Secure Box connecting as a new app: the vault brought over from its previous connection, or that one gone too), for example http://localhost:8080/?demo&faults=trashed.
 
 ```
 index.html              the page: Content-Security-Policy, the root element, the stylesheet
@@ -378,6 +407,7 @@ src/
     vaults.js           the Vault tab's steps, unlock, create, adopt, Emergency Kit, recovery, switching
     cloud.js            saving and syncing, Reconnect, auto-lock, locking every window
     device.js           the vault on this device: making, opening, backups, moving, deleting
+    bringover.js        a vault brought over from Secure Box's previous connection to a cloud
     gone.js             a vault deleted or moved outside Secure Box while open: the ways back
     textedit.js         saving a .txt file edited in the viewer, and what if it changed meanwhile
     files.js            folders, choosing, uploads (parallel, batched), downloads, deletes
@@ -386,7 +416,7 @@ src/
     windows.js, nav.js, prefs.js, memory.js, places.js, bridge.js, store.js, io.js, viewer.js
   ui/                   React components: shell (tabs, vault switcher, menus), home (the Vault
                         tab), passwords, files, viewer, tools, dialogs, common
-  workers/              a small worker pool: document parsing, thumbnails, folder packing
+  workers/              a small worker pool: document parsing, thumbnails, folder and backup packing
   styles/               the stylesheets, linked once from index.html
 firebase.json           Firebase Hosting: publishes dist/ with the security headers
 deploy-firebase.ps1     one-command Firebase deploy (builds first)

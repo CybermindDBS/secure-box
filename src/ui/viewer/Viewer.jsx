@@ -3,7 +3,7 @@ import { canThumbnail, extOf, formatBytes, kindOf, typeLabel, viewerFor, TEXT_SN
 import { looksLikeText } from '../../core/readers.js';
 import { toast } from '../../session/bridge.js';
 import { driveFresh, ensureDrive } from '../../session/cloud.js';
-import { KIND_ICON, deleteEntries, download, fetchBytes, fetchRange, fileForSharing, folderPath, moveEntries, releaseUrls, renameEntry, sourceUrl } from '../../session/files.js';
+import { KIND_ICON, copyGone, deleteEntries, download, fetchBytes, fetchRange, fileForSharing, files, folderPath, isMissingCopy, missingCopyText, moveEntries, noteCopy, releaseUrls, renameEntry, sourceUrl } from '../../session/files.js';
 import { formatDate } from '../../session/io.js';
 import { pref, setPref } from '../../session/prefs.js';
 import { canEditText, textStyle } from '../../core/textfile.js';
@@ -26,7 +26,7 @@ const canShareFiles = () => typeof navigator.share === 'function' && typeof navi
 // ---------------------------------------------------------------------------
 // Photos: fit, zoom, rotate, pan; on touch, pinch, double-tap and swipe
 // ---------------------------------------------------------------------------
-function ImageStage({ file, url, control, onSwipe }) {
+function ImageStage({ file, url, control, onSwipe, onMissing }) {
   const wrapRef = useRef(null);
   const imgRef = useRef(null);
   const view = useRef({ zoom: 1, rotate: 0, fit: true, fitZoom: 1, touchZoomAt: -Infinity });
@@ -215,6 +215,10 @@ function ImageStage({ file, url, control, onSwipe }) {
         draggable="false"
         decoding="async"
         onLoad={apply}
+        onError={async (e) => {
+          // Its encrypted copy went missing since the vault opened: say so, not a broken picture.
+          if ((await readProblem(e.currentTarget.currentSrc || url)).missing) onMissing();
+        }}
         onDoubleClick={() => {
           // Touch double-taps are handled above; skip the dblclick some browsers add.
           if (performance.now() - view.current.touchZoomAt < 700) return;
@@ -240,6 +244,25 @@ function Message({ file, title, text, children }) {
       {text ? <p>{text}</p> : null}
       <div className="viewer-message-actions">{children}</div>
     </div>
+  );
+}
+
+/**
+ * The file's encrypted copy isn't where the vault is (deleted outside Secure Box, say): put it
+ * back and try again, or take the file off the vault's list.
+ */
+function MissingCopy({ file, onRetry }) {
+  return (
+    <Message file={file} title="This file’s encrypted copy is missing" text={missingCopyText()}>
+      <button type="button" className="btn btn-ghost btn-sm" onClick={onRetry}>
+        <Icon name="refresh" size={16} />
+        <span>Try again</span>
+      </button>
+      <button type="button" className="btn btn-danger btn-sm" onClick={() => run(() => deleteEntries([], [file.id]))}>
+        <Icon name="trash" size={16} />
+        <span>Remove from vault</span>
+      </button>
+    </Message>
   );
 }
 
@@ -281,22 +304,25 @@ const DownloadButton = ({ file, primary = true }) => (
   </button>
 );
 
-/** Why the first byte of a streamed file can't be read, or '' if it can. */
+/**
+ * Why the first byte of a streamed file can't be read: { text } ('' if it can), and `missing`
+ * when its encrypted copy isn't where the vault is.
+ */
 async function readProblem(src) {
-  if (!src || src.startsWith('blob:')) return '';
+  if (!src || src.startsWith('blob:')) return { text: '' };
   try {
     const res = await fetch(src, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' });
     const text = await res.text();
-    return res.ok ? '' : text.slice(0, 300) || `The file couldn’t be read (${res.status}).`;
+    return res.ok ? { text: '' } : { text: text.slice(0, 300) || `The file couldn’t be read (${res.status}).`, missing: res.status === 404 };
   } catch (err) {
-    return err?.message || 'The file couldn’t be read.';
+    return { text: err?.message || 'The file couldn’t be read.' };
   }
 }
 
 // Containers whose sound is often in a format browsers don't play (AC-3, DTS…).
 const ODD_SOUND = new Set(['mkv', 'avi', 'mov', 'wmv', 'ts', 'm2ts', 'mpg', 'mpeg']);
 
-function MediaStage({ file, url, tag }) {
+function MediaStage({ file, url, tag, onMissing }) {
   const ref = useRef(null);
   const [problem, setProblem] = useState(null); // { title, text }
   const [silent, setSilent] = useState(false);
@@ -305,7 +331,8 @@ function MediaStage({ file, url, tag }) {
     if (!media) return undefined;
     let timer = 0;
     const onError = async () => {
-      const read = await readProblem(media.currentSrc || media.src);
+      const { text: read, missing } = await readProblem(media.currentSrc || media.src);
+      if (missing) return onMissing();
       const ext = extOf(file.name);
       setProblem(
         read || !driveFresh(30_000)
@@ -365,7 +392,7 @@ function MediaStage({ file, url, tag }) {
   );
 }
 
-function DocStage({ file, kind, note }) {
+function DocStage({ file, kind, note, onMissing }) {
   const [doc, setDoc] = useState(null);
   const [mono, setMono] = useState(pref('textMono') || kind === 'code');
   const textual = kind === 'text' || kind === 'code';
@@ -379,7 +406,7 @@ function DocStage({ file, kind, note }) {
       // Parsing a big document is work: it happens off the page, in a worker (#21).
       const parsed = await runTask('parseDocument', { kind, buffer: bytes, mono });
       if (alive) setDoc(parsed);
-    })().catch((err) => alive && setDoc({ error: err?.message || String(err) }));
+    })().catch((err) => alive && (isMissingCopy(err) ? onMissing() : setDoc({ error: err?.message || String(err) })));
     return () => {
       alive = false;
     };
@@ -434,7 +461,7 @@ function DocStage({ file, kind, note }) {
   );
 }
 
-function PdfStage({ file, url }) {
+function PdfStage({ file, url, onMissing }) {
   const [bytes, setBytes] = useState(null);
   const [error, setError] = useState('');
   const native = nativePdf();
@@ -443,7 +470,7 @@ function PdfStage({ file, url }) {
     let alive = true;
     fetchBytes(file)
       .then((b) => alive && setBytes(b))
-      .catch((err) => alive && setError(err.message));
+      .catch((err) => alive && (isMissingCopy(err) ? onMissing() : setError(err.message)));
     return () => {
       alive = false;
     };
@@ -470,11 +497,21 @@ function PdfStage({ file, url }) {
 /** Chooses what to show, after decrypting the start of the file if its type is unknown. */
 function Stage({ file, control, onSwipe }) {
   const [what, setWhat] = useState({ kind: 'loading' });
+  const [attempt, setAttempt] = useState(0); // Try again: the file is looked for anew
+  // Its encrypted copy isn't where the vault is (deleted outside Secure Box, say).
+  const onMissing = useCallback(() => {
+    noteCopy(file, false);
+    setWhat({ kind: 'missing' });
+  }, [file]);
   useEffect(() => {
     let alive = true;
     setWhat({ kind: 'loading' });
     (async () => {
       await ensureDrive();
+      if (await copyGone(file)) {
+        if (alive) setWhat({ kind: 'missing' });
+        return;
+      }
       const kind = viewerFor(file);
       if (kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'pdf') {
         const url = await sourceUrl(file);
@@ -485,13 +522,15 @@ function Stage({ file, control, onSwipe }) {
         if (alive) setWhat({ kind: 'doc', doc: 'code', note: 'Unknown file type — shown as plain text.' });
       } else if (alive) setWhat({ kind: 'none' });
     })().catch((err) => {
-      if (alive && err?.code !== 'cancelled') setWhat({ kind: 'failed', error: err });
+      if (!alive || err?.code === 'cancelled') return;
+      if (isMissingCopy(err)) onMissing();
+      else setWhat({ kind: 'failed', error: err });
     });
     return () => {
       alive = false;
       releaseUrls();
     };
-  }, [file]);
+  }, [file, attempt, onMissing]);
   switch (what.kind) {
     case 'loading':
       return (
@@ -500,15 +539,17 @@ function Stage({ file, control, onSwipe }) {
           <span>Decrypting…</span>
         </div>
       );
+    case 'missing':
+      return <MissingCopy file={file} onRetry={() => setAttempt((n) => n + 1)} />;
     case 'image':
-      return <ImageStage file={file} url={what.url} control={control} onSwipe={onSwipe} />;
+      return <ImageStage file={file} url={what.url} control={control} onSwipe={onSwipe} onMissing={onMissing} />;
     case 'video':
     case 'audio':
-      return <MediaStage file={file} url={what.url} tag={what.kind} />;
+      return <MediaStage file={file} url={what.url} tag={what.kind} onMissing={onMissing} />;
     case 'pdf':
-      return <PdfStage file={file} url={what.url} />;
+      return <PdfStage file={file} url={what.url} onMissing={onMissing} />;
     case 'doc':
-      return <DocStage file={file} kind={what.doc} note={what.note} />;
+      return <DocStage file={file} kind={what.doc} note={what.note} onMissing={onMissing} />;
     case 'failed':
       return !driveFresh(30_000) ? (
         <Message file={file} title="Your sign-in expired" text="Reconnect to keep viewing your files.">
@@ -563,6 +604,7 @@ function Info({ file }) {
 export function Viewer() {
   const { ids, index, info, editing } = useStore(viewerStore);
   const vault = useSession((s) => s.vault);
+  const missing = useStore(files.store, (v) => v.missing);
   const narrow = useNarrow();
   const ref = useRef(null);
   const control = useRef(null);
@@ -626,7 +668,9 @@ export function Viewer() {
       }
     : {};
   const kind = file ? kindOf(file) : 'other';
-  const isImage = file && viewerFor(file) === 'image';
+  // A file whose encrypted copy is missing has nothing to download or zoom into.
+  const gone = Boolean(file && missing.has(file.blob));
+  const isImage = file && viewerFor(file) === 'image' && !gone;
 
   return (
     <dialog
@@ -675,9 +719,11 @@ export function Viewer() {
                   </button>
                 </div>
               ) : null}
-              <button type="button" className="icon-btn" aria-label="Download" title="Download" onClick={actions.download}>
-                <Icon name="download" />
-              </button>
+              {gone ? null : (
+                <button type="button" className="icon-btn" aria-label="Download" title="Download" onClick={actions.download}>
+                  <Icon name="download" />
+                </button>
+              )}
               {narrow ? (
                 <>
                   <button type="button" className="icon-btn icon-btn-danger" aria-label="Delete" title="Delete" onClick={actions.remove}>

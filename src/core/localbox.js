@@ -77,6 +77,8 @@ export async function writeBox({ source, meta, master = null, password = '', wri
       slots.push({ type: 'account', kid: master.kid, salt: toBase64Url(salt), iv: toBase64Url(iv), key: toBase64Url(ciphertext) });
     }
     if (password) {
+      // A salt of its own for every box, even ones made together with one password: nothing in
+      // them shows they belong together. The slow derivation then runs once per box.
       const salt = randomBytes(16);
       const { iv, ciphertext } = await encryptAesGcm(await passwordKey(password, salt, SHARE_ITERATIONS), fileKey, bind('slot', 'password', id));
       slots.push({ type: 'password', kdf: 'PBKDF2-SHA-256', iterations: SHARE_ITERATIONS, salt: toBase64Url(salt), iv: toBase64Url(iv), key: toBase64Url(ciphertext) });
@@ -361,30 +363,63 @@ export async function zipEntries(content) {
       e += 4 + fieldLength;
     }
     const dir = path.endsWith('/');
-    if (method !== 0 || packed !== length) throw new BoxError('zip', 'This folder box uses a ZIP feature Secure Box doesn’t read.');
+    // Stored as is (Secure Box's own ZIPs), or deflated (as Google Drive and others pack downloads).
+    if (!((method === 0 && packed === length) || method === 8)) throw new BoxError('zip', 'This ZIP file is packed in a way Secure Box doesn’t read.');
     try {
       Z.checkPath(path, dir);
     } catch {
       throw damaged('This folder box contains an unsafe path.');
     }
-    out.push({ path, dir, size: length, offset, crc: v.getUint32(at + 16, true) });
+    out.push({ path, dir, size: length, packed, method, offset, crc: v.getUint32(at + 16, true) });
     at += 46 + nameLength + extraLength + commentLength;
   }
   return out;
 }
 
-/** Yields the bytes of one file inside a folder box, and checks its CRC-32 at the end. */
+/** Yields the bytes of one file inside a ZIP (a folder box, a backup), and checks its CRC-32 at the end. */
 export async function* zipEntryData(content, entry, { window = 8 * 1024 * 1024 } = {}) {
   const local = await content.read(entry.offset, entry.offset + 29);
   const lv = new DataView(local.buffer, local.byteOffset, local.byteLength);
   if (lv.getUint32(0, true) !== 0x04034b50) throw damaged();
   const start = entry.offset + 30 + lv.getUint16(26, true) + lv.getUint16(28, true);
-  if (start + entry.size > content.size) throw damaged();
+  const deflated = entry.method === 8;
+  const stored = deflated ? entry.packed : entry.size;
+  if (start + stored > content.size) throw damaged();
   let crc = 0;
-  for (let from = start; from < start + entry.size; from += window) {
-    const bytes = await content.read(from, Math.min(start + entry.size, from + window) - 1);
-    crc = Z.crc32(crc, bytes);
-    yield bytes;
+  let length = 0;
+  const pieces = (async function* () {
+    for (let from = start; from < start + stored; from += window) yield await content.read(from, Math.min(start + stored, from + window) - 1);
+  })();
+  if (!deflated) {
+    for await (const bytes of pieces) {
+      crc = Z.crc32(crc, bytes);
+      length += bytes.length;
+      yield bytes;
+    }
+  } else {
+    // Unpacked by the browser itself, a window at a time.
+    const packed = new ReadableStream({
+      async pull(controller) {
+        const next = await pieces.next();
+        if (next.done) controller.close();
+        else controller.enqueue(next.value);
+      },
+      cancel: () => pieces.return(),
+    });
+    const unpacked = packed.pipeThrough(new DecompressionStream('deflate-raw'));
+    const reader = unpacked.getReader();
+    try {
+      for (let next = await reader.read(); !next.done; next = await reader.read()) {
+        length += next.value.length;
+        if (length > entry.size) throw damaged(`${entry.path} is longer than it says.`);
+        crc = Z.crc32(crc, next.value);
+        yield next.value;
+      }
+    } catch (err) {
+      throw err?.code ? err : damaged(`${entry.path} can’t be unpacked.`);
+    } finally {
+      reader.cancel().catch(() => {});
+    }
   }
-  if (crc !== entry.crc) throw damaged(`${entry.path} failed its checksum.`);
+  if (length !== entry.size || crc !== entry.crc) throw damaged(`${entry.path} failed its checksum.`);
 }

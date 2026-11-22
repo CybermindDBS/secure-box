@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import { localSupport } from '../../core/localstore.js';
-import { allowDeviceFolder, createDeviceVault, deleteDeviceAtGate, forgetDeviceFolderAtGate, forgetGoneDevice, relocateDevice, restoreDeviceFromGate, startOverDevice } from '../../session/device.js';
+import { allowDeviceFolder, createDeviceVault, deleteDeviceAtGate, forgetDeviceFolderAtGate, forgetGoneDevice, openDeviceVault, relocateDevice, restoreDeviceFromGate, startOverDevice } from '../../session/device.js';
 import { formatDate, pickFile } from '../../session/io.js';
+import { deviceChoice } from '../../session/memory.js';
 import { setSection } from '../../session/nav.js';
+import { bringOver } from '../../session/bringover.js';
 import { companyName, currentProvider, placeDetail, placeRows, providerName } from '../../session/places.js';
 import { DEMO, state } from '../../session/store.js';
 import {
@@ -61,8 +63,10 @@ function PlaceChip() {
   useSession((s) => s.identity);
   useSession((s) => s.backend);
   const provider = currentProvider();
-  const name = DEMO ? 'Demo vault' : providerName(provider);
-  const detail = DEMO ? 'Sample data' : placeDetail(provider);
+  // The demo's cloud is its sample data; a vault on this device is one there too (moved or copied there).
+  const demoCloud = DEMO && provider !== 'local';
+  const name = demoCloud ? 'Demo vault' : providerName(provider);
+  const detail = demoCloud ? 'Sample data' : placeDetail(provider);
   return (
     <div className="place-chip">
       <span className="place-chip-icon" aria-hidden="true">
@@ -501,6 +505,43 @@ function MissingVault() {
 // ---------------------------------------------------------------------------
 // A vault deleted or moved outside Secure Box: what happened, and the ways on
 // ---------------------------------------------------------------------------
+/** The vault moved away from this place (session/migrate.js): where it went, and the way there. */
+function VaultMoved({ gate }) {
+  const provider = currentProvider();
+  const there = gate.to !== provider && gate.to !== 'local';
+  const otherAccount = gate.to === provider && provider !== 'local';
+  const here = gate.to === 'local' && Boolean(deviceChoice()); // this device has a vault: it may well be the one
+  return (
+    <>
+      <div className="problem-head">
+        <span className="problem-icon is-info" aria-hidden="true">
+          <Icon name="move" size={20} />
+        </span>
+        <h2 className="home-title">Your vault moved</h2>
+      </div>
+      <p className="panel-text">
+        It was {gate.text}.{' '}
+        {there
+          ? 'Open it there: everything that was here went with it.'
+          : otherAccount
+            ? 'Sign in with that account to open it.'
+            : 'Open it on that device, under This device: everything that was here went with it.'}
+      </p>
+      <div className="btn-stack">
+        {there ? <Go action={() => openPlace(gate.to)}>Open your {providerName(gate.to)} vault</Go> : null}
+        {otherAccount ? <Go action={() => signIn('select_account', provider)}>Use another {companyName(provider)} account</Go> : null}
+        {here ? <Go action={openDeviceVault}>Open your vault on this device</Go> : null}
+        <Go action={startOverInCloud} kind={there || otherAccount || here ? 'ghost' : 'primary'}>
+          Start a new vault here
+        </Go>
+      </div>
+      <div className="home-links">
+        <Link onClick={showWelcome}>Open another vault</Link>
+      </div>
+    </>
+  );
+}
+
 function VaultMissing({ gate }) {
   const provider = currentProvider();
   const head = (title) => (
@@ -527,8 +568,74 @@ function VaultMissing({ gate }) {
       </>
     );
   }
+  // Secure Box now connects to this cloud as a new app, which can't see what the old one made.
+  const name = providerName(provider);
+  const onedrive = provider === 'microsoft';
+  const sees = `${name} shows an app only ${onedrive ? 'its own folder' : 'the files it made itself'}`;
+  if (gate.kind === 'previous') {
+    return (
+      <>
+        {head(gate.had ? 'Your vault is with Secure Box’s previous connection' : 'Had a vault here before?')}
+        <p className="panel-text">
+          Secure Box now connects to {name} as a new app, and {sees}.{' '}
+          {gate.had
+            ? `Your vault is still in your ${name}. Bring it over: Secure Box signs in through its previous connection too, and copies your vault across exactly as it is.`
+            : `If you had a vault in this ${companyName(provider)} account, bring it over: Secure Box signs in through its previous connection too, and copies it across exactly as it is.`}
+        </p>
+        <div className="btn-stack">
+          <Go action={bringOver}>Bring it over</Go>
+          <Go action={startOverInCloud} kind="ghost">
+            Start a new vault here
+          </Go>
+        </div>
+        <div className="home-links">
+          {otherAccount}
+          {elsewhere}
+        </div>
+      </>
+    );
+  }
+  if (gate.kind === 'app') {
+    return (
+      <>
+        {head(`Secure Box can’t see your vault in ${name}`)}
+        {gate.failed ? (
+          <p className="panel-text">
+            Secure Box couldn’t sign in through its previous connection: {gate.failed} If {companyName(provider)} said that app was deleted or blocked, it’s gone for good.
+          </p>
+        ) : null}
+        <p className="panel-text">
+          Your vault is still in your {name}
+          {onedrive ? ', in Apps › Secure Box' : ', in its “Secure Box” folder'}. But Secure Box now connects to {name} as a different app, and {sees}. To bring your vault back:
+        </p>
+        <ol className="local-steps">
+          <li>
+            {onedrive
+              ? 'On onedrive.com, open Apps, select the “Secure Box” folder with your vault, and choose Download.'
+              : 'On drive.google.com, right-click the “Secure Box” folder and choose Download. Google may split it into several ZIP files.'}
+          </li>
+          <li>Choose Restore from the download below, and pick {onedrive ? 'the ZIP file' : 'all the ZIP files'}.</li>
+          <li>Unlock your vault, then use ⋯ → Move or copy this vault… to put it back in your {name}.</li>
+        </ol>
+        <div className="btn-stack">
+          <Go action={restoreDeviceFromGate}>Restore from the download…</Go>
+          {gate.failed ? (
+            <Go action={bringOver} kind="ghost">
+              Try the previous connection again
+            </Go>
+          ) : null}
+          <Go action={startOverInCloud} kind="ghost">
+            Start a new vault here
+          </Go>
+        </div>
+        <div className="home-links">
+          {otherAccount}
+          {elsewhere}
+        </div>
+      </>
+    );
+  }
   if (gate.kind === 'cloud') {
-    const onedrive = provider === 'microsoft';
     return (
       <>
         {head(`Your vault isn’t in your ${providerName(provider)} any more`)}
@@ -629,11 +736,12 @@ const PANELS = {
   'missing-keyring': MissingKeyring,
   'missing-vault': MissingVault,
   'vault-missing': VaultMissing,
+  'vault-moved': VaultMoved,
   setup: Setup,
 };
 
 // Panels that are about one place show it on top, with the way back to the others.
-const ABOUT_A_PLACE = new Set(['working', 'unlock', 'start', 'create', 'adopt', 'kit', 'recover', 'device-new', 'device-allow', 'device-ios', 'problem', 'missing-keyring', 'missing-vault', 'vault-missing']);
+const ABOUT_A_PLACE = new Set(['working', 'unlock', 'start', 'create', 'adopt', 'kit', 'recover', 'device-new', 'device-allow', 'device-ios', 'problem', 'missing-keyring', 'missing-vault', 'vault-missing', 'vault-moved']);
 
 function TrustFooter() {
   return (

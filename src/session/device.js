@@ -3,14 +3,14 @@
  * choose), backups, moving it, deleting it, and what happens when its folder goes missing.
  */
 import { parseKeyring, trustedRevision, verifyRevision } from '../core/keyring.js';
-import { allowFolder, BROWSER_GONE, createLocalBackend, findLocalVaults, forgetFolder, localSupport, readBackup, vaultIn } from '../core/localstore.js';
-import { forgetStreams } from '../core/stream.js';
+import { allowFolder, BROWSER_GONE, createLocalBackend, findLocalVaults, forgetFolder, LocalError, localSupport, readBackup, vaultIn } from '../core/localstore.js';
 import { formatBytes } from '../core/filetypes.js';
 import { parseEnvelope } from '../core/vault.js';
+import { runTask } from '../workers/pool.js';
 import { ask, confirmDialog, toast } from './bridge.js';
 import { commit, counted, lock, saveChain, vaultGone } from './cloud.js';
-import { files } from './files.js';
-import { downloadFile, pickFile } from './io.js';
+import { files, noteCopy } from './files.js';
+import { downloadFile, pickFiles } from './io.js';
 import * as memory from './memory.js';
 import { folderPath, isDevice } from './places.js';
 import { DEMO, publish, state } from './store.js';
@@ -21,9 +21,14 @@ export const notifyVaultChanged = () => channel?.postMessage({ type: 'vault-chan
 
 /**
  * A backend for a vault on this device, wired to the session: other windows hear of each save,
- * and a vault found deleted outside Secure Box while it's open is reported once (gone.js).
+ * and the open vault found deleted outside Secure Box is reported once (gone.js). One that isn't
+ * open (being switched to, or moved to) says so where it was being opened instead: the open
+ * vault, a cloud say, is fine, and the dialog for it would say otherwise.
  */
-export const deviceBackend = (options) => createLocalBackend({ demo: DEMO, notify: notifyVaultChanged, onGone: (err) => vaultGone(err), ...options });
+export const deviceBackend = (options) => {
+  const backend = createLocalBackend({ demo: DEMO, notify: notifyVaultChanged, onGone: (err) => (state.backend === backend ? vaultGone(err) : undefined), ...options });
+  return backend;
+};
 
 /** Chrome won't let a site use Documents, Desktop or Downloads themselves, only folders inside them (#9). */
 export const FOLDER_HINT = 'Choose a folder inside Documents, or make one in the picker (for example “Vaults”). Browsers don’t allow Documents, Desktop or Downloads themselves.';
@@ -156,22 +161,49 @@ export async function forgetDeviceFolderAtGate() {
   showWelcome({ message: `Secure Box forgot ${pick ? folderPath(pick.name) : 'the folder'}. Its encrypted files are still there.` });
 }
 
-/** Vault tab → This device → Restore a backup: makes this device's vault from a backup file. */
+/** What a vault can be restored from: a backup, or its folder as a cloud's website downloads it (maybe several ZIP files). */
+const pickRestore = () => pickFiles({ accept: '.zip,application/zip', multiple: true });
+
+/** Copies every encrypted copy out of `backup` into `backend`, saying how far it got with `say(percent)`. */
+async function restoreCopies(backend, backup, say) {
+  const names = backup.names();
+  const total = names.reduce((n, name) => n + backup.blob(name).size, 0) || 1;
+  let done = 0;
+  let shown = -1;
+  for (const name of names) {
+    await backend.restoreBlob(backup, name, (n) => {
+      done += n;
+      const percent = Math.floor((done / total) * 100);
+      if (percent !== shown) say((shown = percent));
+    });
+  }
+}
+
+/**
+ * Vault tab → This device → Restore a backup: makes this device's vault from a backup, or from a
+ * vault's folder downloaded from Google Drive or OneDrive (the way back when Secure Box can't see
+ * it there any more).
+ */
 export async function restoreDeviceFromGate() {
-  const file = await pickFile('.zip,application/zip');
-  if (!file) return;
+  const files = await pickRestore();
+  if (!files.length) return;
   try {
-    const backup = await readBackup(file);
+    const backup = await readBackup(files);
     const { kid } = backup.manifest;
     if ((await findLocalVaults({ demo: DEMO })).some((v) => v.kid === kid && v.where === 'browser')) {
-      throw new Error('This device already has that vault. Open it, then use ⋯ → Restore a backup to add what’s missing.');
+      // A download can be of another vault with the same master key (one in a cloud): it's added to that one here.
+      throw new Error(
+        backup.from === 'download'
+          ? 'This device already has a vault with the same master key. Open it, then use ⋯ → Restore a backup… there to add what this download has.'
+          : 'This device already has that vault. Open it, then use ⋯ → Restore a backup to add what’s missing.',
+      );
     }
     showWorking('Restoring your vault…');
     const backend = createLocalBackend({ where: 'browser', kid, demo: DEMO });
-    await backend.create({ keyringText: backup.keyring, vaultText: backup.index, kid });
-    for (const id of backup.blobIds()) await backend.restoreBlob(backup, `local:${id}`);
+    await backend.create({ keyringText: backup.keyring, vaultText: backup.vault, kid });
+    await restoreCopies(backend, backup, (percent) => showWorking(`Restoring your vault… ${percent}%`));
     await useDeviceVault({ where: 'browser', kid });
-    toast('Restored. Unlock it with your master password.');
+    toast(backup.from === 'download' ? 'Restored on this device. Unlock it with your master password. ⋯ → Move or copy this vault… can then put it back in your cloud.' : 'Restored. Unlock it with your master password.');
   } catch (err) {
     showDeviceNew(err.message);
   }
@@ -199,6 +231,61 @@ export async function deleteDeviceAtGate() {
   showWelcome({ message: 'Your vault on this device was deleted.' });
 }
 
+/**
+ * Switching to this device's vault (or moving one there) found it gone, deleted or moved outside
+ * Secure Box: what happened, and the ways on. `err` carries `kid` and `where` (browser or
+ * folder). With `moving`, the vault being moved can take its place. Resolves true once this
+ * device has a vault to open (or room for one) again, false if it's left as it is.
+ */
+export async function deviceVaultGone(err, { moving = false } = {}) {
+  const { kid = '', where = 'browser' } = err;
+  const findable = where === 'folder' && localSupport().folder && !DEMO;
+  const choice = await ask('choose', {
+    title: 'Your vault on this device is gone',
+    message: moving
+      ? `${err.message} Your vault can go there instead${findable ? ', or find the folder if it was moved' : ''}.`
+      : `${err.message} You can set up a new, empty vault on this device${findable ? ', restore one from a backup, or find its folder if it was moved' : ' or restore one from a backup'}.`,
+    choices: [
+      ...(findable ? [{ id: 'find', label: 'Find the folder…' }] : []),
+      ...(moving ? [] : [{ id: 'restore', label: 'Restore a backup…' }]),
+      { id: 'new', label: moving ? 'Put it there instead' : 'Set up a new vault', primary: true },
+    ],
+  });
+  if (!choice) return false;
+  if (choice === 'find') return findDeviceFolder(kid);
+  if (choice === 'restore') return restoreDeviceHere(kid);
+  if (kid) await forgetDeletedDevice(kid);
+  return true;
+}
+
+/** Choose the folder a vault on this device was moved to. Resolves true once it's found there. */
+async function findDeviceFolder(missingKid) {
+  const handle = await pickVaultFolder();
+  if (!handle) return false;
+  const kid = await vaultIn(handle);
+  if (!kid) throw new Error(`“${handle.name}” doesn’t hold a Secure Box vault. Choose the folder that does.`);
+  if (missingKid && kid !== missingKid) await forgetDeletedDevice(missingKid); // another vault: the missing one is let go
+  await deviceBackend({ where: 'folder', handle, kid, existing: true }).load(); // remembers the folder where it is now
+  memory.rememberDeviceChoice({ kid, where: 'folder' });
+  return true;
+}
+
+/** A backup (or a cloud's folder download) restored as this device's vault, in this browser. Resolves true once it's there. */
+async function restoreDeviceHere(missingKid) {
+  const files = await pickRestore();
+  if (!files.length) return false;
+  const backup = await readBackup(files);
+  const { kid } = backup.manifest;
+  if ((await findLocalVaults({ demo: DEMO })).some((v) => v.kid === kid)) throw new Error(`This device already has the vault in that ${backup.from === 'download' ? 'download' : 'backup'}.`);
+  toast('Restoring your vault on this device…');
+  const backend = createLocalBackend({ where: 'browser', kid, demo: DEMO });
+  await backend.create({ keyringText: backup.keyring, vaultText: backup.vault, kid });
+  await restoreCopies(backend, backup, () => {});
+  if (missingKid && missingKid !== kid) await forgetDeletedDevice(missingKid);
+  memory.rememberDeviceChoice({ kid, where: 'browser' });
+  return true;
+}
+
 /** Missing-vault card → Find the folder: the vault's folder was moved or renamed outside Secure Box. */
 export async function relocateDevice() {
   const handle = await pickVaultFolder();
@@ -224,7 +311,7 @@ export async function forgetGoneDevice() {
 }
 
 /** What this browser remembers about a deleted vault on this device: its folder, the choice of it, its last backup. */
-async function forgetDeletedDevice(kid) {
+export async function forgetDeletedDevice(kid) {
   await forgetFolder(kid, { demo: DEMO });
   memory.forgetDeviceChoice(kid);
   memory.forgetBackup(kid);
@@ -250,11 +337,17 @@ export async function deviceBackendForSession() {
   }
   if (!support.browser && !support.folder) throw new Error('This browser can’t keep a vault on this device. Use an up-to-date Chrome, Edge, Firefox or Safari.');
   const vaults = await findLocalVaults({ demo: DEMO });
+  const remembered = memory.deviceChoice();
   let pick =
     vaults.find((v) => v.kid === state.master.kid) ||
     vaults.find((v) => state.masters.has(v.kid)) ||
-    vaults.find((v) => v.kid === memory.deviceChoice()?.kid) ||
+    vaults.find((v) => v.kid === remembered?.kid) ||
     vaults[0];
+  // The vault this device had is gone (this site's data cleared, or its folder forgotten): say so,
+  // rather than quietly make a new, empty one in its place.
+  if (!pick && remembered) {
+    throw Object.assign(new LocalError('gone', remembered.where === 'browser' ? BROWSER_GONE : 'Secure Box lost track of the folder that held your vault on this device.'), remembered);
+  }
   const found = Boolean(pick);
   if (!pick) {
     const choice = await chooseDeviceWhere();
@@ -317,7 +410,9 @@ export async function backupDevice() {
   let backup;
   try {
     setDevice({ busy: 'Backing up…' });
-    backup = await state.backend.backup(state.vault.files, { onProgress: busyText('Backing up') });
+    // Packing checksums every byte of the vault: a worker does it, so the page stays responsive.
+    const pack = (items, { onProgress }) => runTask('zipFolder', { items }, { onProgress });
+    backup = await state.backend.backup(state.vault.files, { onProgress: busyText('Backing up'), pack });
     memory.rememberBackup(state.master.kid, Date.now());
   } catch (err) {
     toast(err.message, 'error');
@@ -325,43 +420,62 @@ export async function backupDevice() {
   } finally {
     setDevice({ busy: '' });
   }
-  const { blob, name } = backup;
+  const { blob, name, missing } = backup;
+  // A file whose encrypted copy is missing here (deleted outside Secure Box) can't be in it: say so.
+  for (const entry of missing) noteCopy(entry, false);
+  const left = !missing.length
+    ? ''
+    : missing.length === 1
+      ? ` “${missing[0].name}” isn’t in it: its encrypted copy is missing.`
+      : ` ${missing.length} files aren’t in it: their encrypted copies are missing.`;
   const file = new File([blob], name, { type: 'application/zip' });
   if (localSupport().ios && navigator.canShare?.({ files: [file] })) {
     // Sharing needs a fresh tap: building the backup took a while.
-    const ok = await confirmDialog({ title: 'Backup ready', message: `${formatBytes(blob.size)}. Save it somewhere off this device, for example in Files or iCloud Drive.`, confirmLabel: 'Save backup' });
+    const ok = await confirmDialog({ title: 'Backup ready', message: `${formatBytes(blob.size)}.${left} Save it somewhere off this device, for example in Files or iCloud Drive.`, confirmLabel: 'Save backup' });
     if (ok) await navigator.share({ files: [file], title: name }).catch((err) => err.name === 'AbortError' || toast(err.message, 'error'));
     return;
   }
   downloadFile(name, blob, 'application/zip');
-  toast(`Backup saved to your downloads (${formatBytes(blob.size)})`);
+  toast(`Backup saved to your downloads (${formatBytes(blob.size)}).${left}`, left ? 'error' : undefined);
 }
 
-/** ⋯ → Restore a backup: adds whatever the backup has and this device's vault doesn't. */
+/**
+ * ⋯ → Restore a backup: adds whatever the backup has and this device's vault doesn't, and puts
+ * back encrypted copies that went missing here (deleted outside Secure Box). Nothing here is
+ * replaced or deleted. Only a backup of this vault (its master key) can be restored into it.
+ */
 export async function restoreDevice() {
   if (!isDevice()) return;
-  const file = await pickFile('.zip,application/zip');
-  if (!file) return;
+  const files = await pickRestore();
+  if (!files.length) return;
   try {
     setDevice({ busy: 'Restoring…' });
-    const backup = await readBackup(file);
-    if (backup.manifest.kid !== state.master.kid) throw new Error('That backup belongs to a different Secure Box master key.');
-    const saved = await state.cipher.open(parseEnvelope(backup.index, state.cipher.format));
+    const backup = await readBackup(files);
+    const what = backup.from === 'download' ? 'download' : 'backup';
+    if (backup.manifest.kid !== state.master.kid) throw new Error(`That ${what} is of another vault, which has its own master key, so it can’t be restored into this one.`);
+    const saved = await state.cipher.open(parseEnvelope(backup.vault));
     const have = { items: new Set(state.vault.items.map((i) => i.id)), folders: new Set(state.vault.folders.map((f) => f.id)), files: new Set(state.vault.files.map((f) => f.id)) };
     const changes = [
       ...saved.items.filter((i) => !have.items.has(i.id)).map((item) => ({ op: 'put', item })),
       ...saved.folders.filter((f) => !have.folders.has(f.id)).map((folder) => ({ op: 'folder-put', folder })),
     ];
     const todo = saved.files.filter((f) => !have.files.has(f.id));
-    const total = todo.reduce((n, f) => n + f.size, 0) || 1;
+    // Files here whose encrypted copy is missing get it back, if the backup has that very copy.
+    const gone = new Set(await state.backend.absent(state.vault.files.map((f) => f.blob)));
+    const lost = state.vault.files.filter((f) => gone.has(f.blob));
+    const repair = lost.filter((f) => backup.blob(f.blob));
+    const total = [...todo, ...repair].reduce((n, f) => n + f.size, 0) || 1;
     let copied = 0;
+    const progress = (n) => {
+      copied += n;
+      busyText('Restoring')(Math.min(1, copied / total));
+    };
     for (const entry of todo) {
-      const ok = await state.backend.restoreBlob(backup, entry.driveId, (n) => {
-        copied += n;
-        busyText('Restoring')(Math.min(1, copied / total));
-      });
+      const ok = await state.backend.restoreBlob(backup, entry.blob, progress);
       if (ok) changes.push({ op: 'file-put', file: entry });
     }
+    let repaired = 0;
+    for (const entry of repair) if (await state.backend.restoreBlob(backup, entry.blob, progress)) repaired++;
     if (changes.length) await commit({ op: 'batch', changes });
     if (backup.keyring) {
       const copy = parseKeyring(backup.keyring);
@@ -370,51 +484,20 @@ export async function restoreDevice() {
         await spreadKeyring();
       }
     }
-    toast(changes.length ? `Restored ${changes.length} ${changes.length === 1 ? 'item' : 'items'}` : 'Nothing to add: everything in that backup is already here');
+    const restored = [changes.length && counted(changes.length, 'item', 'items'), repaired && counted(repaired, 'missing file', 'missing files')].filter(Boolean);
+    const still = lost.length - repaired;
+    const several = backup.from === 'download' && files.length > 1;
+    const source = several ? 'those ZIP files' : `that ${what}`;
+    const lacks = several ? 'don’t have' : 'doesn’t have';
+    const stillNote = !still ? '' : still === 1 ? `One file’s encrypted copy is still missing: ${source} ${lacks} it either.` : `${still} files’ encrypted copies are still missing: ${source} ${lacks} them either.`;
+    if (restored.length) toast(`Restored ${restored.join(' and ')}.${stillNote ? ` ${stillNote}` : ''}`, still ? 'error' : undefined);
+    else toast(stillNote ? `Nothing to add from ${source}. ${stillNote}` : `Nothing to add: everything in ${source} is already here`, still ? 'error' : undefined);
   } catch (err) {
     toast(err.message, 'error');
   } finally {
     setDevice({ busy: '' });
     files.vaultChanged();
-  }
-}
-
-/** ⋯ → Move this vault: copies it to another place exactly as stored, opens it there, then deletes the old copy. */
-export async function moveDevice() {
-  if (!isDevice() || state.device.busy) return;
-  if (files.unfinished()) return toast('Let the uploads finish, then move the vault.', 'error');
-  const source = state.backend;
-  const choice = await chooseDeviceWhere({ moving: source.where });
-  if (!choice) return;
-  const kid = state.master.kid;
-  const target = deviceBackend({ where: choice.where, handle: choice.handle || null, kid });
-  setDevice({ busy: 'Moving…' });
-  try {
-    await saveChain; // nothing half-saved left behind in the old place
-    const leftover = await source.moveTo(target, {
-      onProgress: busyText('Moving'),
-      // The copy is complete: from here the app reads and saves there.
-      opened: async () => {
-        const { vault } = await target.load(); // also remembers a chosen folder
-        if (!vault) throw new Error('The copy couldn’t be opened.');
-        state.backend = target;
-        state.rev = vault.rev;
-        memory.rememberDeviceChoice({ kid, where: target.where });
-        if (target.where === 'browser') await forgetFolder(kid, { demo: DEMO });
-        forgetStreams();
-      },
-    });
-    channel?.postMessage({ type: 'device-moved', kid }); // other windows with it open lock, then open it in its new place
-    state.device = { ...state.device, protection: '' };
-    if (target.where === 'browser') navigator.storage?.persist?.().catch(() => {});
-    if (leftover) toast(`Moved to ${placeOf(target)}, but the old copy couldn’t be deleted: ${leftover.message}`, 'error');
-    else toast(`Moved to ${placeOf(target)}`);
-  } catch (err) {
-    toast(err.message, 'error');
-  } finally {
-    setDevice({ busy: '' });
-    refreshDeviceStatus();
-    checkStrays();
+    files.checkCopies();
   }
 }
 

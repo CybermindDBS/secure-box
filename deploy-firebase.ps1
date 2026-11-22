@@ -7,11 +7,13 @@
   "firebase deploy --only hosting" to publish dist/ with the security
   headers from firebase.json. Settings are remembered in deploy.settings.json.
 
-  IMPORTANT: keep using the SAME Google OAuth client ID once you have vaults (it is remembered
-  in deploy.settings.json), with the Firebase addresses added to it. Google Drive only shows Secure Box the
-  files created through that client's Google Cloud project, so a client from another project
-  would not see existing vaults. Any Firebase project can host the files; adding Firebase to
-  that same Google Cloud project keeps everything in one place.
+  IMPORTANT: keep using the SAME Google Cloud project and the SAME Microsoft app registration once
+  people have vaults (both are remembered in deploy.settings.json). Google Drive shows Secure Box
+  only the files its own Google Cloud project made, and OneDrive only its app registration's
+  folder, so switching either hides every vault already made (nothing is deleted). A new OAuth
+  client in the same Google project is fine. This script refuses a switch unless you pass
+  -NewCloudApps. Any Firebase project can host the files; adding Firebase to that same Google
+  Cloud project keeps everything in one place.
 
 .EXAMPLE
   .\deploy-firebase.ps1 -Project my-cloud-project-id -GoogleClientId 1234-abc.apps.googleusercontent.com
@@ -24,6 +26,16 @@
 .EXAMPLE
   .\deploy-firebase.ps1 -MicrosoftClientId 00000000-0000-0000-0000-000000000000
   Adds Microsoft sign-in (OneDrive): the Application (client) ID of your Microsoft app registration.
+
+.EXAMPLE
+  .\deploy-firebase.ps1 -GoogleClientId 5678-xyz.apps.googleusercontent.com -NewCloudApps
+  Switches on purpose to a client in another Google Cloud project (or -MicrosoftClientId to another
+  app registration). Keep the old one working: it becomes Secure Box's previous connection, and
+  Secure Box offers to bring each vault over from it.
+
+.EXAMPLE
+  .\deploy-firebase.ps1 -ForgetPreviousCloudApps
+  Ends that, once everyone's vault has been brought over.
 #>
 [CmdletBinding()]
 param(
@@ -31,7 +43,9 @@ param(
   [string]$GoogleClientId,
   [string]$MicrosoftClientId,
   [int]$AutoLockMinutes,
-  [int]$SessionHours
+  [int]$SessionHours,
+  [switch]$NewCloudApps,
+  [switch]$ForgetPreviousCloudApps
 )
 
 Set-StrictMode -Version 2.0
@@ -79,6 +93,37 @@ if ($MicrosoftClientId -and $MicrosoftClientId -notmatch '^[0-9a-fA-F]{8}-([0-9a
   Stop-Deploy 'Pass -MicrosoftClientId with the Application (client) ID of your Microsoft app registration (a GUID).'
 }
 
+# --- Guard: the Google project and the Microsoft app decide what Secure Box can see ----------
+# Google Drive shows Secure Box only the files its own Google Cloud project made (the number a
+# client ID starts with), and OneDrive only its app registration's folder. Switching either hides
+# every vault people already have there, though nothing is deleted. Switching on purpose keeps the
+# old one as Secure Box's previous connection, from which it brings each vault over.
+function Get-ProjectNumber([string]$Id) { return ($Id -split '-')[0] }
+$oldGoogle = if ($saved.Contains('GoogleClientId')) { [string]$saved['GoogleClientId'] } else { '' }
+$oldMicrosoft = if ($saved.Contains('MicrosoftClientId')) { [string]$saved['MicrosoftClientId'] } else { '' }
+$googleSwitch = [bool]($oldGoogle -and ((Get-ProjectNumber $oldGoogle) -ne (Get-ProjectNumber $GoogleClientId)))
+$microsoftSwitch = [bool]($oldMicrosoft -and $MicrosoftClientId -and ($oldMicrosoft -ne $MicrosoftClientId))
+if (($googleSwitch -or $microsoftSwitch) -and -not $NewCloudApps) {
+  $why = @()
+  if ($googleSwitch) {
+    $why += "-GoogleClientId is in another Google Cloud project ($(Get-ProjectNumber $GoogleClientId)) than the one this site uses ($(Get-ProjectNumber $oldGoogle)).`n       Google Drive shows Secure Box only the files its own project made."
+  }
+  if ($microsoftSwitch) {
+    $why += "-MicrosoftClientId is another Microsoft app registration than the one this site uses ($oldMicrosoft).`n       OneDrive gives each app registration a folder of its own."
+  }
+  Stop-Deploy (($why -join "`n       ") +
+    "`n       Every vault people already have there would look gone to Secure Box, though nothing is deleted." +
+    "`n       Keep the one in use (a new OAuth client in the same Google project is fine). To switch on purpose," +
+    "`n       keep the old one working and run this again with -NewCloudApps: Secure Box then offers to bring" +
+    "`n       each vault over from it.")
+}
+if ($googleSwitch) { $saved['PreviousGoogleClientId'] = $oldGoogle }
+if ($microsoftSwitch) { $saved['PreviousMicrosoftClientId'] = $oldMicrosoft }
+if ($ForgetPreviousCloudApps) {
+  $saved.Remove('PreviousGoogleClientId')
+  $saved.Remove('PreviousMicrosoftClientId')
+}
+
 $firebase = Get-Command firebase.cmd -ErrorAction SilentlyContinue
 if (-not $firebase) { $firebase = Get-Command firebase -ErrorAction SilentlyContinue }
 if (-not $firebase) {
@@ -98,6 +143,9 @@ $saved['SessionHours'] = $SessionHours
 Write-Step 'Writing public/assets/config.json'
 $config = [ordered]@{ googleClientId = $GoogleClientId }
 if ($MicrosoftClientId) { $config['microsoftClientId'] = $MicrosoftClientId }
+# Secure Box's previous connections, while vaults are brought over from them (see the guard above).
+if ($saved.Contains('PreviousGoogleClientId') -and $saved['PreviousGoogleClientId']) { $config['previousGoogleClientId'] = [string]$saved['PreviousGoogleClientId'] }
+if ($saved.Contains('PreviousMicrosoftClientId') -and $saved['PreviousMicrosoftClientId']) { $config['previousMicrosoftClientId'] = [string]$saved['PreviousMicrosoftClientId'] }
 $config['autoLockMinutes'] = $AutoLockMinutes
 $config['sessionHours'] = $SessionHours
 [System.IO.File]::WriteAllText($ConfigPath, ($config | ConvertTo-Json) + "`n", $Utf8NoBom)

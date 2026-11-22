@@ -1,0 +1,318 @@
+/* ==========================================================================
+   Moving or copying a vault (ui/dialogs/MoveVault.jsx), and the card a moved
+   vault leaves on the Vault tab
+   ========================================================================== */
+.move-dialog {
+  width: min(540px, calc(100vw - 24px));
+}
+
+.move-dialog .dialog-body {
+  padding-top: 22px;
+}
+
+.move-dialog h2 {
+  margin-bottom: 10px;
+  font-size: 17px;
+  font-weight: 620;
+  letter-spacing: -0.012em;
+  outline: none;
+}
+
+.move-body {
+  display: grid;
+  gap: 14px;
+}
+
+.move-body > .panel-text,
+.move-body > .panel-hint {
+  margin: 0;
+}
+
+/* From → To */
+.move-route {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: stretch;
+  gap: 6px;
+}
+
+.move-route-arrow {
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+}
+
+.move-place {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.move-place.is-to {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface));
+}
+
+.move-place-icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.move-place-text {
+  display: grid;
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.move-place-text small {
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.move-place-text strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.move-place-text span {
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 460px) {
+  .move-route {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .move-route-arrow {
+    height: 12px;
+    transform: rotate(90deg);
+  }
+}
+
+/* What's at the place now */
+.move-there {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.move-there > .icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--accent);
+}
+
+.move-there.is-warn {
+  background: var(--danger-soft);
+  color: var(--text);
+}
+
+.move-there.is-warn > .icon {
+  color: var(--danger);
+}
+
+.move-there p {
+  margin: 0;
+}
+
+/* Combine or replace; move or copy */
+.move-group {
+  margin: 2px 0 -6px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.move-options.local-where-choice {
+  margin-bottom: 0;
+}
+
+.local-option.is-danger:has(input:checked) {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.local-option.is-danger input {
+  accent-color: var(--danger);
+}
+
+.move-secret {
+  display: grid;
+  gap: 2px;
+  margin-top: -4px;
+  padding: 12px 14px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent-soft) 40%, var(--surface));
+}
+
+.move-secret .field {
+  margin-bottom: 4px;
+}
+
+.move-secret-hint {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+/* How much, and whether it fits */
+.move-size {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  margin: 0;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+.move-size.is-short span:last-child {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* Signing in, looking */
+.move-wait {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.move-wait p {
+  margin: 0;
+}
+
+/* The steps, ticked off */
+.move-steps {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.move-steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 2px;
+  font-size: 13.5px;
+  transition: color 0.2s;
+}
+
+.move-steps li.is-later {
+  color: var(--text-3);
+}
+
+.move-step-mark {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+}
+
+.move-steps li.is-done .move-step-mark {
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+  color: var(--ok);
+  animation: rise 0.2s ease-out;
+}
+
+.move-steps li.is-later .move-step-mark {
+  width: 16px;
+  height: 16px;
+  margin: 2px;
+  border: 1.5px solid var(--border-strong);
+}
+
+.move-step-text {
+  display: grid;
+  flex: 1;
+  gap: 6px;
+  min-width: 0;
+}
+
+.move-step-detail {
+  color: var(--text-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Done */
+.move-done {
+  animation: rise 0.24s ease-out;
+}
+
+.move-done small {
+  line-height: 1.5;
+}
+
+/* The Vault tab: the vault moved away from this place */
+.problem-icon.is-info {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .move-steps li.is-done .move-step-mark,
+  .move-done {
+    animation: none;
+  }
+}
+
+/* A question with a few ways on (DialogHost, ChooseDialog): room for its buttons in a row, which wrap on a phone */
+.dialog-choose {
+  width: min(500px, calc(100vw - 24px));
+}
+
+.dialog-choose .dialog-body {
+  padding-top: 22px;
+}
+
+.dialog-choose h2 {
+  margin-bottom: 8px;
+  font-size: 17px;
+  font-weight: 620;
+  letter-spacing: -0.012em;
+}
+
+.dialog-choose .panel-text {
+  margin-bottom: 0;
+}
+
+.dialog-foot.is-wrap {
+  flex-wrap: wrap;
+}

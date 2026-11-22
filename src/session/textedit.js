@@ -25,7 +25,7 @@ export async function saveEditing(text) {
     });
     if (!ok) return null;
     asNew = true;
-  } else if (current.driveId !== editing.base.driveId) {
+  } else if (current.blob !== editing.base.blob) {
     const ok = await confirmDialog({
       title: 'This file changed meanwhile',
       message: `“${current.name}” was saved on another device or in another window while you were editing it. Save yours as a copy beside it, so neither is lost?`,
@@ -36,7 +36,14 @@ export async function saveEditing(text) {
     asNew = true;
   }
   const base = current ? { ...editing.base, folder: current.folder } : editing.base;
-  const entry = await saveTextFile(base, encodeText(text, editing.style), { asNew });
+  let entry;
+  try {
+    entry = await saveTextFile(base, encodeText(text, editing.style), { asNew });
+  } catch (err) {
+    // Saved elsewhere at the very same moment: ask again, now that the vault shows that save.
+    if (err?.code === 'changed') return saveEditing(text);
+    throw err;
+  }
   // A copy is shown beside the file that changed meanwhile, or in place of the one deleted.
   const place = entry.id === editing.id ? null : current ? { after: editing.id } : { instead: editing.id };
   editingSaved(entry, text, place);

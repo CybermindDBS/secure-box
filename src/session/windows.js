@@ -57,12 +57,14 @@ export function listenToOtherWindows() {
         break;
       case 'busy?':
         // Another window is about to lock: it waits for what's under way here, and says what it stops.
-        if (state.unlocked) channel.postMessage({ type: 'busy', id: data.id, uploads: files.runningCount(), paused: files.pausedCount(), device: Boolean(state.device.busy) });
+        if (state.unlocked) channel.postMessage({ type: 'busy', id: data.id, uploads: files.runningCount(), paused: files.pausedCount(), device: Boolean(state.device.busy || state.moving) });
         break;
-      case 'device-moved':
-        // Another window moved this device's vault: the place this one reads from is gone.
-        if (state.unlocked && isDevice() && data.kid === state.master?.kid) lock('moved', { fromOtherWindow: true });
+      case 'vault-moved': {
+        // Another window moved the vault this one has open (migrate.js): the place it reads from is cleared.
+        const same = data.provider === 'local' ? isDevice() && state.master?.kid === data.kid : state.provider === data.provider && state.identity?.sub === data.sub;
+        if (state.unlocked && same) lock('moved', { fromOtherWindow: true });
         break;
+      }
       case 'keyring-changed':
         // Another window changed a key ring (master password, Emergency Kit): use its copy too.
         if (state.unlocked && typeof data.kid === 'string') refreshKeyringFromElsewhere(data.kid);

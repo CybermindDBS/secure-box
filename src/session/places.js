@@ -16,6 +16,25 @@ export const providerName = (provider = currentProvider()) => ({ microsoft: 'One
 export const companyName = (provider = currentProvider()) => (provider === 'microsoft' ? 'Microsoft' : 'Google');
 export const isDevice = () => state.backend?.kind === 'local';
 
+/**
+ * The app Secure Box connects to a cloud as, which decides what it can see there: Google Drive
+ * shows an app only the files its Google Cloud project made (the number a client id starts
+ * with), and OneDrive only the folder of its app registration (the client id itself).
+ */
+export const appOf = (provider, clientId) => (provider === 'microsoft' ? String(clientId || '') : String(clientId || '').split('-')[0]);
+export const clientIdOf = (provider) => (provider === 'microsoft' ? state.config?.microsoftClientId : state.config?.googleClientId) || '';
+export const cloudApp = (provider) => (DEMO ? 'demo' : appOf(provider, clientIdOf(provider)));
+
+/**
+ * Secure Box's previous connection to `provider` (config.json, while vaults are brought over
+ * from it after a switch to a new Google project or Microsoft app), or '' when there's none.
+ */
+export function previousClientId(provider) {
+  if (DEMO) return state.demoPrevious ? 'demo' : '';
+  const id = String((provider === 'microsoft' ? state.config?.previousMicrosoftClientId : state.config?.previousGoogleClientId) || '');
+  return id && appOf(provider, id) !== cloudApp(provider) ? id : '';
+}
+
 /** A place as the screens name it: the demo's stand-in for the clouds is the "Demo vault". */
 export const placeName = (provider = currentProvider()) => (DEMO && provider === 'google' ? 'Demo vault' : providerName(provider));
 
@@ -26,7 +45,23 @@ export const placeOfVault = (provider) => (provider === 'local' ? 'vault on this
 export const yourVault = (provider) => `your ${placeOfVault(provider)}`;
 
 export const backendFor = (auth) => (auth.provider === 'microsoft' ? createOneDriveBackend(auth) : createCloudBackend(auth));
-export const cipherFor = (master, backend = state.backend) => VaultCipher.create(master, backend?.vaultPurpose);
+export const cipherFor = (master) => VaultCipher.create(master);
+
+/**
+ * Where a vault went, from the note left where it was (vault.js, movedNote), seen from `from`:
+ * { where: 'OneDrive' | 'another Google account' | 'a device of yours', when: 'on 21 Nov 2026' }.
+ */
+export function movedWhere(note, from) {
+  const where = note.to === from && from !== 'local' ? `another ${companyName(from)} account` : note.to === 'local' ? 'a device of yours' : providerName(note.to);
+  const when = note.at ? `on ${new Date(note.at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}` : '';
+  return { where, when };
+}
+
+/** "moved to OneDrive on 21 Nov 2026". */
+export function movedTo(note, from) {
+  const { where, when } = movedWhere(note, from);
+  return `moved to ${where}${when ? ` ${when}` : ''}`;
+}
 
 /**
  * Where a folder vault on this device is, as precisely as a browser allows: websites only ever

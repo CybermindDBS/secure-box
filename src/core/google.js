@@ -12,6 +12,13 @@ const API = 'https://www.googleapis.com/drive/v3';
 const UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
 export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const FOLDER = 'application/vnd.google-apps.folder';
+/**
+ * Secure Box tags what it keeps in Drive with private app properties, and finds it by them, so
+ * renaming or moving things in Drive is harmless: { secureBox: 'root' | 'files' | 'keyring' |
+ * 'vault' | 'blob' }, with the key id on the key ring and vault, and each encrypted copy's name
+ * (the one the vault knows it by) on the copy.
+ */
+export const TAG = 'secureBox';
 const PENDING_KEY = 'unibox.oauth';
 const POPUP_PREFIX = 'popup.';
 const CHANNEL = 'unibox-auth';
@@ -139,10 +146,10 @@ export function relayAuthPopupReturn() {
 }
 
 /** Must be called directly from a click (pop-up blockers). Resolves with fresh tokens. */
-export function reconnectWithPopup({ clientId, loginHint, expectedSub, signal }) {
+export function reconnectWithPopup({ clientId, loginHint, expectedSub, prompt = '', signal }) {
   const state = `${POPUP_PREFIX}${toBase64Url(randomBytes(16))}`;
   const nonce = toBase64Url(randomBytes(16));
-  const popup = window.open(authUrl({ clientId, state, nonce, loginHint }), 'unibox-google', 'popup=yes,width=500,height=680');
+  const popup = window.open(authUrl({ clientId, state, nonce, loginHint, prompt }), 'unibox-google', 'popup=yes,width=500,height=680');
   if (!popup) {
     return Promise.reject(new GoogleError('popup-blocked', 'Your browser blocked the Google window. Allow pop-ups for this site and try again.'));
   }
@@ -227,10 +234,10 @@ export class Drive {
     return res;
   }
 
-  /** Everything Secure Box keeps in Drive, except the encrypted file blobs; with `trashed`, what of it is in the bin. */
-  async findUnibox({ trashed = false } = {}) {
+  /** Everything Secure Box keeps in Drive, except the encrypted copies; with `trashed`, what of it is in the bin. */
+  async findParts({ trashed = false } = {}) {
     const kinds = ['root', 'files', 'keyring', 'vault'];
-    const q = `(${kinds.map((k) => `appProperties has { key='unibox' and value='${k}' }`).join(' or ')}) and trashed = ${trashed}`;
+    const q = `(${kinds.map((k) => `appProperties has { key='${TAG}' and value='${k}' }`).join(' or ')}) and trashed = ${trashed}`;
     const params = new URLSearchParams({
       q,
       spaces: 'drive',
@@ -239,17 +246,64 @@ export class Drive {
       pageSize: '100',
     });
     const { files = [] } = await (await this.call(`${API}/files?${params}`)).json();
-    return files.map((f) => ({ ...f, kind: f.appProperties?.unibox, kid: f.appProperties?.kid || '' }));
+    return files.map((f) => ({ ...f, kind: f.appProperties?.[TAG], kid: f.appProperties?.kid || '' }));
+  }
+
+  /**
+   * Whether this Drive holds files an earlier version of Secure Box made (in the bin, with
+   * `trashed`): ones without its current tag. Secure Box sees only the files it made itself
+   * (drive.file), so anything else it sees is one of those: a vault this version can't open.
+   */
+  async hasEarlier({ trashed = false } = {}) {
+    const params = new URLSearchParams({ q: `trashed = ${trashed}`, spaces: 'drive', fields: 'files(id,appProperties)', pageSize: '100' });
+    const { files = [] } = await (await this.call(`${API}/files?${params}`)).json();
+    return files.some((f) => !f.appProperties?.[TAG]);
+  }
+
+  /**
+   * Every encrypted copy (not in the bin), wherever it is in Drive: name -> { id, size }. If two
+   * share a name, the newer one wins: an upload that was tried again keeps the one it finished.
+   */
+  async findCopies() {
+    const found = new Map();
+    let pageToken = '';
+    do {
+      const params = new URLSearchParams({
+        q: `appProperties has { key='${TAG}' and value='blob' } and trashed = false`,
+        spaces: 'drive',
+        fields: 'nextPageToken,files(id,size,appProperties)',
+        orderBy: 'createdTime',
+        pageSize: '1000',
+      });
+      if (pageToken) params.set('pageToken', pageToken);
+      const page = await (await this.call(`${API}/files?${params}`)).json();
+      for (const f of page.files || []) if (f.appProperties?.blob) found.set(f.appProperties.blob, { id: f.id, size: Number(f.size) || 0 });
+      pageToken = page.nextPageToken || '';
+    } while (pageToken);
+    return found;
+  }
+
+  /** One encrypted copy by its name (a random id: nothing in it needs quoting): { id, size } or null. */
+  async findCopy(name) {
+    const params = new URLSearchParams({
+      q: `appProperties has { key='blob' and value='${name}' } and trashed = false`,
+      spaces: 'drive',
+      fields: 'files(id,size)',
+      orderBy: 'createdTime desc',
+      pageSize: '1',
+    });
+    const [file] = (await (await this.call(`${API}/files?${params}`)).json()).files || [];
+    return file ? { id: file.id, size: Number(file.size) || 0 } : null;
   }
 
   async createFolder(name, parentId, kind) {
-    const body = { name, mimeType: FOLDER, appProperties: { unibox: kind }, ...(parentId ? { parents: [parentId] } : {}) };
+    const body = { name, mimeType: FOLDER, appProperties: { [TAG]: kind }, ...(parentId ? { parents: [parentId] } : {}) };
     const res = await this.call(`${API}/files?fields=id`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     return (await res.json()).id;
   }
 
   async createText({ name, parentId, text, appProperties, description = '' }) {
-    const boundary = `unibox-${toHex(randomBytes(12))}`;
+    const boundary = `secure-box-${toHex(randomBytes(12))}`;
     const meta = { name, mimeType: 'application/json', description, appProperties, ...(parentId ? { parents: [parentId] } : {}) };
     const body =
       `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n` +
@@ -283,6 +337,15 @@ export class Drive {
     }
   }
 
+  /** Gives a file or folder another name. */
+  async rename(id, name) {
+    await this.call(`${API}/files/${encodeURIComponent(id)}?fields=id`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+  }
+
   /** Takes a file (or a folder, with what's in it) out of the bin. */
   async untrash(id) {
     await this.call(`${API}/files/${encodeURIComponent(id)}?fields=id`, {
@@ -290,6 +353,39 @@ export class Drive {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ trashed: false }),
     });
+  }
+
+  /**
+   * The revision saved just before `revisionId` (Drive lists a file's revisions oldest first), or
+   * null if it's the first one, or Drive doesn't list it yet.
+   */
+  async revisionBefore(fileId, revisionId) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const order = [];
+      let pageToken = '';
+      do {
+        const params = new URLSearchParams({ fields: 'nextPageToken,revisions(id)', pageSize: '1000' });
+        if (pageToken) params.set('pageToken', pageToken);
+        const page = await (await this.call(`${API}/files/${encodeURIComponent(fileId)}/revisions?${params}`)).json();
+        order.push(...(page.revisions || []).map((r) => r.id));
+        pageToken = page.nextPageToken || '';
+      } while (pageToken);
+      const at = order.indexOf(revisionId);
+      if (at >= 0) return at > 0 ? order[at - 1] : null;
+      await wait(300); // not listed yet: once more, a moment later
+    }
+    return null;
+  }
+
+  /** Free space in this Google account, in bytes, or null when it has no limit. */
+  async freeSpace() {
+    const { storageQuota: q = {} } = await (await this.call(`${API}/about?fields=storageQuota`)).json();
+    return q.limit ? Math.max(0, Number(q.limit) - Number(q.usage || 0)) : null;
+  }
+
+  /** What a file held at an earlier revision. */
+  async readRevision(fileId, revisionId) {
+    return (await this.call(`${API}/files/${encodeURIComponent(fileId)}/revisions/${encodeURIComponent(revisionId)}?alt=media`)).text();
   }
 
   async updateText(id, text) {

@@ -8,9 +8,9 @@ let ready = false;
 const zipJobs = new Map(); // id -> { job, expires }: what a ZIP download contains (paths and file ids, no keys)
 
 /**
- * `describe(fileId, { fresh })` -> { entry, source: 'drive'|'link'|'page', token?, links? } or null when
+ * `describe(fileId, { fresh })` -> { entry, source: 'drive'|'link'|'page', token?, id?, links? } or null when
  * locked; `fresh` asks for new addresses when the old ones stopped working.
- * `read(driveId, start, end)` -> ArrayBuffer (demo mode only).
+ * `read(name, start, end)` -> ArrayBuffer: encrypted bytes of the copy stored under `name` (source 'page').
  */
 export async function startStreaming({ describe, read }) {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return false;
@@ -25,11 +25,12 @@ export async function startStreaming({ describe, read }) {
         const hit = zipJobs.get(msg.jobId);
         port.postMessage(hit && hit.expires > Date.now() ? hit.job : { error: 'expired' });
       } else if (msg.type === 'unibox-read') {
-        const bytes = await read(msg.driveId, msg.start, msg.end);
+        const bytes = await read(msg.name, msg.start, msg.end);
         port.postMessage({ bytes }, [bytes]);
       }
     } catch (err) {
-      port.postMessage({ error: String(err?.message || err) });
+      // The worker answers with this: 404 for an encrypted copy that's missing.
+      port.postMessage({ error: String(err?.message || err), status: err?.status || (err?.code === 'not-found' ? 404 : 0) });
     }
   });
   try {

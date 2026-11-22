@@ -287,7 +287,7 @@ function SelectionBar({ order }) {
 // ---------------------------------------------------------------------------
 // A file or folder
 // ---------------------------------------------------------------------------
-function Art({ entry, isFolder, size = 'lg', thumbnails }) {
+function Art({ entry, isFolder, size = 'lg', thumbnails, missing = false }) {
   const [thumb, setThumb] = useState(false);
   const [failed, setFailed] = useState(false);
   if (isFolder) {
@@ -301,22 +301,28 @@ function Art({ entry, isFolder, size = 'lg', thumbnails }) {
   return (
     <span className={`file-art kind-${kind} art-${size}${thumb ? ' has-thumb' : ''}`}>
       <Icon name={KIND_ICON[kind]} size={size === 'lg' ? 34 : 18} />
-      {thumbnails && entry.thumbBytes && state.streaming && !failed ? (
+      {thumbnails && entry.thumbBytes && state.streaming && !failed && !missing ? (
         <img src={fileUrl(entry.id, { thumb: true })} alt="" loading="lazy" decoding="async" draggable="false" onLoad={() => setThumb(true)} onError={() => setFailed(true)} />
       ) : null}
-      {kind === 'video' && size === 'lg' ? (
+      {kind === 'video' && size === 'lg' && !missing ? (
         <span className="play-badge" aria-hidden="true">
           <Icon name="play" size={14} />
+        </span>
+      ) : null}
+      {missing ? (
+        <span className="missing-badge" aria-hidden="true">
+          <Icon name="alert" size={size === 'lg' ? 14 : 10} />
         </span>
       ) : null}
     </span>
   );
 }
 
-function EntryCard({ entry, isFolder, layout, selected, focused, pending, added = false, thumbnails, events }) {
+function EntryCard({ entry, isFolder, layout, selected, focused, pending, added = false, missing = false, thumbnails, events }) {
   const [over, setOver] = useState(false);
   const stats = isFolder ? folderStats(entry.id) : null;
-  const meta = isFolder ? `${stats.files + stats.folders} ${stats.files + stats.folders === 1 ? 'item' : 'items'}` : `${formatBytes(entry.size)} · ${relativeTime(entry.updated)}`;
+  // A file whose encrypted copy is missing (deleted outside Secure Box) says so where its size was.
+  const meta = isFolder ? `${stats.files + stats.folders} ${stats.files + stats.folders === 1 ? 'item' : 'items'}` : missing ? 'Encrypted copy missing' : `${formatBytes(entry.size)} · ${relativeTime(entry.updated)}`;
   const busyText = { deleting: 'Deleting…', moving: 'Moving…', renaming: 'Renaming…' }[pending];
   const common = {
     'data-id': entry.id,
@@ -335,7 +341,7 @@ function EntryCard({ entry, isFolder, layout, selected, focused, pending, added 
     onDragStart: (e) => events.dragStart(e, entry),
     ...(isFolder ? dropProps(entry.id, setOver) : {}),
   };
-  const state_ = `${selected ? ' is-selected' : ''}${pending ? ' is-pending' : ''}${over ? ' is-drop' : ''}${added ? ' is-added' : ''}`;
+  const state_ = `${selected ? ' is-selected' : ''}${pending ? ' is-pending' : ''}${over ? ' is-drop' : ''}${added ? ' is-added' : ''}${missing ? ' is-missing' : ''}`;
   const check = (
     <span
       className="item-check"
@@ -376,7 +382,7 @@ function EntryCard({ entry, isFolder, layout, selected, focused, pending, added 
       <div className={`tile${state_}`} role="gridcell" {...common}>
         {check}
         {more}
-        <Art entry={entry} isFolder={isFolder} thumbnails={thumbnails} />
+        <Art entry={entry} isFolder={isFolder} thumbnails={thumbnails} missing={missing} />
         <span className="tile-name" title={entry.name}>
           {entry.name}
         </span>
@@ -388,12 +394,12 @@ function EntryCard({ entry, isFolder, layout, selected, focused, pending, added 
   return (
     <div className={`frow${state_}`} role="row" {...common}>
       {check}
-      <Art entry={entry} isFolder={isFolder} size="sm" thumbnails={thumbnails} />
+      <Art entry={entry} isFolder={isFolder} size="sm" thumbnails={thumbnails} missing={missing} />
       <span className="frow-name" title={entry.name}>
         {entry.name}
       </span>
       <span className="frow-kind">{isFolder ? 'Folder' : typeLabel(entry)}</span>
-      <span className="frow-size">{isFolder ? `${stats.files} ${stats.files === 1 ? 'file' : 'files'}` : formatBytes(entry.size)}</span>
+      <span className="frow-size">{isFolder ? `${stats.files} ${stats.files === 1 ? 'file' : 'files'}` : missing ? 'Missing' : formatBytes(entry.size)}</span>
       <span className="frow-date">{relativeTime(entry.updated)}</span>
       {more}
       {loader}
@@ -467,6 +473,7 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
   const selected = useStore(files.store, (v) => v.selected);
   const pending = useStore(files.store, (v) => v.pending);
   const added = useStore(files.store, (v) => v.added);
+  const missing = useStore(files.store, (v) => v.missing);
   const narrow = useNarrow();
   const bodyRef = useRef(null);
   const [focusId, setFocusId] = useState(null);
@@ -707,7 +714,7 @@ function FilesBody({ entries, layout, thumbnails, query, folder }) {
             <EntryCard key={f.id} entry={f} isFolder layout={layout} selected={selected.has(f.id)} focused={f.id === focusable} pending={pending.get(f.id)} added={f.id === added} thumbnails={thumbnails} events={events} />
           ))}
           {entries.files.map((f) => (
-            <EntryCard key={f.id} entry={f} isFolder={false} layout={layout} selected={selected.has(f.id)} focused={f.id === focusable} pending={pending.get(f.id)} thumbnails={thumbnails} events={events} />
+            <EntryCard key={f.id} entry={f} isFolder={false} layout={layout} selected={selected.has(f.id)} focused={f.id === focusable} pending={pending.get(f.id)} missing={missing.has(f.blob)} thumbnails={thumbnails} events={events} />
           ))}
         </>
       )}

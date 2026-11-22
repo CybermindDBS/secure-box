@@ -26,6 +26,13 @@ const TAG_BYTES = 16;
 const MAGIC = [0x53, 0x45, 0x43, 0x42, 0x4f, 0x58, 0x46, 0x31]; // "SECBOXF1"
 const FLAG = { content: 0, contentLast: 1, thumb: 2, thumbLast: 3 };
 
+/** Whether `blob` is one of Secure Box's encrypted copies (by how it starts), whatever it's called. */
+export async function isEncryptedCopy(blob) {
+  if (blob.size < HEADER_BYTES) return false;
+  const start = new Uint8Array(await blob.slice(0, MAGIC.length).arrayBuffer());
+  return MAGIC.every((byte, i) => start[i] === byte);
+}
+
 export class FileCryptoError extends Error {
   constructor(message) {
     super(message);

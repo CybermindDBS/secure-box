@@ -11,6 +11,7 @@ import { FormError, PasswordInput, StrengthMeter } from '../common/Fields.jsx';
 import { Icon } from '../common/Icon.jsx';
 import { useStore } from '../hooks.js';
 import { Modal } from './Modal.jsx';
+import { MoveVaultDialog } from './MoveVault.jsx';
 
 const EXTRA = new Map(); // kind -> component, for dialogs other parts of the UI add (files, viewer, tools)
 
@@ -36,6 +37,30 @@ function ConfirmDialog({ id, props, close }) {
         <button type="button" className={`btn ${danger ? 'btn-danger' : 'btn-primary'}`} onClick={() => close(true)}>
           {confirmLabel}
         </button>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+/** A question with a few ways on: { title, message, choices: [{ id, label, primary }], cancelLabel }. Resolves with the id chosen, or null. */
+function ChooseDialog({ id, props, close }) {
+  const titleId = `choose-${id}`;
+  return (
+    <Modal onDismiss={() => close(null)} className="dialog dialog-choose" labelledBy={titleId}>
+      <div className="dialog-body">
+        <h2 id={titleId}>{props.title}</h2>
+        {props.message ? <p className="panel-text">{props.message}</p> : null}
+      </div>
+      <div className="dialog-foot is-wrap">
+        <button type="button" className="btn btn-ghost" onClick={() => close(null)}>
+          {props.cancelLabel || 'Not now'}
+        </button>
+        {props.choices.map((c) => (
+          <button key={c.id} type="button" className={`btn ${c.primary ? 'btn-primary' : 'btn-ghost'}`} data-autofocus={c.primary || undefined} onClick={() => close(c.id)}>
+            {c.label}
+          </button>
+        ))}
       </div>
     </Modal>
   );
@@ -89,6 +114,7 @@ function VaultGoneDialog({ props, close }) {
   const [busy, setBusy] = useState('');
   const [problem, setProblem] = useState('');
   const go = async (action) => {
+    if (props.actions.find((a) => a.id === action)?.close) return close(action); // the session takes it from here
     setBusy(action);
     setProblem('');
     try {
@@ -373,12 +399,14 @@ function KitDialog({ props, close }) {
 // ---------------------------------------------------------------------------
 const KINDS = {
   confirm: ConfirmDialog,
+  choose: ChooseDialog,
   reconnect: ReconnectDialog,
   ownKey: OwnKeyDialog,
   vaultGone: VaultGoneDialog,
   deviceWhere: DeviceWhereDialog,
   changePassword: ChangePasswordDialog,
   kit: KitDialog,
+  moveVault: MoveVaultDialog,
 };
 
 export function DialogHost() {

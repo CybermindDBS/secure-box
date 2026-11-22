@@ -30,7 +30,7 @@ function googleDrive(drive) {
     const method = init.method || 'GET';
     if (url.includes('/files?')) {
       const inBin = new URL(url).searchParams.get('q').includes('trashed = true');
-      return json({ files: (inBin ? drive.bin : drive.live).map(([id, kind]) => ({ id, appProperties: { unibox: kind, kid: 'kid1' }, headRevisionId: 'r1', parents: [] })) });
+      return json({ files: (inBin ? drive.bin : drive.live).map(([id, kind]) => ({ id, appProperties: { secureBox: kind, kid: 'kid1' }, headRevisionId: 'r1', parents: [] })) });
     }
     if (url.includes('alt=media')) return new Response('{}', { status: 200 });
     if (url.includes('fields=headRevisionId,trashed')) return drive.head();
