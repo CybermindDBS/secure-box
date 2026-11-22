@@ -50,13 +50,28 @@ function downloadsRunning() {
   return running;
 }
 
+/**
+ * Tells every Secure Box window how many downloads are under way. A window being closed can't
+ * stop to ask, so each keeps this count, and asks before closing while it isn't 0: a download
+ * needs a window for its keys (and, from a vault on this device, for its bytes).
+ */
+function announceDownloads() {
+  var running = downloads.size;
+  self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (clients) {
+    clients.forEach(function (client) {
+      client.postMessage({ type: 'unibox-downloads', running: running });
+    });
+  });
+}
+
 /** `stream`, counted as a download for as long as it runs. */
 function counted(stream) {
   var reader = stream.getReader();
   var record = { at: Date.now() };
   downloads.add(record);
+  announceDownloads();
   var finish = function () {
-    downloads.delete(record);
+    if (downloads.delete(record)) announceDownloads();
   };
   return new ReadableStream(
     {
