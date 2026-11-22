@@ -48,7 +48,7 @@ You don't have to take anyone's word for this:
   </tr>
   <tr>
     <td><img src="docs/images/encrypt.webp" alt="The Encrypt and decrypt tab"><br><sub><b>Encrypt & decrypt.</b> Share files and messages with a password, no account needed.</sub></td>
-    <td align="center"><img src="docs/images/phone.webp" alt="Secure Box on a phone" width="42%"><br><sub><b>On your phone.</b> Made for touch, and installable as an app.</sub></td>
+    <td align="center"><img src="docs/images/phone.webp" alt="Secure Box on a phone" width="34%"><br><sub><b>On your phone.</b> Made for touch, and installable as an app.</sub></td>
   </tr>
 </table>
 
@@ -86,15 +86,11 @@ You don't have to take anyone's word for this:
 ## How it works
 
 ```mermaid
-flowchart LR
-    host["Web host<br/>(static files only)"] -->|the app, nothing else| app
-    subgraph device ["Your device"]
-        app["Secure Box in your browser<br/>encrypts and decrypts"]
-        local[("Vault on<br/>this device")]
-        app <--> local
-    end
+flowchart TB
+    host["Web host: the app's files, nothing else"] --> app["Secure Box in your browser<br/>encrypts and decrypts everything"]
     app <-->|encrypted| drive[("Your Google Drive")]
     app <-->|encrypted| onedrive[("Your OneDrive")]
+    app <-->|encrypted| local[("This device")]
 ```
 
 A vault is the same three parts wherever it lives:
