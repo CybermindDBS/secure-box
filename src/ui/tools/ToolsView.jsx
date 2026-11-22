@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useMemo, useState } from 'react';
 import { BOX_EXTENSION } from '../../core/localbox.js';
 import { toast } from '../../session/bridge.js';
 import { copyText, pickFile, pickFiles } from '../../session/io.js';
@@ -34,7 +34,7 @@ import {
 import { Check, FormError, PasswordInput, StrengthMeter } from '../common/Fields.jsx';
 import { Icon, Spinner } from '../common/Icon.jsx';
 import { Segmented } from '../common/Segmented.jsx';
-import { useSession, useStore, useVersion } from '../hooks.js';
+import { useIncremental, useSession, useStore, useVersion } from '../hooks.js';
 import { run } from '../run.js';
 
 // ---------------------------------------------------------------------------
@@ -216,6 +216,52 @@ function WhoCanOpen({ what, share, setShare, password, setPassword, confirm, set
 // ---------------------------------------------------------------------------
 // Files
 // ---------------------------------------------------------------------------
+/**
+ * What's chosen to encrypt: drawn a batch at a time (thousands of files can be dropped), and not
+ * again while a password is typed.
+ */
+const JobList = memo(function JobList({ jobs, busy }) {
+  const { count, more, sentinel } = useIncremental(jobs.length, { key: 'jobs', first: 60, step: 120 });
+  return (
+    <ul className="tool-list">
+      {(count < jobs.length ? jobs.slice(0, count) : jobs).map((job) => (
+        <li key={job.id} className="tool-item">
+          <Icon name={job.kind === 'folder' ? 'folder' : 'file'} size={16} />
+          <span className="tool-item-name">{job.name}</span>
+          <span className="tool-item-meta">{job.kind === 'folder' ? `${job.count} ${job.count === 1 ? 'file' : 'files'} · ${formatBytes(job.size)}` : formatBytes(job.size)}</span>
+          <button type="button" className="icon-btn icon-btn-sm" aria-label={`Remove ${job.name}`} title="Remove" disabled={Boolean(busy)} onClick={() => removeJob(job.id)}>
+            <Icon name="x" size={16} />
+          </button>
+        </li>
+      ))}
+      {more ? <li ref={sentinel} className="tool-more" aria-hidden="true" /> : null}
+    </ul>
+  );
+});
+
+/** The .sbox files chosen to open, the same way. */
+const BoxList = memo(function BoxList({ boxes, statuses, busy }) {
+  const { count, more, sentinel } = useIncremental(boxes.length, { key: 'boxes', first: 60, step: 120 });
+  return (
+    <ul className="tool-list">
+      {(count < boxes.length ? boxes.slice(0, count) : boxes).map((entry, i) => (
+        <li key={entry.id} className="tool-item">
+          <Icon name="file" size={16} />
+          <span className="tool-item-name">{entry.file.name}</span>
+          <span className={`tool-item-state is-${statuses[i].tone}`}>
+            {statuses[i].tone === 'ok' ? <Icon name="check" size={14} /> : null}
+            {statuses[i].text}
+          </span>
+          <button type="button" className="icon-btn icon-btn-sm" aria-label={`Remove ${entry.file.name}`} title="Remove" disabled={Boolean(busy)} onClick={() => removeBox(entry.id)}>
+            <Icon name="x" size={16} />
+          </button>
+        </li>
+      ))}
+      {more ? <li ref={sentinel} className="tool-more" aria-hidden="true" /> : null}
+    </ul>
+  );
+});
+
 function EncryptSection() {
   const jobs = useStore(toolsStore, (s) => s.jobs);
   const busy = useStore(toolsStore, (s) => s.busy);
@@ -225,8 +271,8 @@ function EncryptSection() {
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [hideNames, setHideNames] = useState(pref('hideNames'));
-  const size = jobs.reduce((n, j) => n + j.size, 0);
-  const folders = jobs.some((j) => j.kind === 'folder');
+  const size = useMemo(() => jobs.reduce((n, j) => n + j.size, 0), [jobs]);
+  const folders = useMemo(() => jobs.some((j) => j.kind === 'folder'), [jobs]);
   const count = jobs.length;
   const what = count === 1 ? 'it' : 'them';
   const go = () => run(() => encryptJobs({ password, confirm, share, hideNames }));
@@ -240,18 +286,7 @@ function EncryptSection() {
           Encrypt {count} {folders ? (count === 1 ? 'item' : 'items') : count === 1 ? 'file' : 'files'} <span className="tool-section-meta">· {formatBytes(size)}</span>
         </h3>
       </header>
-      <ul className="tool-list">
-        {jobs.map((job) => (
-          <li key={job.id} className="tool-item">
-            <Icon name={job.kind === 'folder' ? 'folder' : 'file'} size={16} />
-            <span className="tool-item-name">{job.name}</span>
-            <span className="tool-item-meta">{job.kind === 'folder' ? `${job.count} ${job.count === 1 ? 'file' : 'files'} · ${formatBytes(job.size)}` : formatBytes(job.size)}</span>
-            <button type="button" className="icon-btn icon-btn-sm" aria-label={`Remove ${job.name}`} title="Remove" disabled={Boolean(busy)} onClick={() => removeJob(job.id)}>
-              <Icon name="x" size={16} />
-            </button>
-          </li>
-        ))}
-      </ul>
+      <JobList jobs={jobs} busy={busy} />
       <WhoCanOpen what={what} share={share} setShare={setShare} password={password} setPassword={setPassword} confirm={confirm} setConfirm={setConfirm} onEnter={go} idPrefix="box" />
       <Check checked={hideNames} onChange={setHideNames} hint="The .sbox files get random names. The real names are stored inside, encrypted.">
         Hide file names
@@ -278,10 +313,11 @@ function OpenSection() {
   const busy = useStore(toolsStore, (s) => s.busy);
   const error = useStore(toolsStore, (s) => s.error);
   const unlocked = useSession((s) => s.unlocked);
-  useVersion(); // key rings unlocked this session open more files
+  const version = useVersion(); // key rings unlocked this session open more files
   const [password, setPassword] = useState('');
   const [secret, setSecret] = useState('');
-  const statuses = boxes.map((b) => boxStatus(b, backup));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const statuses = useMemo(() => boxes.map((b) => boxStatus(b, backup)), [boxes, backup, version]);
   const needsPassword = statuses.some((s) => s.needs === 'password');
   const needsVault = statuses.some((s) => s.needs === 'vault');
   const ready = boxes.filter((b) => b.box).length;
@@ -298,21 +334,7 @@ function OpenSection() {
           Open {boxes.length} {BOX_EXTENSION} {boxes.length === 1 ? 'file' : 'files'}
         </h3>
       </header>
-      <ul className="tool-list">
-        {boxes.map((entry, i) => (
-          <li key={entry.id} className="tool-item">
-            <Icon name="file" size={16} />
-            <span className="tool-item-name">{entry.file.name}</span>
-            <span className={`tool-item-state is-${statuses[i].tone}`}>
-              {statuses[i].tone === 'ok' ? <Icon name="check" size={14} /> : null}
-              {statuses[i].text}
-            </span>
-            <button type="button" className="icon-btn icon-btn-sm" aria-label={`Remove ${entry.file.name}`} title="Remove" disabled={Boolean(busy)} onClick={() => removeBox(entry.id)}>
-              <Icon name="x" size={16} />
-            </button>
-          </li>
-        ))}
-      </ul>
+      <BoxList boxes={boxes} statuses={statuses} busy={busy} />
       {needsPassword ? <PasswordInput id="box-open-password" label="The file’s password" value={password} onChange={setPassword} onEnter={go} mono /> : null}
       {needsVault && !backup ? (
         <div className="tool-callout">

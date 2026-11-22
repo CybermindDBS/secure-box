@@ -205,3 +205,29 @@
     box-shadow: 0 0 0 2px var(--accent);
   }
 }
+
+/* Where what's drawn of a long list ends: more is drawn as this comes near (hooks.js,
+   useIncremental). It takes a whole row of the grid, and no room to speak of. */
+.files-more,
+.transfer-more,
+.list-more,
+.tool-more {
+  grid-column: 1 / -1;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  pointer-events: none;
+}
+
+/* Cards out of view skip layout and painting until they come near it, so a folder of thousands
+   scrolls as lightly as one of dozens; each keeps the size it last had (auto). */
+.files-body .tile {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 212px;
+}
+
+.files-body .frow:not(.frow-head) {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 48px;
+}

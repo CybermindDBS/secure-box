@@ -415,8 +415,9 @@ npm run preview      # serves dist/ at http://localhost:8081, under the real CSP
 
 - Built with **React** and **Vite**. The page keeps its strict Content-Security-Policy in development too: no inline scripts or styles, and the only Trusted Types policy lets through just Secure Box's own scripts.
 - `npm run build` writes `dist/` and runs [`scripts/check-build.mjs`](scripts/check-build.mjs): the page's policy must match `firebase.json`'s, nothing may be inline, and every file the page and the service worker load must be there.
-- `npm test` runs 92 unit tests: the key ring and its revisions, every encryption format, `.sbox` files and messages, the one vault format and how each place finds its files (against stand-ins for Google Drive and OneDrive), saves that cross on Google Drive, moving and copying vaults, backups and restores (cloud downloads included), missing files, ZIP reading and writing, document readers, uploads that resume, tamper detection, and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
+- `npm test` runs 97 unit tests: the key ring and its revisions, every encryption format, `.sbox` files and messages, the one vault format and how each place finds its files (against stand-ins for Google Drive and OneDrive), saves that cross on Google Drive, moving and copying vaults, backups and restores (cloud downloads included), missing files, ZIP reading and writing, document readers, uploads that resume, tamper detection, big vaults (thousands of changes applied in one pass, checked against applying them one at a time), and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
 - The demo can rehearse failures: add `&faults=` to `?demo`, for example http://localhost:8080/?demo&faults=trashed.
+- The demo can be a big vault too: add `&files=` to `?demo` for a folder of that many photos (up to 20,000), for example http://localhost:8080/?demo&files=5000.
 
 <details>
 <summary><b>Demo failures</b> you can rehearse</summary>
@@ -470,6 +471,7 @@ src/
     gone.js             a vault deleted or moved outside Secure Box while open: the ways back
     textedit.js         saving a .txt file edited in the viewer, and what if it changed meanwhile
     files.js            folders, choosing, uploads (parallel, batched), downloads, deletes
+    thumbs.js           thumbnails in the Files tab: loaded for what's in view, a few at a time
     tools.js            Encrypt & decrypt: .sbox files and messages, with or without a vault
     passwords.js        items, CSV, master password, Emergency Kit, key ring backup
     windows.js, nav.js, prefs.js, memory.js, places.js, bridge.js, store.js, io.js, viewer.js

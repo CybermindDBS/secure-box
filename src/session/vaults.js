@@ -85,7 +85,9 @@ export async function boot() {
     // nothing there; the sample vault is with its previous connection, to be brought over.
     // oldgone: likewise, but that previous connection is gone (the download is the way back).
     const newApp = /(^|,)\s*(newapp|oldgone)\s*(,|$)/.test(faults || '');
-    state.backend = await createDemoBackend({ empty: newApp });
+    // ?demo&files=N: a big vault, to see how Secure Box handles thousands of files.
+    const photos = Math.min(20000, Math.max(0, Math.trunc(Number(new URLSearchParams(location.search).get('files')) || 0)));
+    state.backend = await createDemoBackend({ empty: newApp, photos });
     if (newApp) state.demoPrevious = { backend: await createDemoBackend(), gone: /(^|,)\s*oldgone\s*(,|$)/.test(faults) };
     state.demoBackend = state.backend; // the demo's stand-in for the clouds
     if (faults) (await import('./faults.js')).injectFaults(state.backend, faults);

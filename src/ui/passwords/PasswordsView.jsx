@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { generatePassword, passwordEntropyBits } from '../../core/crypto.js';
 import { hostnameOf, safeHref } from '../../core/vault.js';
 import { confirmDialog } from '../../session/bridge.js';
@@ -12,7 +12,7 @@ import { Modal } from '../dialogs/Modal.jsx';
 import { Avatar, Icon, Spinner } from '../common/Icon.jsx';
 import { Menu, MenuItem } from '../common/Menu.jsx';
 import { Segmented } from '../common/Segmented.jsx';
-import { useSession, useVersion } from '../hooks.js';
+import { useIncremental, useSession, useVersion } from '../hooks.js';
 import { run } from '../run.js';
 
 /** What fills Passwords and Files while another vault opens. */
@@ -45,6 +45,29 @@ export function SyncStatus() {
 // ---------------------------------------------------------------------------
 // The list
 // ---------------------------------------------------------------------------
+/** One entry: drawn again only when it, or whether it's open or busy, changes. */
+const ItemRow = memo(function ItemRow({ item, open, busy }) {
+  return (
+    <li>
+      <button
+        type="button"
+        className={`row${open ? ' is-selected' : ''}${busy ? ' is-pending' : ''}`}
+        data-id={item.id}
+        aria-current={open ? 'true' : undefined}
+        aria-busy={busy ? 'true' : undefined}
+        onClick={() => selectItem(item.id)}
+      >
+        <Avatar item={item} />
+        <span className="row-text">
+          <span className="row-title">{item.title}</span>
+          <span className="row-sub">{busy === 'deleting' ? 'Deleting…' : busy === 'saving' ? 'Saving…' : subtitleOf(item)}</span>
+        </span>
+        {busy ? <Spinner small /> : null}
+      </button>
+    </li>
+  );
+});
+
 function ItemList({ onNew }) {
   const vault = useSession((s) => s.vault);
   const query = useSession((s) => s.query);
@@ -53,9 +76,14 @@ function ItemList({ onNew }) {
   const switching = useSession((s) => Boolean(s.switching));
   const items = useMemo(() => visibleItems(vault, query), [vault, query]);
   const listRef = useRef(null);
+  // Thousands of entries (an import, say): drawn a batch at a time as the list is scrolled.
+  const { count, more, sentinel, reveal } = useIncremental(items.length, { key: query, first: 100, step: 200 });
   useEffect(() => {
-    if (selectedId) listRef.current?.querySelector(`[data-id="${CSS.escape(selectedId)}"]`)?.scrollIntoView({ block: 'nearest' });
-  }, [selectedId]);
+    if (!selectedId) return;
+    const at = items.findIndex((it) => it.id === selectedId);
+    if (at >= 0) reveal(at);
+    requestAnimationFrame(() => listRef.current?.querySelector(`[data-id="${CSS.escape(selectedId)}"]`)?.scrollIntoView({ block: 'nearest' }));
+  }, [selectedId, items, reveal]);
   if (switching) {
     return (
       <div id="list-empty" className="list-empty">
@@ -74,35 +102,19 @@ function ItemList({ onNew }) {
           if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
           event.preventDefault();
           const index = items.findIndex((it) => it.id === selectedId);
-          const next = items[Math.min(items.length - 1, Math.max(0, index + (event.key === 'ArrowDown' ? 1 : -1)))];
+          const at = Math.min(items.length - 1, Math.max(0, index + (event.key === 'ArrowDown' ? 1 : -1)));
+          const next = items[at];
           if (next) {
+            reveal(at);
             selectItem(next.id);
             requestAnimationFrame(() => listRef.current?.querySelector(`[data-id="${CSS.escape(next.id)}"]`)?.focus());
           }
         }}
       >
-        {items.map((item) => {
-          const busy = pending.get(item.id);
-          return (
-            <li key={item.id}>
-              <button
-                type="button"
-                className={`row${item.id === selectedId ? ' is-selected' : ''}${busy ? ' is-pending' : ''}`}
-                data-id={item.id}
-                aria-current={item.id === selectedId ? 'true' : undefined}
-                aria-busy={busy ? 'true' : undefined}
-                onClick={() => selectItem(item.id)}
-              >
-                <Avatar item={item} />
-                <span className="row-text">
-                  <span className="row-title">{item.title}</span>
-                  <span className="row-sub">{busy === 'deleting' ? 'Deleting…' : busy === 'saving' ? 'Saving…' : subtitleOf(item)}</span>
-                </span>
-                {busy ? <Spinner small /> : null}
-              </button>
-            </li>
-          );
-        })}
+        {(count < items.length ? items.slice(0, count) : items).map((item) => (
+          <ItemRow key={item.id} item={item} open={item.id === selectedId} busy={pending.get(item.id)} />
+        ))}
+        {more ? <li ref={sentinel} className="list-more" aria-hidden="true" /> : null}
       </ul>
       {!items.length ? (
         <div id="list-empty" className="list-empty">

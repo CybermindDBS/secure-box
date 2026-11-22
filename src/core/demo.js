@@ -199,8 +199,12 @@ async function sampleFiles() {
 // ---------------------------------------------------------------------------
 // The in-memory "Drive"
 // ---------------------------------------------------------------------------
-/** The demo's stand-in for the clouds, with the sample vault in it; `empty`: with nothing in it yet. */
-export async function createDemoBackend({ empty = false } = {}) {
+/**
+ * The demo's stand-in for the clouds, with the sample vault in it; `empty`: with nothing in it yet.
+ * `photos` (?demo&files=N, to try Secure Box with a big vault): that many more photos, each
+ * encrypted with a key of its own, in a folder of their own.
+ */
+export async function createDemoBackend({ empty = false, photos = 0 } = {}) {
   const blobs = new Map(); // the encrypted copies, by name, like a cloud's "Encrypted files" folder
   const store = {
     async open({ name }) {
@@ -259,6 +263,36 @@ export async function createDemoBackend({ empty = false } = {}) {
       op: 'file-put',
       file: makeFileEntry({ id, name: sample.name, type, size: file.size, folder, blob: id, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes }),
     });
+  }
+
+  if (!empty && photos > 0) {
+    // One small photo and its thumbnail, encrypted anew as each file: a big vault, made quickly.
+    const canvas = new OffscreenCanvas(320, 240);
+    const g = canvas.getContext('2d');
+    const sky = g.createLinearGradient(0, 0, 0, 240);
+    sky.addColorStop(0, '#3a2c7a');
+    sky.addColorStop(1, '#e0826a');
+    g.fillStyle = sky;
+    g.fillRect(0, 0, 320, 240);
+    g.fillStyle = '#fde3a0';
+    g.beginPath();
+    g.arc(160, 170, 46, 0, Math.PI * 2);
+    g.fill();
+    g.fillStyle = '#1e1b3d';
+    g.fillRect(0, 180, 320, 60);
+    const photo = new File([await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.8 })], 'photo.jpg', { type: 'image/jpeg' });
+    const thumbnail = await makeThumbnail(photo, 'image/jpeg');
+    const folder = folderFor([`${photos} photos`]);
+    const changes = [];
+    for (let i = 1; i <= photos; i++) {
+      const id = crypto.randomUUID();
+      const plan = layout({ size: photo.size, thumbBytes: thumbnail?.length || 0 });
+      const writer = createPieceWriter({ total: plan.total, send: await store.open({ name: id }) });
+      const meta = await encryptFile({ file: photo, fileId: id, thumbnail, write: (bytes) => writer.write(bytes) });
+      const name = `Photo ${String(i).padStart(5, '0')}.jpg`;
+      changes.push({ op: 'file-put', file: makeFileEntry({ id, name, type: 'image/jpeg', size: photo.size, folder, blob: id, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes }) });
+    }
+    vault = applyChange(vault, { op: 'batch', changes });
   }
 
   let keyringText = empty ? null : serializeKeyring(doc);

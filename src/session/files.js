@@ -10,16 +10,18 @@
  */
 import { MAX_FILE_SIZE, createPieceWriter, decryptFile, encryptFile, layout } from '../core/fileformat.js';
 import { canThumbnail, formatBytes, guessType, kindOf } from '../core/filetypes.js';
+import { backoff, transient } from '../core/retry.js';
 import { downloadsUnderWay, fileUrl, forgetStreams, zipUrl } from '../core/stream.js';
 import { makeThumbnail } from '../core/thumbs.js';
+import { forgetThumbs } from './thumbs.js';
 import { runTask } from '../workers/pool.js';
-import { collectTree, copiesInUse, folderChain, makeFileEntry, makeFolder, uniqueName } from '../core/vault.js';
+import { collectTree, copiesInUse, folderChain, makeFileEntry, makeFolder, uniqueName, uniqueNameWhere, vaultIndex } from '../core/vault.js';
 import { ask, confirmDialog, toast } from './bridge.js';
 import { commit, driveFresh, ensureDrive } from './cloud.js';
 import { downloadFile, pickFiles } from './io.js';
 import { pushNav } from './nav.js';
 import { pref } from './prefs.js';
-import { DEMO, createStore, state } from './store.js';
+import { DEMO, createStore, pause, state } from './store.js';
 import { dropFromViewer, editingDirty } from './viewer.js';
 
 const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
@@ -34,7 +36,8 @@ const store = createStore({
   pending: new Map(), // id -> 'deleting' | 'moving' | 'renaming' (#10)
   missing: new Set(), // names of encrypted copies that aren't where the vault is (deleted outside Secure Box, say)
   added: null, // a folder just made: shown and lit up for a moment, not chosen
-  transfers: [], // what the uploads tray shows
+  transfers: [], // what the uploads tray shows: a row for each upload
+  summary: null, // and their totals (snapshot)
   tray: 'open', // 'open' | 'collapsed'
 });
 const get = () => store.get();
@@ -50,8 +53,10 @@ function markAdded(id) {
 
 const vault = () => state.vault;
 const isLocal = () => state.backend?.kind === 'local';
-const folderById = (id) => vault()?.folders.find((f) => f.id === id);
-const fileById = (id) => vault()?.files.find((f) => f.id === id);
+// Found by id at once, however big the vault (core/vault.js, vaultIndex).
+const index = () => (vault() ? vaultIndex(vault()) : null);
+const folderById = (id) => (id ? index()?.folders.get(id) : undefined);
+const fileById = (id) => (id ? index()?.files.get(id) : undefined);
 export { fileById, folderById };
 
 // ===========================================================================
@@ -84,16 +89,15 @@ export function visibleEntries(v = vault(), folder = get().folder, query = get()
       files: sortFiles(v.files.filter((f) => match(f.name)), sort),
     };
   }
+  const { foldersIn, filesIn } = vaultIndex(v);
   return {
-    folders: v.folders.filter((f) => f.parent === folder).sort((a, b) => collator.compare(a.name, b.name)),
-    files: sortFiles(v.files.filter((f) => f.folder === folder), sort),
+    folders: [...foldersIn(folder)].sort((a, b) => collator.compare(a.name, b.name)),
+    files: sortFiles([...filesIn(folder)], sort),
   };
 }
 
-export function folderStats(folderId) {
-  const { folderIds, files } = collectTree(vault(), folderId);
-  return { folders: folderIds.length - 1, files: files.length, bytes: files.reduce((n, f) => n + f.size, 0) };
-}
+/** What a folder holds at any depth: { folders, files, bytes } (worked out once per vault). */
+export const folderStats = (folderId) => vaultIndex(vault()).totals(folderId);
 
 export const folderPath = (file) => [ROOT_NAME, ...folderChain(vault(), file.folder).map((f) => f.name)].join(' / ');
 export const crumbsOf = (folder) => folderChain(vault(), folder);
@@ -346,8 +350,9 @@ function zipEntries(folderIds, fileIds) {
     const here = `${path}${uniqueZipName(taken, zipName(folder.name), false)}/`;
     entries.push({ path: here, dir: true, mtime: timeOf(folder) });
     const inner = new Set();
-    for (const sub of v.folders.filter((f) => f.parent === folder.id).sort(byName)) addFolder(sub, here, inner);
-    for (const file of v.files.filter((f) => f.folder === folder.id).sort(byName)) addFile(file, here, inner);
+    const { foldersIn, filesIn } = vaultIndex(v);
+    for (const sub of [...foldersIn(folder.id)].sort(byName)) addFolder(sub, here, inner);
+    for (const file of [...filesIn(folder.id)].sort(byName)) addFile(file, here, inner);
   };
   const top = new Set();
   // A folder or file already inside another chosen folder isn't added twice.
@@ -393,7 +398,7 @@ export async function newFolder() {
   if (!name) return;
   await ensureDrive();
   const parent = get().folder;
-  const siblings = vault().folders.filter((f) => f.parent === parent).map((f) => f.name);
+  const siblings = index().foldersIn(parent).map((f) => f.name);
   const folder = makeFolder({ name: uniqueName(name, siblings, { isFolder: true }), parent });
   await commit({ op: 'folder-put', folder });
   markAdded(folder.id); // shown where it landed; choosing stays the checkbox's job
@@ -502,19 +507,26 @@ async function deleteCopies(names) {
   const inUse = copiesInUse(vault());
   const done = names.filter((name) => inUse.has(name));
   const left = [];
-  for (const name of names.filter((n) => !inUse.has(n))) {
-    try {
-      await backend.trash(name);
-      done.push(name);
-    } catch (err) {
-      // Gone already counts as done.
-      if (err?.status === 404 || err?.code === 'not-found') done.push(name);
-      else {
-        console.warn('Delete: the encrypted copy stayed', name, err);
-        left.push(name);
+  // A few at a time, as many as uploads (thousands of files deleted at once don't take hours).
+  const todo = names.filter((n) => !inUse.has(n));
+  let next = 0;
+  const worker = async () => {
+    while (next < todo.length) {
+      const name = todo[next++];
+      try {
+        await backend.trash(name);
+        done.push(name);
+      } catch (err) {
+        // Gone already counts as done.
+        if (err?.status === 404 || err?.code === 'not-found') done.push(name);
+        else {
+          console.warn('Delete: the encrypted copy stayed', name, err);
+          left.push(name);
+        }
       }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(parallel(), todo.length) }, worker));
   if (done.length && state.backend === backend) await commit({ op: 'trash-done', names: done }).catch((err) => console.warn('Trash list:', err));
   return left;
 }
@@ -556,7 +568,7 @@ export async function saveTextFile(base, bytes, { asNew = false } = {}) {
   const current = asNew ? null : fileById(base.id);
   const folder = current ? current.folder : folderById(base.folder) ? base.folder : null;
   const id = current ? current.id : crypto.randomUUID();
-  const name = current ? current.name : uniqueName(base.name, vault().files.filter((f) => f.folder === folder).map((f) => f.name));
+  const name = current ? current.name : uniqueName(base.name, index().filesIn(folder).map((f) => f.name));
   const type = base.type || 'text/plain';
   const file = new File([bytes], name, { type, lastModified: Date.now() });
   const plan = layout({ size: file.size, thumbBytes: 0 });
@@ -599,22 +611,63 @@ export async function saveTextFile(base, bytes, { asNew = false } = {}) {
 // Uploads
 // ===========================================================================
 const tasks = [];
-const ACTIVE = new Set(['queued', 'preparing', 'uploading', 'paused']);
-const RUNNING = new Set(['queued', 'preparing', 'uploading']);
-let running = 0;
+const ACTIVE = new Set(['queued', 'preparing', 'uploading', 'saving', 'paused']);
+const RUNNING = new Set(['queued', 'preparing', 'uploading', 'saving']);
+let running = 0; // uploads sending their encrypted copy right now (not the ones going into the vault)
+let reading = 0; // dropped folders still being read: their files are queued as they're found
+let drops = 0; // bumped by Stop all: a dropped folder still being read stops there
 let stoppedFor = ''; // the storage is full: nothing else starts until you retry
 const parallel = () => (state.backend?.kind === 'local' ? 2 : 3);
 
+// What's waiting to start, oldest first, taken from the front, so starting the next of thousands
+// doesn't go through all of them each time. It may still hold some that were cancelled since.
+let waiting = [];
+let head = 0;
+const queueUp = (task) => waiting.push(task);
+function nextWaiting() {
+  while (head < waiting.length) {
+    const task = waiting[head++];
+    if (task.status === 'queued') return task;
+  }
+  waiting = [];
+  head = 0;
+  return null;
+}
+
+// What the tray shows: a row for each upload, made again only when that upload changed, and the
+// totals, at most every 150 ms however many files are going.
 let snapTimer = 0;
+function rowOf(task) {
+  const row = task.row;
+  if (row && row.status === task.status && row.progress === task.progress && row.error === task.error) return row;
+  task.type ??= guessType(task.file.name, task.file.type);
+  task.row = { id: task.id, name: task.file.name, size: task.file.size, type: task.type, status: task.status, progress: task.progress, error: task.error, local: task.local };
+  return task.row;
+}
 function snapshot() {
   clearTimeout(snapTimer);
   snapTimer = 0;
-  set({
-    transfers: tasks.map((t) => ({ id: t.id, name: t.file.name, size: t.file.size, type: guessType(t.file.name, t.file.type), status: t.status, progress: t.progress, error: t.error, local: t.local })),
+  const sum = { files: 0, active: 0, failed: 0, paused: 0, stopped: 0, finished: 0, bytes: 0, sent: 0, local: tasks.length > 0, reading: reading > 0 };
+  const transfers = tasks.map((task) => {
+    const row = rowOf(task);
+    if (!row.local) sum.local = false;
+    if (row.status === 'cancelled') {
+      sum.stopped++;
+      return row;
+    }
+    sum.files++;
+    sum.bytes += row.size;
+    sum.sent += row.size * (row.status === 'done' ? 1 : row.progress);
+    if (row.status === 'done') sum.finished++;
+    else if (row.status === 'error') sum.failed++;
+    else if (row.status === 'paused') sum.paused++;
+    else sum.active++;
+    return row;
   });
+  set({ transfers, summary: sum });
 }
 const snapSoon = () => {
-  snapTimer ||= setTimeout(snapshot, 120);
+  snapTimer ||= setTimeout(snapshot, 150);
 };
 
 /** Opens the browser's file picker and uploads what's chosen into the open folder. */
@@ -629,45 +682,80 @@ export async function upload({ directory = false } = {}) {
   return undefined;
 }
 
-/** Files and folders dropped on the Files tab (or on a folder), with their folders. */
+/**
+ * Files and folders dropped on the Files tab (or on a folder), with their folders. A dropped
+ * folder of thousands starts uploading at once: its files are queued a batch at a time as
+ * they're found, instead of after the whole folder has been read.
+ */
 export function uploadFromDrop(dataTransfer, target = get().folder) {
   // Entries must be read before the drop event finishes.
   const entries = [...dataTransfer.items].map((item) => item.webkitGetAsEntry?.()).filter(Boolean);
   const plain = [...dataTransfer.files];
-  (async () => {
-    const found = [];
-    const walk = async (entry, path) => {
-      if (entry.isFile) found.push({ file: await new Promise((res, rej) => entry.file(res, rej)), path });
-      else if (entry.isDirectory) {
-        const reader = entry.createReader();
-        for (;;) {
-          const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
-          if (!batch.length) break;
-          for (const child of batch) await walk(child, [...path, entry.name]);
-        }
+  if (!entries.length) {
+    enqueue(plain.map((file) => ({ file, path: [] })), target);
+    return;
+  }
+  reading++;
+  const drop = drops;
+  let found = [];
+  let more = false; // a later batch of the same drop
+  let sentAt = performance.now();
+  const send = () => {
+    if (drop !== drops) found = []; // stopped meanwhile
+    if (found.length) enqueue(found, target, { more });
+    more ||= found.length > 0;
+    found = [];
+    sentAt = performance.now();
+  };
+  const walk = async (entry, path) => {
+    if (drop !== drops) throw new DOMException('Stopped.', 'AbortError');
+    if (entry.isFile) {
+      found.push({ file: await new Promise((res, rej) => entry.file(res, rej)), path });
+      if (found.length >= 200 || performance.now() - sentAt > 250) send();
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (!batch.length) break;
+        for (const child of batch) await walk(child, [...path, entry.name]);
       }
-    };
-    if (entries.length) for (const entry of entries) await walk(entry, []);
-    else found.push(...plain.map((file) => ({ file, path: [] })));
-    enqueue(found, target);
-  })().catch((err) => toast(err.message, 'error'));
+    }
+  };
+  (async () => {
+    for (const entry of entries) await walk(entry, []);
+  })()
+    .catch((err) => {
+      if (err?.name !== 'AbortError') toast(err.message, 'error');
+    })
+    .finally(() => {
+      send();
+      reading--;
+      snapSoon();
+      pump(); // nothing more is coming from this drop
+    });
 }
 
 /**
  * Queues files for the open vault. An item may carry `after()`, run once it's encrypted and
- * saved. Resolves when every item has finished, failed or stopped.
+ * saved. Resolves when every item has finished, failed or stopped. `more`: another batch of
+ * files from the same drop (when the storage filled up meanwhile, they stop too).
  */
-export function enqueue(items, target = get().folder) {
+export function enqueue(items, target = get().folder, { more = false } = {}) {
   if (!items.length) return Promise.resolve([]);
-  stoppedFor = '';
+  if (!more) stoppedFor = '';
   const added = items.map(({ file, path, after }) => {
     const task = { id: crypto.randomUUID(), file, path, target, after, backend: state.backend, local: state.backend?.kind === 'local', progress: 0, status: 'queued', error: '', abort: new AbortController() };
     task.finished = new Promise((resolve) => {
       task.settle = resolve;
     });
+    if (stoppedFor) {
+      task.status = 'error';
+      task.error = stoppedFor;
+      task.settle('error');
+    } else queueUp(task);
     return task;
   });
-  tasks.push(...added);
+  for (const task of added) tasks.push(task);
   set({ tray: 'open' });
   snapshot();
   pump();
@@ -676,7 +764,7 @@ export function enqueue(items, target = get().folder) {
 
 function pump() {
   while (running < parallel()) {
-    const task = tasks.find((t) => t.status === 'queued');
+    const task = nextWaiting();
     if (!task) break;
     if (task.backend !== state.backend) {
       // The vault changed: what's still waiting belonged to the one that closed.
@@ -685,50 +773,68 @@ function pump() {
       continue;
     }
     if (!task.local && !driveFresh(2 * 60_000)) {
+      task.status = 'paused';
       for (const t of tasks) if (t.status === 'queued') t.status = 'paused';
-      snapshot();
+      snapSoon();
       break;
     }
     run(task);
   }
-  if (!tasks.some((t) => ACTIVE.has(t.status))) {
+  if (!reading && !tasks.some((t) => ACTIVE.has(t.status))) {
     pathJobs.clear();
     if (tasks.length && tasks.every((t) => t.status === 'done')) setTimeout(clearFinished, 4000);
   }
 }
 
+/** An upload: its encrypted copy is sent, then it goes into the vault with others that finish about then. */
 async function run(task) {
   running++;
   task.status = 'preparing';
-  snapshot();
+  snapSoon();
+  let entry = null;
   try {
-    await uploadOne(task);
-    task.status = 'done';
-    task.progress = 1;
-    if (task.after) await Promise.resolve().then(task.after).catch((err) => console.warn('After saving:', err));
+    entry = await uploadOne(task);
   } catch (err) {
-    if (err?.name === 'AbortError') {
-      task.status = 'cancelled';
-      task.error = '';
-    } else if (err?.code === 'expired') {
-      // The sign-in ran out mid-way: it waits for "Reconnect & resume" instead of failing.
-      task.status = 'paused';
-      task.progress = 0;
-      task.error = '';
-      task.abort = new AbortController();
-    } else if (err?.code === 'quota') {
-      task.status = 'error';
-      task.error = err.message;
-      stopQueue(err.message);
-    } else {
-      task.status = 'error';
-      task.error = err?.message || String(err);
-    }
-  } finally {
-    running--;
-    if (task.status !== 'paused') task.settle?.(task.status);
-    snapshot();
+    failed(task, err);
+  }
+  running--;
+  if (entry) {
+    // The encrypted copy is stored: the next file starts while this one is saved to the vault.
+    task.status = 'saving';
+    task.progress = 1;
+    snapSoon();
     pump();
+    try {
+      await saveEntry(entry, task.backend);
+      task.status = 'done';
+      if (task.after) await Promise.resolve().then(task.after).catch((err) => console.warn('After saving:', err));
+    } catch (err) {
+      failed(task, err);
+    }
+  }
+  if (task.status !== 'paused') task.settle?.(task.status);
+  snapSoon();
+  pump();
+}
+
+/** An upload that didn't go through: stopped, waiting for a fresh sign-in, or failed. */
+function failed(task, err) {
+  if (err?.name === 'AbortError') {
+    task.status = 'cancelled';
+    task.error = '';
+  } else if (err?.code === 'expired') {
+    // The sign-in ran out mid-way: it waits for "Reconnect & resume" instead of failing.
+    task.status = 'paused';
+    task.progress = 0;
+    task.error = '';
+    task.abort = new AbortController();
+  } else if (err?.code === 'quota') {
+    task.status = 'error';
+    task.error = err.message;
+    stopQueue(err.message);
+  } else {
+    task.status = 'error';
+    task.error = err?.message || String(err);
   }
 }
 
@@ -754,7 +860,7 @@ async function ensurePath(target, path) {
   // The folder it was going into was deleted meanwhile: All files instead.
   let parent = target && folderById(target) ? target : null;
   for (const name of path) {
-    const existing = vault().folders.find((f) => f.parent === parent && f.name.toLowerCase() === name.toLowerCase());
+    const existing = index().foldersIn(parent).find((f) => f.name.toLowerCase() === name.toLowerCase());
     if (existing) {
       parent = existing.id;
       continue;
@@ -774,6 +880,7 @@ async function ensurePath(target, path) {
   return parent;
 }
 
+/** Encrypts and stores one file's copy; resolves with its vault entry (not saved to the vault yet). */
 async function uploadOne(task) {
   const { file } = task;
   if (file.size > MAX_FILE_SIZE) throw new Error(`Files up to ${formatBytes(MAX_FILE_SIZE)} are supported.`);
@@ -788,7 +895,7 @@ async function uploadOne(task) {
       : await makeThumbnail(file, type);
   const plan = layout({ size: file.size, thumbBytes: thumbnail?.length || 0 });
   task.status = 'uploading';
-  snapshot();
+  snapSoon();
   const { backend } = task;
   const send = await backend.openUpload({ name: id, size: plan.total, signal: task.abort.signal }); // stored under the file's own id
   const writer = createPieceWriter({
@@ -807,59 +914,112 @@ async function uploadOne(task) {
     await send.abort?.(); // the upload session (or a half-written file here) goes
     throw err;
   }
-  const entry = makeFileEntry({ id, name: file.name, type, size: file.size, folder, blob: id, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes });
-  await saveEntry(entry, backend);
+  return makeFileEntry({ id, name: file.name, type, size: file.size, folder, blob: id, key: meta.key, chunk: meta.chunk, thumbBytes: meta.thumbBytes });
 }
 
-// Saved to the vault in small batches: many small files make a few vault saves, not one each.
+// Saved to the vault together: while one save is under way, the files that finish meanwhile
+// wait for the next one, so thousands of files make a few dozen vault saves instead of
+// thousands (each save writes the whole vault, which grows with every file).
 let batch = [];
 let batchTimer = 0;
+let saving = null; // the save under way
 
 function saveEntry(entry, backend) {
   return new Promise((resolve, reject) => {
     batch.push({ entry, backend, resolve, reject });
-    clearTimeout(batchTimer);
-    if (batch.length >= 20) flush();
-    else batchTimer = setTimeout(flush, 600);
+    saveSoon();
   });
 }
 
-async function flush() {
+/** Saves what's waiting: now if nothing else is uploading, else within a second, to take in more. */
+function saveSoon() {
+  if (saving || !batch.length) return; // the next save goes once this one is done
+  if (!running || batch.length >= 1000) flush();
+  else batchTimer ||= setTimeout(flush, 1000);
+}
+
+/** Saves everything waiting to go into the vault now; resolves when the save under way is done. */
+function flush() {
   clearTimeout(batchTimer);
+  batchTimer = 0;
+  if (saving || !batch.length) return saving || Promise.resolve();
   const items = batch;
   batch = [];
+  saving = saveBatch(items)
+    .catch((err) => {
+      // Something unexpected: none of them is left waiting for ever.
+      console.warn('Saving uploads:', err);
+      for (const { reject } of items) reject(err);
+    })
+    .finally(() => {
+      saving = null;
+      saveSoon();
+    });
+  return saving;
+}
+
+async function saveBatch(items) {
+  // Copies stored for a vault that's closed since (another one opened) never go into this one.
+  const elsewhere = items.filter((it) => it.backend !== state.backend);
+  for (const { entry, backend, reject } of elsewhere) {
+    backend.trash(entry.blob).catch(() => {});
+    reject(new Error('Another vault was opened before this file was saved.'));
+  }
+  items = items.filter((it) => it.backend === state.backend);
   if (!items.length) return;
-  const v = vault();
-  const names = new Map();
+  const { filesIn } = index();
+  const names = new Map(); // folder -> { taken, counters }: the names there, as each file takes one
   const changes = items.map(({ entry }) => {
-    const taken = names.get(entry.folder) || v.files.filter((f) => f.folder === entry.folder).map((f) => f.name);
-    const name = uniqueName(entry.name, taken);
-    taken.push(name);
-    names.set(entry.folder, taken);
+    let here = names.get(entry.folder);
+    if (!here) names.set(entry.folder, (here = { taken: new Set(filesIn(entry.folder).map((f) => f.name.toLowerCase())), counters: new Map() }));
+    const name = uniqueNameWhere(entry.name, (lower) => here.taken.has(lower), { counters: here.counters });
+    here.taken.add(name.toLowerCase());
     return { op: 'file-put', file: { ...entry, name } };
   });
-  try {
-    await commit({ op: 'batch', changes });
-  } catch (err) {
-    for (const { entry, backend, reject } of items) {
-      backend.trash(entry.blob).catch(() => {});
-      reject(err);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await commit({ op: 'batch', changes });
+      break;
+    } catch (err) {
+      // A passing failure (offline for a moment, the cloud busy): tried again before giving up,
+      // as a save holds many files.
+      if (transient(err) && attempt < 3 && state.backend === items[0].backend) {
+        await pause(backoff(attempt));
+        continue;
+      }
+      for (const { entry, backend, reject } of items) {
+        backend.trash(entry.blob).catch(() => {});
+        reject(err);
+      }
+      return;
     }
-    return;
   }
   // A folder deleted meanwhile in another window or device: those files are in All files now.
-  const moved = changes.filter((c) => c.file.folder && !vault().files.some((f) => f.id === c.file.id && f.folder === c.file.folder));
+  const moved = changes.filter((c) => c.file.folder && fileById(c.file.id)?.folder !== c.file.folder);
   if (moved.length) toast(`${moved.length === 1 ? `“${moved[0].file.name}” was` : `${moved.length} files were`} saved in ${ROOT_NAME}: the folder ${moved.length === 1 ? 'it was going to' : 'they were going to'} was deleted meanwhile.`);
   for (const { resolve } of items) resolve();
+}
+
+function requeue(task) {
+  Object.assign(task, { status: 'queued', progress: 0, error: '', abort: new AbortController(), backend: state.backend });
+  task.finished = new Promise((resolve) => {
+    task.settle = resolve;
+  });
+  queueUp(task);
 }
 
 export function retryTask(id) {
   const task = tasks.find((t) => t.id === id);
   if (!task) return;
-  Object.assign(task, { status: 'queued', progress: 0, error: '', abort: new AbortController(), backend: state.backend });
-  task.finished = new Promise((resolve) => {
-    task.settle = resolve;
-  });
+  requeue(task);
+  stoppedFor = '';
+  snapshot();
+  pump();
+}
+
+/** The tray's Retry all: every upload that failed goes again. */
+export function retryFailed() {
+  for (const task of tasks) if (task.status === 'error') requeue(task);
   stoppedFor = '';
   snapshot();
   pump();
@@ -883,6 +1043,7 @@ export async function resumePaused() {
     if (t.status === 'paused') {
       t.status = 'queued';
       t.backend = state.backend;
+      queueUp(t);
     }
   }
   snapshot();
@@ -890,8 +1051,10 @@ export async function resumePaused() {
 }
 
 export function clearFinished() {
-  if (tasks.some((t) => ACTIVE.has(t.status))) return;
-  for (let i = tasks.length - 1; i >= 0; i--) if (['done', 'cancelled'].includes(tasks[i].status)) tasks.splice(i, 1);
+  if (reading || tasks.some((t) => ACTIVE.has(t.status))) return;
+  const keep = tasks.filter((t) => t.status !== 'done' && t.status !== 'cancelled');
+  tasks.length = 0;
+  for (const task of keep) tasks.push(task);
   snapshot();
 }
 
@@ -911,6 +1074,8 @@ export async function closeTray() {
     await stopAll();
   }
   tasks.length = 0;
+  waiting = [];
+  head = 0;
   snapshot();
 }
 
@@ -918,12 +1083,13 @@ export const toggleTray = () => set({ tray: get().tray === 'open' ? 'collapsed' 
 
 /** Stops every upload, and resolves once all of them have stopped. */
 export async function stopAll() {
+  drops++;
   const live = tasks.filter((t) => ACTIVE.has(t.status));
   for (const task of live) cancelTask(task.id);
   await Promise.all(live.map((t) => t.finished));
 }
 
-const unfinished = () => tasks.some((t) => ACTIVE.has(t.status));
+const unfinished = () => reading > 0 || tasks.some((t) => ACTIVE.has(t.status));
 
 // Leaving the page while files are still uploading or downloading (or saving here), or with a
 // text file's changes unsaved, asks first: a download needs a Secure Box window for its keys
@@ -946,11 +1112,16 @@ export const files = {
   /** Uploads paused until Reconnect & resume: they never finish by themselves. */
   pausedCount: () => tasks.filter((t) => t.status === 'paused').length,
   stopAll,
+  /** Uploads whose encrypted copy is stored, saved to the vault now (before locking, say). */
+  async saveWaiting() {
+    for (let i = 0; i < 3 && (saving || batch.length); i++) await (saving || flush());
+  },
   checkCopies,
   /** Another vault opened: start at the top, nothing chosen. */
   reset() {
     set({ folder: null, query: '', selected: new Set(), anchor: null, pending: new Map(), missing: new Set() });
     releaseUrls();
+    forgetThumbs();
   },
   /** Another vault opened: its finished uploads aren't this vault's to retry. */
   clearTransfers() {

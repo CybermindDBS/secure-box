@@ -87,9 +87,17 @@ export function createCopies({ listAll, findOne, missing }) {
         reload();
         await listing;
       }
-      const out = [];
-      for (const name of names) if (!(await find(name))) out.push(name);
-      return out;
+      // Each one not in the listing is looked up on its own, a few at a time.
+      const gone = new Array(names.length).fill(false);
+      let next = 0;
+      const worker = async () => {
+        while (next < names.length) {
+          const i = next++;
+          if (!(await find(names[i]))) gone[i] = true;
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, names.length) }, worker));
+      return names.filter((_, i) => gone[i]);
     },
     /** Every copy stored here, listed afresh: name -> { size }. */
     async list() {
