@@ -5,6 +5,8 @@
  *   expire  uploads fail as if the sign-in ran out: they pause, ready for Reconnect & resume
  *   trash   deleting encrypted copies fails: they're remembered and tried again on a later sync
  *   save    the first vault save fails: the change isn't saved, and says so
+ *   slow    a slow connection: each piece of an upload takes 1.5 s, and each read (a thumbnail,
+ *           say) a third of a second, to rehearse adding files while others upload, or scrolling
  *   race    the first vault save crosses with another device's, which it replaces (Google Drive
  *           can't refuse it): Secure Box takes that save back and puts its change on top
  *   moved   once open, the vault is moved to another place from another device: the next save
@@ -24,6 +26,7 @@
  */
 import { GoogleError } from '../core/google.js';
 import { movedNoteText } from '../core/vault.js';
+import { pause } from './store.js';
 
 export function injectFaults(backend, list) {
   const faults = new Set(String(list || '').split(',').map((f) => f.trim()).filter(Boolean));
@@ -97,6 +100,22 @@ export function injectFaults(backend, list) {
       const theirs = await backend.saveFromAnotherDevice(); // lands just before this save...
       const ours = await write(text, rev); // ...which replaces it, as Google Drive allows
       throw Object.assign(new GoogleError('overwrote', 'Another device saved the vault at the same moment.'), { overwrote: theirs, rev: ours });
+    };
+  }
+  if (faults.has('slow')) {
+    const open = backend.openUpload.bind(backend);
+    backend.openUpload = async (...args) => {
+      const send = await open(...args);
+      const slowly = async (...piece) => {
+        await pause(1500);
+        return send(...piece);
+      };
+      return Object.assign(slowly, { pieceSize: send.pieceSize, abort: send.abort });
+    };
+    const readBytes = backend.readBytes.bind(backend);
+    backend.readBytes = async (...args) => {
+      await pause(330);
+      return readBytes(...args);
     };
   }
   if (faults.has('save')) {

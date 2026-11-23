@@ -206,6 +206,40 @@
   }
 }
 
+/* The uploads box moves by its top (TransfersTray.jsx), out of the way of what's behind it: a grip
+   says so, and a finger dragging it doesn't scroll the page. */
+.transfers-head {
+  position: relative;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.transfers-head::before {
+  content: '';
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  width: 32px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-strong);
+  translate: -50% 0;
+}
+
+.transfers-head :is(button, a) {
+  cursor: pointer;
+}
+
+.transfers.is-moving {
+  animation: none;
+  box-shadow: var(--shadow-lg), 0 0 0 1px var(--border-strong);
+}
+
+.transfers.is-moving .transfers-head {
+  cursor: grabbing;
+}
+
 /* Where what's drawn of a long list ends: more is drawn as this comes near (hooks.js,
    useIncremental). It takes a whole row of the grid, and no room to speak of. */
 .files-more,

@@ -426,6 +426,7 @@ npm run preview      # serves dist/ at http://localhost:8081, under the real CSP
 |---|---|
 | `quota`, `expire`, `trash`, `save` | Uploads, sign-in, deleting or saving go wrong |
 | `race` | A save crosses with another device's save |
+| `slow` | A slow connection: uploads and reads (thumbnails, say) take a while |
 | `bin`, `deleted`, `trashed`, `gone` | The vault is in the bin, or deleted outside Secure Box (found when opening, or while open) |
 | `moved`, `away` | The vault was moved away from another device (while open, or found when opening) |
 | `older` | Opening finds a vault an earlier version made |

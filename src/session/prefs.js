@@ -1,7 +1,8 @@
 /**
  * How you like to see Secure Box, remembered in this browser (#8): the tab you were on, the tools
  * mode, thumbnails, grid or list, sorting, monospace text, the password generator, hidden .sbox
- * names. One validated record, shared by every Secure Box window here.
+ * names, where the uploads box was moved to. One validated record, shared by every Secure Box
+ * window here.
  *
  * Nothing from inside a vault is ever kept here: no names, folders, searches or secrets.
  */
@@ -20,6 +21,8 @@ const SCHEMA = {
   sort: { ok: oneOf('name', 'updated', 'size', 'type'), fallback: 'name' },
   textMono: { ok: bool, fallback: false }, // plain-text documents in a fixed-width font
   hideNames: { ok: bool, fallback: true }, // .sbox files get random names
+  // How far the uploads box was moved from its corner, up (y) and to the left (x), in pixels.
+  trayOffset: { ok: (o) => o && typeof o === 'object' && [o.x, o.y].every((n) => Number.isFinite(n) && n >= 0 && n <= 10000), fallback: { x: 0, y: 0 } },
   generator: {
     ok: (g) => g && typeof g === 'object' && Number.isInteger(g.length) && g.length >= 8 && g.length <= 64 && ['upper', 'lower', 'digits', 'symbols'].every((k) => bool(g[k])),
     fallback: { length: 20, upper: true, lower: true, digits: true, symbols: true },

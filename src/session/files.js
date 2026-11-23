@@ -641,7 +641,7 @@ function rowOf(task) {
   const row = task.row;
   if (row && row.status === task.status && row.progress === task.progress && row.error === task.error) return row;
   task.type ??= guessType(task.file.name, task.file.type);
-  task.row = { id: task.id, name: task.file.name, size: task.file.size, type: task.type, status: task.status, progress: task.progress, error: task.error, local: task.local };
+  task.row = { id: task.id, name: task.file.name, savedAs: task.savedAs || '', size: task.file.size, type: task.type, status: task.status, progress: task.progress, error: task.error, local: task.local };
   return task.row;
 }
 function snapshot() {
@@ -805,7 +805,9 @@ async function run(task) {
     snapSoon();
     pump();
     try {
-      await saveEntry(entry, task.backend);
+      // Saved under another name when one beside it has its name ("Report (2).pdf"): the tray says so.
+      const name = await saveEntry(entry, task.backend);
+      task.savedAs = name !== task.file.name ? name : '';
       task.status = 'done';
       if (task.after) await Promise.resolve().then(task.after).catch((err) => console.warn('After saving:', err));
     } catch (err) {
@@ -997,11 +999,11 @@ async function saveBatch(items) {
   // A folder deleted meanwhile in another window or device: those files are in All files now.
   const moved = changes.filter((c) => c.file.folder && fileById(c.file.id)?.folder !== c.file.folder);
   if (moved.length) toast(`${moved.length === 1 ? `“${moved[0].file.name}” was` : `${moved.length} files were`} saved in ${ROOT_NAME}: the folder ${moved.length === 1 ? 'it was going to' : 'they were going to'} was deleted meanwhile.`);
-  for (const { resolve } of items) resolve();
+  items.forEach(({ resolve }, i) => resolve(changes[i].file.name));
 }
 
 function requeue(task) {
-  Object.assign(task, { status: 'queued', progress: 0, error: '', abort: new AbortController(), backend: state.backend });
+  Object.assign(task, { status: 'queued', progress: 0, error: '', savedAs: '', abort: new AbortController(), backend: state.backend });
   task.finished = new Promise((resolve) => {
     task.settle = resolve;
   });
