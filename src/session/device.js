@@ -1,8 +1,10 @@
 /**
- * The vault kept only on this device: making and opening it (in this browser, or in a folder you
- * choose), backups, moving it, deleting it, and what happens when its folder goes missing.
+ * The vault kept only on this device: making and opening it (in a folder you choose; in the
+ * experimental build also in this browser's own storage, experiments.js), backups, moving it,
+ * deleting it, and what happens when its folder goes missing.
  */
 import { parseKeyring, trustedRevision, verifyRevision } from '../core/keyring.js';
+import { BROWSER_VAULT } from '../experiments.js';
 import { allowFolder, BROWSER_GONE, createLocalBackend, findLocalVaults, forgetFolder, LocalError, localSupport, readBackup, vaultIn } from '../core/localstore.js';
 import { formatBytes } from '../core/filetypes.js';
 import { parseEnvelope } from '../core/vault.js';
@@ -12,7 +14,7 @@ import { commit, counted, lock, saveChain, vaultGone } from './cloud.js';
 import { files, noteCopy } from './files.js';
 import { downloadFile, pickFiles } from './io.js';
 import * as memory from './memory.js';
-import { folderPath, isDevice } from './places.js';
+import { deviceUnavailable, folderPath, isDevice } from './places.js';
 import { DEMO, publish, state } from './store.js';
 import { channel } from './windows.js';
 import { handleError, openAccount, showError, showPanel, showWelcome, showWorking, spreadKeyring, streamingReady } from './vaults.js';
@@ -34,13 +36,22 @@ export const deviceBackend = (options) => {
 export const FOLDER_HINT = 'Choose a folder inside Documents, or make one in the picker (for example “Vaults”). Browsers don’t allow Documents, Desktop or Downloads themselves.';
 
 /** The folder picker, opening in Documents. Resolves null when cancelled. */
-async function pickVaultFolder() {
+export async function pickVaultFolder() {
   try {
     return await window.showDirectoryPicker({ id: 'secure-box-local', mode: 'readwrite', startIn: 'documents' });
   } catch (err) {
     if (err.name === 'AbortError') return null;
     throw err;
   }
+}
+
+/**
+ * Asks for a folder to keep a vault on this device in: says what it's for first, so the picker
+ * opens on a click of its own (browsers open one only right after a click). Null when cancelled.
+ */
+export async function chooseVaultFolder({ title = 'Choose a folder for your vault', text = 'Your vault on this device is kept there as ordinary encrypted files you can see, copy and back up.' } = {}) {
+  const ok = await confirmDialog({ title, message: `${text} ${FOLDER_HINT}`, confirmLabel: 'Choose folder…' });
+  return ok ? pickVaultFolder() : null;
 }
 
 const placeOf = (backend) => (backend.where === 'folder' ? folderPath(backend.name) : 'this browser');
@@ -59,22 +70,23 @@ const setDevice = (patch) => {
  */
 export async function openDeviceVault({ quiet = false } = {}) {
   const support = localSupport();
-  if (support.ios && !support.standalone) {
+  if (BROWSER_VAULT && support.browser && support.ios && !support.standalone) {
     if (!quiet) {
       state.provider = 'local';
       showPanel('device-ios');
     }
     return false;
   }
-  if (!support.browser && !support.folder) {
-    if (!quiet) showError({ title: 'Not in this browser', message: 'This browser can’t keep a vault on this device. Use an up-to-date Chrome, Edge, Firefox or Safari.', action: 'show-welcome', actionLabel: 'Back' });
+  const unavailable = deviceUnavailable();
+  if (unavailable) {
+    if (!quiet) showError({ title: DEMO ? 'Not in the demo' : 'Not in this browser', message: unavailable, action: 'show-welcome', actionLabel: 'Back' });
     return false;
   }
   const vaults = await findLocalVaults({ demo: DEMO });
   const last = memory.deviceChoice();
   // The vault this device used isn't here any more: say so, rather than offer a new one.
   if (last && !vaults.some((v) => v.kid === last.kid && v.where === last.where)) {
-    showMissingDevice(last.where === 'browser' ? BROWSER_GONE : 'Secure Box lost track of the folder that holds your vault on this device.', last.where);
+    showMissingDevice(BROWSER_VAULT && last.where === 'browser' ? BROWSER_GONE : 'Secure Box lost track of the folder that holds your vault on this device.', last.where);
     return true;
   }
   const pick = vaults.find((v) => v.kid === last?.kid && v.where === last?.where) || vaults.find((v) => v.where === 'browser') || vaults[0];
@@ -96,7 +108,7 @@ export async function openDeviceVault({ quiet = false } = {}) {
 export function showDeviceNew(error = '') {
   state.provider = 'local';
   state.backend = null;
-  showPanel('device-new', { folderOk: localSupport().folder && !DEMO, error });
+  showPanel('device-new', { folderOk: localSupport().folder && !DEMO, browserOk: localSupport().browser, error });
 }
 
 /**
@@ -107,7 +119,7 @@ export function showDeviceNew(error = '') {
 export function showMissingDevice(message, where = state.backend?.where || memory.deviceChoice()?.where || 'folder') {
   state.provider = 'local';
   const kid = state.backend?.kid || memory.deviceChoice()?.kid || '';
-  showPanel('vault-missing', { kind: where === 'browser' ? 'browser' : 'folder', message, kid, backupAt: kid ? memory.backupAt(kid) : 0 });
+  showPanel('vault-missing', { kind: BROWSER_VAULT && where === 'browser' ? 'browser' : 'folder', message, kid, backupAt: kid ? memory.backupAt(kid) : 0 });
 }
 
 /** Vault-missing card → Start over: Secure Box forgets the missing vault, then opens another here or offers a new one. */
@@ -131,12 +143,16 @@ export async function useDeviceVault({ where, handle = null, kid = null }) {
 }
 
 export async function createDeviceVault(where) {
-  const inFolder = where === 'folder' && localSupport().folder && !DEMO;
+  const support = localSupport();
+  // Without the browser's own storage (the production app), a folder is the only place.
+  const inBrowser = BROWSER_VAULT && support.browser;
+  const inFolder = (where === 'folder' || !inBrowser) && support.folder && !DEMO;
+  if (!inFolder && !inBrowser) return showDeviceNew(deviceUnavailable());
   let handle = null;
   if (inFolder) {
     handle = await pickVaultFolder();
     if (!handle) return;
-  } else {
+  } else if (BROWSER_VAULT) {
     navigator.storage?.persist?.().catch(() => {}); // ask the browser to keep it (Firefox asks the person)
   }
   await useDeviceVault({ where: inFolder ? 'folder' : 'browser', handle });
@@ -164,6 +180,21 @@ export async function forgetDeviceFolderAtGate() {
 /** What a vault can be restored from: a backup, or its folder as a cloud's website downloads it (maybe several ZIP files). */
 const pickRestore = () => pickFiles({ accept: '.zip,application/zip', multiple: true });
 
+/**
+ * Where a vault restored from a backup goes on this device: the browser's own storage where that
+ * experiment is on, else a folder you choose. Resolves { where, handle, backend }, or null when
+ * no folder was chosen.
+ */
+async function restorePlace(kid) {
+  if (BROWSER_VAULT && localSupport().browser) return { where: 'browser', handle: null, backend: createLocalBackend({ where: 'browser', kid, demo: DEMO }) };
+  const unavailable = deviceUnavailable();
+  if (unavailable) throw new Error(unavailable);
+  const handle = await chooseVaultFolder({ title: 'Where should the restored vault go?', text: 'Choose a folder for it on this device: it’s kept there as ordinary encrypted files you can see, copy and back up.' });
+  if (!handle) return null;
+  if (await vaultIn(handle)) throw new Error(`“${handle.name}” holds a vault already. Choose another folder.`);
+  return { where: 'folder', handle, backend: createLocalBackend({ where: 'folder', handle, demo: DEMO }) };
+}
+
 /** Copies every encrypted copy out of `backup` into `backend`, saying how far it got with `say(percent)`. */
 async function restoreCopies(backend, backup, say) {
   const names = backup.names();
@@ -190,7 +221,7 @@ export async function restoreDeviceFromGate() {
   try {
     const backup = await readBackup(files);
     const { kid } = backup.manifest;
-    if ((await findLocalVaults({ demo: DEMO })).some((v) => v.kid === kid && v.where === 'browser')) {
+    if ((await findLocalVaults({ demo: DEMO })).some((v) => v.kid === kid)) {
       // A download can be of another vault with the same master key (one in a cloud): it's added to that one here.
       throw new Error(
         backup.from === 'download'
@@ -198,11 +229,12 @@ export async function restoreDeviceFromGate() {
           : 'This device already has that vault. Open it, then use ⋯ → Restore a backup to add what’s missing.',
       );
     }
+    const place = await restorePlace(kid);
+    if (!place) return;
     showWorking('Restoring your vault…');
-    const backend = createLocalBackend({ where: 'browser', kid, demo: DEMO });
-    await backend.create({ keyringText: backup.keyring, vaultText: backup.vault, kid });
-    await restoreCopies(backend, backup, (percent) => showWorking(`Restoring your vault… ${percent}%`));
-    await useDeviceVault({ where: 'browser', kid });
+    await place.backend.create({ keyringText: backup.keyring, vaultText: backup.vault, kid });
+    await restoreCopies(place.backend, backup, (percent) => showWorking(`Restoring your vault… ${percent}%`));
+    await useDeviceVault({ where: place.where, handle: place.handle, kid });
     toast(backup.from === 'download' ? 'Restored on this device. Unlock it with your master password. ⋯ → Move or copy this vault… can then put it back in your cloud.' : 'Restored. Unlock it with your master password.');
   } catch (err) {
     showDeviceNew(err.message);
@@ -270,19 +302,20 @@ async function findDeviceFolder(missingKid) {
   return true;
 }
 
-/** A backup (or a cloud's folder download) restored as this device's vault, in this browser. Resolves true once it's there. */
+/** A backup (or a cloud's folder download) restored as this device's vault (restorePlace). Resolves true once it's there. */
 async function restoreDeviceHere(missingKid) {
   const files = await pickRestore();
   if (!files.length) return false;
   const backup = await readBackup(files);
   const { kid } = backup.manifest;
   if ((await findLocalVaults({ demo: DEMO })).some((v) => v.kid === kid)) throw new Error(`This device already has the vault in that ${backup.from === 'download' ? 'download' : 'backup'}.`);
+  const place = await restorePlace(kid);
+  if (!place) return false;
   toast('Restoring your vault on this device…');
-  const backend = createLocalBackend({ where: 'browser', kid, demo: DEMO });
-  await backend.create({ keyringText: backup.keyring, vaultText: backup.vault, kid });
-  await restoreCopies(backend, backup, () => {});
+  await place.backend.create({ keyringText: backup.keyring, vaultText: backup.vault, kid });
+  await restoreCopies(place.backend, backup, () => {});
   if (missingKid && missingKid !== kid) await forgetDeletedDevice(missingKid);
-  memory.rememberDeviceChoice({ kid, where: 'browser' });
+  memory.rememberDeviceChoice({ kid, where: place.where });
   return true;
 }
 
@@ -327,7 +360,7 @@ export async function forgetDeletedDevice(kid) {
  */
 export async function deviceBackendForSession() {
   const support = localSupport();
-  if (support.ios && !support.standalone) {
+  if (BROWSER_VAULT && support.browser && support.ios && !support.standalone) {
     await confirmDialog({
       title: 'Use the Home Screen app',
       message: 'On iPhone and iPad, keep a vault on this device only in the Secure Box app on your Home Screen: Safari deletes the data of websites you haven’t opened for 7 days. Tap Share → Add to Home Screen, then open Secure Box from there.',
@@ -335,7 +368,8 @@ export async function deviceBackendForSession() {
     });
     return null;
   }
-  if (!support.browser && !support.folder) throw new Error('This browser can’t keep a vault on this device. Use an up-to-date Chrome, Edge, Firefox or Safari.');
+  const unavailable = deviceUnavailable();
+  if (unavailable) throw new Error(unavailable);
   const vaults = await findLocalVaults({ demo: DEMO });
   const remembered = memory.deviceChoice();
   let pick =
@@ -346,7 +380,7 @@ export async function deviceBackendForSession() {
   // The vault this device had is gone (this site's data cleared, or its folder forgotten): say so,
   // rather than quietly make a new, empty one in its place.
   if (!pick && remembered) {
-    throw Object.assign(new LocalError('gone', remembered.where === 'browser' ? BROWSER_GONE : 'Secure Box lost track of the folder that held your vault on this device.'), remembered);
+    throw Object.assign(new LocalError('gone', BROWSER_VAULT && remembered.where === 'browser' ? BROWSER_GONE : 'Secure Box lost track of the folder that held your vault on this device.'), remembered);
   }
   const found = Boolean(pick);
   if (!pick) {
@@ -359,11 +393,21 @@ export async function deviceBackendForSession() {
 }
 
 /**
- * Where a vault on this device goes: the browser's storage, or a folder (Chrome and Edge on
- * computers, Chrome on Android). With `moving` (where it is now), where it moves to.
+ * Where a vault on this device goes: a folder (Chrome and Edge on computers, Chrome on Android),
+ * or, where that experiment is on, the browser's storage. With `moving` (where it is now),
+ * where it moves to.
  */
 export async function chooseDeviceWhere({ moving = null } = {}) {
-  const folderOk = localSupport().folder && !DEMO;
+  const support = localSupport();
+  const folderOk = support.folder && !DEMO;
+  if (!BROWSER_VAULT || !support.browser) {
+    // The production app: a folder you choose is the only place on this device.
+    if (!folderOk) throw new Error(deviceUnavailable());
+    const handle = await chooseVaultFolder(
+      moving ? { title: 'Move your vault to another folder', text: 'Secure Box copies it there exactly as it is, still encrypted, opens it there, then deletes the old copy.' } : undefined,
+    );
+    return handle ? { where: 'folder', handle } : null;
+  }
   if (!moving && !folderOk) return { where: 'browser' };
   const where = await ask('deviceWhere', { moving, folderOk, folderName: moving === 'folder' ? state.backend?.name : '' });
   if (!where) return null;
@@ -389,7 +433,7 @@ export function refreshDeviceStatus() {
 
 /** When this device's vault was last backed up, and whether that's long ago. */
 export function backupState() {
-  if (!isDevice() || state.backend.where !== 'browser') return null;
+  if (!BROWSER_VAULT || !isDevice() || state.backend.where !== 'browser') return null;
   const at = memory.backupAt(state.master.kid);
   const changed = Number(String(state.rev || '').split(':')[0]) || 0; // when the vault was last saved
   const stale = !at || (changed > at + 5000 && Date.now() - at > 7 * 86_400_000);

@@ -1,6 +1,7 @@
 /**
  * ⋯ → Move or copy this vault: takes the open vault to another place (Google Drive, OneDrive, or
- * this device, in this browser or a folder), or to another account of the same cloud.
+ * this device, in a folder you choose, or in this browser where that experiment is on), or to
+ * another account of the same cloud.
  *
  *   1. Choose a place. Secure Box signs in there (or asks where on this device), and looks at what
  *      it holds (transfer.js, lookAt).
@@ -21,6 +22,7 @@
 import { formatBytes } from '../core/filetypes.js';
 import { isNewer, serializeKeyring, trustedRevision, verifyRevision } from '../core/keyring.js';
 import { allowFolder, findLocalVaults, forgetFolder, localSupport } from '../core/localstore.js';
+import { BROWSER_VAULT } from '../experiments.js';
 import { refreshMicrosoft } from '../core/microsoft.js';
 import { checkPlace, copyFiles, encryptedSize, lookAt } from '../core/transfer.js';
 import { compareVaults, emptyVault, mergeVaults, movedNoteText, parseEnvelope } from '../core/vault.js';
@@ -29,7 +31,7 @@ import { counted, ensureDrive, pullLatest, reconnectNow, saveChain } from './clo
 import { chooseDeviceWhere, deviceBackend, deviceVaultGone, forgetDeletedDevice } from './device.js';
 import { files } from './files.js';
 import * as memory from './memory.js';
-import { backendFor, cipherFor, companyName, folderPath, microsoftReady, placeName, providerName } from './places.js';
+import { backendFor, cipherFor, companyName, deviceUnavailable, folderPath, microsoftReady, placeName, providerName } from './places.js';
 import { DEMO, publish, state } from './store.js';
 import { tools } from './tools.js';
 import { leaveEditing } from './viewer.js';
@@ -90,23 +92,21 @@ export function destinations() {
       id: 'local',
       provider: 'local',
       name: 'Another place on this device',
-      detail: inBrowser ? 'A folder you choose' : 'This browser, or another folder',
+      detail: inBrowser ? 'A folder you choose' : BROWSER_VAULT && support.browser ? 'This browser, or another folder' : 'Another folder you choose',
       icon: 'device',
-      disabled: inBrowser && !folderOk,
-      why: inBrowser && !folderOk ? (DEMO ? 'The demo keeps its vault on this device in the browser only.' : 'This browser can only keep a vault in its own storage, where it is now.') : '',
+      disabled: !folderOk,
+      why: folderOk ? '' : DEMO ? 'The demo keeps its vault on this device in the browser only.' : inBrowser ? 'This browser can only keep a vault in its own storage, where it is now.' : deviceUnavailable(),
     });
   } else {
     const blocked =
-      support.ios && !support.standalone
+      BROWSER_VAULT && support.browser && support.ios && !support.standalone
         ? 'On iPhone and iPad, a vault on this device needs the Secure Box app on your Home Screen (Share → Add to Home Screen).'
-        : !support.browser && !support.folder
-          ? 'This browser can’t keep a vault on this device.'
-          : '';
+        : deviceUnavailable();
     rows.push({
       id: 'local',
       provider: 'local',
       name: 'This device',
-      detail: memory.deviceChoice() ? 'Your vault on this device is there' : folderOk ? 'In this browser, or a folder you choose' : 'In this browser',
+      detail: memory.deviceChoice() ? 'Your vault on this device is there' : !(BROWSER_VAULT && support.browser) ? 'A folder you choose' : folderOk ? 'In this browser, or a folder you choose' : 'In this browser',
       icon: 'device',
       disabled: Boolean(blocked),
       why: blocked,
@@ -194,7 +194,7 @@ async function findDeviceDestination() {
     const source = state.backend;
     const choice = await chooseDeviceWhere({ moving: source.where });
     if (!choice) return null;
-    if (choice.where === 'browser') {
+    if (BROWSER_VAULT && choice.where === 'browser') {
       if (source.where === 'browser') throw fail('Your vault is in this browser already.');
       return { backend: deviceBackend({ where: 'browser', kid }) };
     }
@@ -226,7 +226,7 @@ async function findDeviceDestination() {
   }
   // The vault this device had is gone already (this site's data cleared, say): said in passing.
   const remembered = memory.deviceChoice();
-  const lost = remembered ? (remembered.where === 'browser' ? 'this site’s data in the browser was cleared' : 'Secure Box lost track of its folder') : '';
+  const lost = remembered ? (BROWSER_VAULT && remembered.where === 'browser' ? 'this site’s data in the browser was cleared' : 'Secure Box lost track of its folder') : '';
   const choice = await chooseDeviceWhere();
   if (!choice) return null;
   return { backend: deviceBackend({ where: choice.where, handle: choice.handle || null, kid: choice.where === 'browser' ? kid : null }), lost };
@@ -293,7 +293,7 @@ export async function transfer(plan, { mode, replace = false, signal, onStep = (
       if (dest.provider === 'local') {
         if (seen.doc && seen.doc.kid !== state.master.kid) await forgetDeletedDevice(seen.doc.kid);
         // In this browser each master key has a space of its own: the vault goes in the open one's.
-        if (dest.backend.where === 'browser') dest.backend = deviceBackend({ where: 'browser', kid: state.master.kid });
+        if (BROWSER_VAULT && dest.backend.where === 'browser') dest.backend = deviceBackend({ where: 'browser', kid: state.master.kid });
       }
       seen = lookAt(await at('to', dest.backend.load()), state.master.kid);
       there = null;
@@ -436,7 +436,7 @@ async function clearOldPlace(source, dest, names) {
   if (source.backend.kind === 'local') {
     await source.backend.removeAll();
     if (dest.provider !== 'local') await forgetDeletedDevice(source.backend.kid || kid);
-    else if (dest.backend.where === 'browser') await forgetFolder(kid, { demo: DEMO }); // the old folder's handle
+    else if (BROWSER_VAULT && dest.backend.where === 'browser') await forgetFolder(kid, { demo: DEMO }); // the old folder's handle
   } else {
     await source.backend.retire(movedNoteText(dest.provider), names);
     memory.forgetCloudVault(source.provider, source.email);

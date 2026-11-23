@@ -62,9 +62,12 @@ function pdfAssets() {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   base: './',
   plugins: [serviceWorkerScripts(), pdfAssets()],
+  // Experiments (src/experiments.js): on only in the experimental build (--mode experimental),
+  // never in production. A literal, so the build drops the code only they reach.
+  define: { __EXPERIMENTS__: JSON.stringify(mode === 'experimental') },
   // React's automatic JSX runtime through Vite's own transform: no Babel, and no inline
   // scripts in development, so the page keeps its strict CSP in dev too.
   oxc: { jsx: { runtime: 'automatic', importSource: 'react' } },
@@ -86,4 +89,4 @@ export default defineConfig({
     assetsInlineLimit: 0, // never data: URLs for scripts or styles
     chunkSizeWarningLimit: 1500,
   },
-});
+}));

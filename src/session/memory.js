@@ -4,6 +4,7 @@
  * was backed up, why the last window locked. Nothing secret. The demo keeps its own copy, so
  * trying it never changes what the real app opens.
  */
+import { BROWSER_VAULT } from '../experiments.js';
 import { DEMO } from './store.js';
 
 const ns = DEMO ? 'secure-box.demo.' : 'secure-box.';
@@ -55,7 +56,11 @@ export function lastProvider() {
 export const rememberProvider = (provider) => write(localStorage, KEYS.provider, provider);
 
 // This device's vault: its key id and where it lives.
-export const deviceChoice = () => readJson(localStorage, KEYS.device, null);
+/** This device's vault used last: { kid, where }. One in the browser's storage only counts where that experiment is on. */
+export function deviceChoice() {
+  const choice = readJson(localStorage, KEYS.device, null);
+  return choice?.where === 'browser' && !BROWSER_VAULT ? null : choice;
+}
 export const rememberDeviceChoice = (choice) => write(localStorage, KEYS.device, choice);
 export function forgetDeviceChoice(kid) {
   if (deviceChoice()?.kid === kid) write(localStorage, KEYS.device, null);

@@ -1,3 +1,4 @@
+import { BROWSER_VAULT } from '../../experiments.js';
 import { backupDevice, backupState, encryptStrays, protectDevice } from '../../session/device.js';
 import { relativeTime } from '../../session/io.js';
 import { isDevice } from '../../session/places.js';
@@ -28,12 +29,12 @@ export function DeviceBar() {
                 <Icon name="info" size={14} label="Browsers never tell websites where a folder is on your disk, only its name." />
               </span>
             </span>
-          ) : (
+          ) : BROWSER_VAULT ? (
             <span>Kept in this browser</span>
-          )}
+          ) : null}
         </span>
-        {device.protection === 'protected' ? <span className="local-pill is-ok">Won’t be cleared automatically</span> : null}
-        {device.protection === 'unprotected' ? (
+        {BROWSER_VAULT && device.protection === 'protected' ? <span className="local-pill is-ok">Won’t be cleared automatically</span> : null}
+        {BROWSER_VAULT && device.protection === 'unprotected' ? (
           <>
             <span className="local-pill is-warn">The browser may clear it when space runs low</span>
             <button type="button" className="btn btn-ghost btn-sm" onClick={() => run(protectDevice)}>

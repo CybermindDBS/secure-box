@@ -2,8 +2,10 @@
 // - dist/index.html carries the same Content-Security-Policy as firebase.json (minus the
 //   directives a <meta> can't hold), and has no inline scripts, styles or style attributes;
 // - every script and stylesheet it names exists, and is a file of the right kind;
-// - the service worker and the classic scripts it imports are there, unhashed.
-import { existsSync, readFileSync } from 'node:fs';
+// - the service worker and the classic scripts it imports are there, unhashed;
+// - experiments (src/experiments.js) are left out of a production build, and are in an
+//   experimental one (node scripts/check-build.mjs --experimental).
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -59,8 +61,19 @@ for (const [, list] of sw.matchAll(/importScripts\(([^)]*)\)/g)) {
   for (const [, path] of list.matchAll(/'([^']+)'/g)) if (!existsSync(join(dist, path))) fail(`sw.js imports a missing file: ${path}`);
 }
 
+// Experiments are named only in a build that has them (EXPERIMENTS in src/experiments.js): a
+// production build must not, and the experimental one must, so this can't pass by accident.
+const experimental = process.argv.includes('--experimental');
+const scripts = readdirSync(join(dist, 'assets'))
+  .filter((name) => name.endsWith('.js'))
+  .map((name) => readFileSync(join(dist, 'assets', name), 'utf8'))
+  .join('\n');
+const hasExperiments = /[`"']browser-vault[`"']/.test(scripts); // the minifier may quote it with backticks
+if (!experimental && hasExperiments) fail('The browser vault experiment is in this production build. Build with "npm run build", not "--mode experimental".');
+if (experimental && !hasExperiments) fail('The experimental build has no experiments in it.');
+
 if (problems.length) {
   console.error(`Build check failed:\n- ${problems.join('\n- ')}`);
   process.exit(1);
 }
-console.log('Build check passed: same CSP as firebase.json, nothing inline, every file present.');
+console.log(`Build check passed: same CSP as firebase.json, nothing inline, every file present, ${experimental ? 'experiments on (experimental build)' : 'no experiments'}.`);

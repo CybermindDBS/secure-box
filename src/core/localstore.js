@@ -3,13 +3,14 @@
  * vaults (same key ring, same encryption, same app), but nothing in it is ever uploaded.
  *
  * Where it lives
- *   browser  the browser's private storage for Secure Box (the "origin private file system").
- *            Works in every modern browser, phones included, but isn't visible as files and goes
- *            away if someone clears this site's data, so we ask for persistent storage (the
- *            browser then never clears it on its own) and make backups easy.
  *   folder   a folder you choose (Chrome and Edge on computers, Chrome on Android): ordinary
  *            encrypted files you can see, copy or keep in a synced folder. The browser asks once
  *            per visit to allow it.
+ *   browser  an experiment, off in production (experiments.js): the browser's private storage
+ *            for Secure Box (the "origin private file system"). Works in every modern browser,
+ *            phones included, but isn't visible as files, goes away if someone clears this site's
+ *            data, and stays behind at this address if Secure Box moves to another; we ask for
+ *            persistent storage (the browser then never clears it on its own) and make backups easy.
  *
  * Layout, in either place, exactly as in the clouds (a vault is the same everywhere):
  *   Secure Box Key Ring.json   the key ring (your master key, locked)
@@ -23,6 +24,7 @@ import { isEncryptedCopy } from './fileformat.js';
 import { zipEntries, zipEntryData, zipFolder } from './localbox.js';
 import { KEYRING_FILE_NAME, parseKeyring } from './keyring.js';
 import { FILES_FOLDER, VAULT_FILE_NAME, isBlobName, parseEnvelope } from './vault.js';
+import { BROWSER_VAULT } from '../experiments.js';
 
 const VAULT_DIR = 'Secure Box';
 const KEYRING = KEYRING_FILE_NAME;
@@ -58,7 +60,8 @@ export function localSupport() {
   const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const standalone = window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone === true;
   return {
-    browser: typeof navigator.storage?.getDirectory === 'function' && typeof FileSystemFileHandle !== 'undefined' && 'createWritable' in FileSystemFileHandle.prototype,
+    // The browser's own storage: only where that experiment is on (experiments.js).
+    browser: BROWSER_VAULT && typeof navigator.storage?.getDirectory === 'function' && typeof FileSystemFileHandle !== 'undefined' && 'createWritable' in FileSystemFileHandle.prototype,
     folder: typeof window.showDirectoryPicker === 'function',
     ios,
     standalone,
@@ -142,7 +145,7 @@ export async function findLocalVaults({ demo = false } = {}) {
       found.push({ kid, where: 'folder', handle, name: handle.name, ready: permission === 'granted' });
     }
   }
-  if (support.browser) {
+  if (BROWSER_VAULT && support.browser) {
     try {
       const base = await browserBase(demo, false);
       for await (const [kid, dir] of base.entries()) {
@@ -215,7 +218,7 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
         throw err.name === 'NotFoundError' ? await goneError() : err;
       }
     } else {
-      if (!currentKid) throw new LocalError('missing', 'There is no vault on this device yet.');
+      if (!BROWSER_VAULT || !currentKid) throw new LocalError('missing', 'There is no vault on this device yet.');
       try {
         root = await (await browserBase(demo, create)).getDirectoryHandle(currentKid, { create });
       } catch (err) {
@@ -254,7 +257,7 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
     filesDir = null;
     if (lost) return lost;
     let message;
-    if (where === 'browser') message = BROWSER_GONE;
+    if (BROWSER_VAULT && where === 'browser') message = BROWSER_GONE;
     else if (!(await reachable(handle))) message = `The folder “${handle.name}” that held your vault on this device isn’t there any more.`;
     else if (emptied) message = `Your vault’s files aren’t in “${handle.name}” any more: they were moved or deleted.`;
     else message = `Your vault isn’t in “${handle.name}” any more: its “${VAULT_DIR}” folder was moved or deleted.`;
@@ -322,7 +325,7 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
   /** The vault's own folder goes too once it's empty: the key id's folder in the browser, "Secure Box" in a chosen one. */
   async function dropFolder(top) {
     if (!(await isEmpty(top))) return;
-    if (where === 'browser') await (await browserBase(demo, false)).removeEntry(currentKid).catch(() => {});
+    if (BROWSER_VAULT && where === 'browser') await (await browserBase(demo, false)).removeEntry(currentKid).catch(() => {});
     else if (!(await top.isSameEntry(handle))) await handle.removeEntry(VAULT_DIR).catch(() => {});
   }
 
@@ -355,12 +358,12 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
     describe: () => ({ source: 'page' }), // the streaming worker asks this page for the bytes
 
     async load() {
-      if (where === 'browser' && !currentKid) return { keyring: null, vault: null }; // a new vault, not made yet
+      if (BROWSER_VAULT && where === 'browser' && !currentKid) return { keyring: null, vault: null }; // a new vault, not made yet
       try {
         // A newly chosen folder gets its vault folder now; a known one must still be there.
         await open(where === 'folder' && !currentKid);
       } catch (err) {
-        if (err.name === 'NotFoundError' && where === 'browser') return { keyring: null, vault: null };
+        if (BROWSER_VAULT && err.name === 'NotFoundError' && where === 'browser') return { keyring: null, vault: null };
         throw err;
       }
       const [keyringFile, indexFile] = await Promise.all([readFile(KEYRING), readFile(INDEX)]);
@@ -400,7 +403,7 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
     },
 
     /** Whether the vault can be saved again where it was: in the browser always, in a folder while that folder is there. */
-    placeIsThere: async () => where === 'browser' || reachable(handle),
+    placeIsThere: async () => (BROWSER_VAULT && where === 'browser') || reachable(handle),
 
     /**
      * Saves an open vault again where it was, after it was deleted outside Secure Box: its key
@@ -430,7 +433,7 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
     },
     /** Free space for this site's storage in the browser, in bytes; null for a chosen folder (browsers don't say). */
     async freeSpace() {
-      if (where === 'folder') return null;
+      if (!BROWSER_VAULT || where === 'folder') return null;
       const { quota, usage } = (await navigator.storage?.estimate?.()) || {};
       return Number.isFinite(quota) ? Math.max(0, quota - (usage || 0)) : null;
     },
@@ -537,12 +540,12 @@ export function createLocalBackend({ where = 'browser', handle = null, kid = nul
     // ---- Keeping it safe --------------------------------------------------
     /** 'files' (a real folder), 'protected' (the browser won't clear it by itself) or 'unprotected'. */
     async protection() {
-      if (where === 'folder') return 'files';
+      if (!BROWSER_VAULT || where === 'folder') return 'files';
       return (await navigator.storage?.persisted?.()) ? 'protected' : 'unprotected';
     },
     /** Asks the browser for persistent storage. Firefox asks the person; others decide by themselves. */
     async protect() {
-      return Boolean(await navigator.storage?.persist?.());
+      return BROWSER_VAULT && Boolean(await navigator.storage?.persist?.());
     },
 
     /**

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { emergencyKitText } from '../../core/keyring.js';
 import { answer, dialogs, toast } from '../../session/bridge.js';
 import { reconnectNow } from '../../session/cloud.js';
+import { BROWSER_VAULT } from '../../experiments.js';
 import { FOLDER_HINT } from '../../session/device.js';
 import { recoverWith } from '../../session/gone.js';
 import { copyText, downloadFile } from '../../session/io.js';
@@ -224,18 +225,23 @@ function DeviceWhereDialog({ props, close }) {
   );
 }
 
-/** "In this browser" or "In a folder you choose", for a new vault on this device or a move. */
+/**
+ * "In this browser" or "In a folder you choose", for a new vault on this device or a move: a
+ * choice only in the experimental build, where the browser's own storage is one (experiments.js).
+ */
 export function DeviceWhereChoice({ where, onChange, moving = null, folderOk = true, folderName = '' }) {
   return (
     <div className="local-where-choice" role="radiogroup" aria-label="Where to keep it">
-      <label className="local-option">
-        <input type="radio" name="device-where" value="browser" checked={where === 'browser'} disabled={moving === 'browser'} onChange={() => onChange('browser')} />
-        <span>
-          <strong>In this browser</strong>
-          <small>Nothing to set up. Clearing this site’s data in the browser deletes it.</small>
-          {moving === 'browser' ? <em className="local-now">Where it is now</em> : null}
-        </span>
-      </label>
+      {BROWSER_VAULT ? (
+        <label className="local-option">
+          <input type="radio" name="device-where" value="browser" checked={where === 'browser'} disabled={moving === 'browser'} onChange={() => onChange('browser')} />
+          <span>
+            <strong>In this browser</strong>
+            <small>Nothing to set up. Clearing this site’s data in the browser deletes it.</small>
+            {moving === 'browser' ? <em className="local-now">Where it is now</em> : null}
+          </span>
+        </label>
+      ) : null}
       <label className="local-option">
         <input type="radio" name="device-where" value="folder" checked={where === 'folder'} disabled={!folderOk} onChange={() => onChange('folder')} />
         <span>
@@ -403,7 +409,7 @@ const KINDS = {
   reconnect: ReconnectDialog,
   ownKey: OwnKeyDialog,
   vaultGone: VaultGoneDialog,
-  deviceWhere: DeviceWhereDialog,
+  ...(BROWSER_VAULT ? { deviceWhere: DeviceWhereDialog } : {}),
   changePassword: ChangePasswordDialog,
   kit: KitDialog,
   moveVault: MoveVaultDialog,
