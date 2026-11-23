@@ -126,9 +126,9 @@ function ItemList({ onNew }) {
           ) : (
             <>
               <div className="empty-icon">
-                <Icon name="shield" size={22} />
+                <Icon name="key" size={22} />
               </div>
-              <p className="empty-title">Your vault is empty</p>
+              <p className="empty-title">No passwords yet</p>
               <p>Add a password or a secure note to get started.</p>
               <button type="button" className="btn btn-primary btn-sm" onClick={onNew}>
                 <Icon name="plus" size={16} />
@@ -314,7 +314,7 @@ function ItemDetail({ onEdit }) {
         <div className="empty-icon">
           <Icon name="lock" size={22} />
         </div>
-        <p className="empty-title">{vault?.items.length ? 'Select an item' : 'Nothing here yet'}</p>
+        <p className="empty-title">{vault?.items.length ? 'Select an item' : 'Passwords and notes you add show here'}</p>
         <p>Everything is encrypted in this browser before it is saved.</p>
       </div>
     );

@@ -85,7 +85,10 @@
   gap: 8px;
 }
 
+/* A place is a button (Move or copy) or, on the Vault tab, a row whose name is its button,
+   stretched over it, so the row can hold a second one: "Sign in with another account". */
 .place-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 14px;
@@ -105,24 +108,64 @@
     transform 0.1s;
 }
 
-.place-row:hover {
+/* Over "Sign in with another account", only that link lights up, not the row it's in. */
+.place-row:hover:where(:not(:has(.place-row-other:hover))) {
   border-color: var(--border-strong);
   background: var(--surface-2);
 }
 
-.place-row:focus-visible {
+.place-row:focus-visible,
+.place-row:has(.place-row-open:focus-visible) {
   outline: none;
   border-color: var(--accent);
   box-shadow: var(--ring);
 }
 
-.place-row:active {
+.place-row:active:where(:not(:has(.place-row-other:active))) {
   transform: scale(0.995);
 }
 
-.place-row:disabled {
+.place-row:disabled,
+.place-row:has(.place-row-open:disabled) {
   opacity: 0.55;
   cursor: default;
+}
+
+.place-row-open {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 14.5px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.place-row-open::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 14px;
+}
+
+.place-row-open:focus-visible {
+  outline: none;
+}
+
+.place-row-open:disabled {
+  cursor: default;
+}
+
+/* Above the row's own button, and bigger to tap than its text without moving it. */
+.place-row .place-row-other {
+  position: relative;
+  z-index: 1;
+  justify-self: start;
+  margin: 1px -8px -12px;
+  padding: 4px 8px 12px;
+  font-size: 12.5px;
 }
 
 .place-row.is-last-used {
@@ -169,7 +212,7 @@
     color 0.15s;
 }
 
-.place-row:hover .place-row-go {
+.place-row:hover:where(:not(:has(.place-row-other:hover))) .place-row-go {
   color: var(--text-2);
   transform: translateX(2px);
 }
@@ -247,6 +290,65 @@
 
 .place-chip-change {
   flex: none;
+}
+
+/* ---------- Unlock: the card you see most, with room to breathe ---------- */
+.home-card:has(> .unlock) {
+  padding: 34px 32px 26px;
+}
+
+.unlock-head {
+  margin-bottom: 24px;
+  text-align: center;
+}
+
+.unlock-badge {
+  display: grid;
+  place-items: center;
+  width: 60px;
+  height: 60px;
+  margin: 0 auto 16px;
+  border-radius: 18px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent-soft) 45%, transparent);
+}
+
+.home-title.unlock-title {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: -0.02em;
+}
+
+.unlock .field {
+  margin-bottom: 16px;
+}
+
+.unlock .input {
+  height: 48px;
+  padding-left: 14px;
+  border-radius: 12px;
+  font-size: 16px;
+}
+
+/* Room for its one tool (show the password), so the placeholder fits on a phone too. */
+.unlock .input-group .input {
+  padding-right: 48px;
+}
+
+.unlock .input-tools {
+  top: 8px;
+  right: 8px;
+}
+
+.unlock .btn-block {
+  height: 48px;
+  border-radius: 12px;
+  font-size: 15px;
+}
+
+.unlock .home-links {
+  margin-top: 16px;
 }
 
 /* ---------- Problems ---------- */
@@ -354,6 +456,15 @@
   gap: 6px;
 }
 
+.home-foot a {
+  color: inherit;
+  text-underline-offset: 2px;
+}
+
+.home-foot a:hover {
+  color: var(--text-2);
+}
+
 @media (max-width: 760px) {
   .home {
     padding: 12px 12px 24px;
@@ -366,5 +477,19 @@
 
   .home-title {
     font-size: 18px;
+  }
+
+  .home-card:has(> .unlock) {
+    padding: 28px 18px 20px;
+  }
+
+  .unlock-badge {
+    width: 56px;
+    height: 56px;
+    border-radius: 16px;
+  }
+
+  .home-title.unlock-title {
+    font-size: 22px;
   }
 }

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Privacy · Secure Box</title>
+    <meta name="description" content="How Secure Box handles your data: everything is encrypted in your browser and kept in your own Google Drive, OneDrive or a folder on your device." />
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/privacy.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-head">
+        <a class="brand" href="./">
+          <img src="assets/favicon.svg" alt="" width="28" height="28" />
+          <span>Secure Box</span>
+        </a>
+        <a class="open" href="./">Open Secure Box</a>
+      </header>
+
+      <h1>Privacy</h1>
+      <p class="updated">Updated 23 November 2026</p>
+      <p>
+        Secure Box is a vault for passwords, notes and files that encrypts everything in your browser. It's open source (AGPL-3.0): the code this site runs is
+        <a href="https://github.com/CybermindDBS/secure-box">published on GitHub</a>, so anyone can check what it does.
+      </p>
+
+      <h2>In short</h2>
+      <ul>
+        <li>Your passwords, notes and files are encrypted in your browser before they're stored. Only your master password, or your Emergency Kit, can unlock them.</li>
+        <li>They're stored where you choose: your own Google Drive or OneDrive, or a folder on your device. Secure Box has no server of its own that stores them or could read them.</li>
+        <li>There are no Secure Box accounts, no analytics, no advertising and no tracking cookies.</li>
+      </ul>
+
+      <h2>Your vault</h2>
+      <ul>
+        <li>Everything in your vault (passwords, notes, folders, file names, and each file's own key) is encrypted into one vault file. Each file you store becomes one more encrypted file, under a random name.</li>
+        <li>In Google Drive they're in a “Secure Box” folder. In OneDrive they're in Secure Box's own app folder (“Apps/Secure Box”). On your device they're in a “Secure Box” folder inside a folder you choose.</li>
+        <li>Your master password never leaves your device: your browser uses it to unlock your vault's keys. Nobody else can see it or recover it; only your Emergency Kit can replace it.</li>
+        <li>Encrypt &amp; decrypt works the same way: files and messages are encrypted and decrypted in your browser, and saved where you choose.</li>
+        <li>The demo's sample data stays in your browser tab.</li>
+      </ul>
+
+      <h2>Google and Microsoft</h2>
+      <p>If you keep your vault in Google Drive or OneDrive, you sign in on Google's or Microsoft's own pages and let Secure Box use:</p>
+      <ul>
+        <li><strong>Google:</strong> your email address, and only the Google Drive files Secure Box creates or that you open with it, nothing else in your Drive (the <code>drive.file</code> permission).</li>
+        <li><strong>Microsoft:</strong> your name and email address, and only Secure Box's own app folder in your OneDrive (the <code>Files.ReadWrite.AppFolder</code> permission).</li>
+      </ul>
+      <p>
+        Your browser talks to Google and Microsoft directly. Secure Box keeps the sign-in only in memory while it's unlocked: locking it, or closing it, forgets it. You can take Secure Box's
+        access away at any time in your <a href="https://myaccount.google.com/connections">Google Account</a> or your <a href="https://account.live.com/consent/Manage">Microsoft account</a>.
+      </p>
+      <p>
+        Secure Box's use and transfer of information received from Google APIs adheres to the
+        <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.
+      </p>
+
+      <h2>What your browser keeps</h2>
+      <p>
+        To open the right vault quickly, your browser keeps, on this device only: where your vault was last (Google Drive, OneDrive or this device), the email addresses you signed in with
+        and which of those accounts have a vault, view settings such as grid or list, when your master password last changed, when Secure Box last locked, and which folder a vault on this
+        device is in. None of it is secret: no passwords, keys or sign-in tokens. While you sign in, the tab briefly keeps the one-time codes the sign-in needs. Clearing this site's data in
+        your browser removes all of it.
+      </p>
+
+      <h2>This website</h2>
+      <p>
+        The site is a set of files served by Firebase Hosting, a Google service. Like any web server, it sees your IP address and browser details when it sends you those files; Google handles
+        that under <a href="https://policies.google.com/privacy">its own privacy policy</a>. Secure Box adds no logging, analytics or advertising of its own, and the site's security policy
+        only lets the page connect to this site, Google and Microsoft.
+      </p>
+
+      <h2>Your data is yours</h2>
+      <ul>
+        <li>To delete a vault, delete its “Secure Box” folder in Google Drive or OneDrive, or on your device. A vault on this device can also be deleted from Secure Box itself (⋯ → Delete this vault…).</li>
+        <li>There's nothing for us to delete: we never have your data.</li>
+      </ul>
+
+      <h2>Changes</h2>
+      <p>If this policy changes, this page will say so, with a new date. Every change is in the project's public history on GitHub.</p>
+
+      <h2>Questions</h2>
+      <p><a href="https://github.com/CybermindDBS/secure-box/issues">Open an issue on GitHub</a>.</p>
+    </main>
+  </body>
+</html>

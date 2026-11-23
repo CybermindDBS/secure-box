@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { localSupport } from '../../core/localstore.js';
 import { BROWSER_VAULT } from '../../experiments.js';
 import { FOLDER_HINT, allowDeviceFolder, createDeviceVault, deleteDeviceAtGate, forgetDeviceFolderAtGate, forgetGoneDevice, openDeviceVault, relocateDevice, restoreDeviceFromGate, startOverDevice } from '../../session/device.js';
@@ -89,18 +89,31 @@ function PlaceChip() {
 // ---------------------------------------------------------------------------
 // The places
 // ---------------------------------------------------------------------------
-export function PlaceRow({ icon, name, sub, onClick, last = false, disabled = false, busy = false }) {
+/**
+ * A place: the whole row opens it (its name is the button, stretched over the row). `other`, for
+ * a cloud this browser signed in to: { label, aria, onClick }, a way in with another account, on
+ * its own line under the account.
+ */
+export function PlaceRow({ icon, name, sub, onClick, last = false, disabled = false, busy = false, other = null }) {
+  const subId = useId();
   return (
-    <button type="button" className={`place-row${last ? ' is-last-used' : ''}`} onClick={onClick} disabled={disabled || busy}>
+    <div className={`place-row${last ? ' is-last-used' : ''}`}>
       <span className="place-row-icon" aria-hidden="true">
         {busy ? <Spinner small /> : <Icon name={icon} size={20} />}
       </span>
       <span className="place-row-text">
-        <strong>{name}</strong>
-        <small>{sub}</small>
+        <button type="button" className="place-row-open" onClick={onClick} disabled={disabled || busy} aria-label={last && !DEMO ? `${name}, last used` : undefined} aria-describedby={subId}>
+          {name}
+        </button>
+        <small id={subId}>{sub}</small>
+        {other ? (
+          <button type="button" className="link-btn place-row-other" onClick={other.onClick} aria-label={other.aria}>
+            {other.label}
+          </button>
+        ) : null}
       </span>
       <Icon name="chevronRight" size={18} className="place-row-go" />
-    </button>
+    </div>
   );
 }
 
@@ -118,7 +131,20 @@ function Places({ gate }) {
       ) : null}
       <div className="place-list">
         {rows.map((row) => (
-          <PlaceRow key={row.provider} icon={row.icon} name={row.name} sub={row.sub} last={row.last} disabled={row.disabled} onClick={() => run(openPlace, row.provider)} />
+          <PlaceRow
+            key={row.provider}
+            icon={row.icon}
+            name={row.name}
+            sub={row.sub}
+            last={row.last}
+            disabled={row.disabled}
+            onClick={() => run(openPlace, row.provider)}
+            other={
+              row.account
+                ? { label: 'Sign in with another account', aria: `Sign in with another ${companyName(row.provider)} account`, onClick: () => run(signIn, 'select_account', row.provider) }
+                : null
+            }
+          />
         ))}
       </div>
       {!DEMO && !known ? <p className="home-note">New here? Pick where your vault should live. You can add the others later, with the same master password.</p> : null}
@@ -142,16 +168,32 @@ function Unlock({ gate }) {
   const [password, setPassword] = useState(gate.demoPassword || '');
   const [caps, setCaps] = useState(false);
   const [go, busy] = useAction(() => unlock(password));
-  const provider = currentProvider();
+  // Only the master password: where the vault is (and with which account) is on the Change page.
   return (
-    <>
-      <h2 className="home-title">Welcome back</h2>
+    <div className="unlock">
+      <div className="unlock-head">
+        <span className="unlock-badge" aria-hidden="true">
+          <Icon name="lock" size={26} />
+        </span>
+        <h2 className="home-title unlock-title">Welcome back</h2>
+      </div>
       {gate.status ? (
         <p className="home-message" role="status">
           {gate.status}
         </p>
       ) : null}
-      <PasswordInput id="unlock-password" label="Master password" value={password} onChange={setPassword} onEnter={go} onCaps={setCaps} autoFocus disabled={busy} invalid={Boolean(gate.error)} />
+      <PasswordInput
+        id="unlock-password"
+        label="Master password"
+        placeholder="Your Secure Box master password"
+        value={password}
+        onChange={setPassword}
+        onEnter={go}
+        onCaps={setCaps}
+        autoFocus
+        disabled={busy}
+        invalid={Boolean(gate.error)}
+      />
       {gate.demoPassword ? (
         <p className="panel-hint">
           Demo master password: <span className="mono">{gate.demoPassword}</span>
@@ -164,9 +206,9 @@ function Unlock({ gate }) {
       </button>
       <div className="home-links">
         <Link onClick={showRecover}>Forgot master password?</Link>
-        {!DEMO && provider !== 'local' ? <Link onClick={() => signIn('select_account', provider)}>Use a different {companyName(provider)} account</Link> : null}
+        {!DEMO ? <Link onClick={showWelcome}>Open another vault</Link> : null}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -214,7 +256,7 @@ function Create({ gate }) {
       <PasswordInput id="create-password" label="Master password" value={password} onChange={setPassword} autoFocus disabled={busy} />
       <StrengthMeter password={password} />
       <PasswordInput id="create-confirm" label="Repeat it" value={confirm} onChange={setConfirm} onEnter={go} disabled={busy} reveal={false} />
-      <p className="panel-hint">Use 12+ characters: a short sentence only you would think of works well. Don’t save it in your browser or online account.</p>
+      <p className="panel-hint">Use 12+ characters: a short sentence only you would think of works well. Make it different from your Google or Microsoft password, and don’t save it in your browser or online account.</p>
       <FormError error={gate.error} />
       <button type="button" className={`btn btn-primary btn-block${busy ? ' is-busy' : ''}`} disabled={busy} onClick={() => go()}>
         <span className="btn-spinner" aria-hidden="true" />
@@ -285,7 +327,7 @@ function Adopt({ gate }) {
             </button>
           </div>
           <PasswordInput id="adopt-password" label="Master password" value={secret} onChange={setSecret} onEnter={go} onCaps={setCaps} autoFocus disabled={busy} />
-          <p className="panel-hint">The master password of that vault. Its Emergency Kit’s recovery key works too.</p>
+          <p className="panel-hint">The Secure Box master password of that vault. Its Emergency Kit’s recovery key works too.</p>
         </>
       )}
       {waiting ? (
@@ -747,8 +789,9 @@ const PANELS = {
   setup: Setup,
 };
 
-// Panels that are about one place show it on top, with the way back to the others.
-const ABOUT_A_PLACE = new Set(['working', 'unlock', 'start', 'create', 'adopt', 'kit', 'recover', 'device-new', 'device-allow', 'device-ios', 'problem', 'missing-keyring', 'missing-vault', 'vault-missing', 'vault-moved']);
+// Panels that are about one place show it on top, with the way back to the others. Not the
+// unlock card: that's only the master password.
+const ABOUT_A_PLACE = new Set(['working', 'start', 'create', 'adopt', 'kit', 'recover', 'device-new', 'device-allow', 'device-ios', 'problem', 'missing-keyring', 'missing-vault', 'vault-missing', 'vault-moved']);
 
 function TrustFooter() {
   return (
@@ -765,6 +808,9 @@ function TrustFooter() {
         <Icon name="key" size={14} />
         Your master password never leaves you
       </span>
+      <a href="privacy.html" target="_blank" rel="noopener">
+        Privacy
+      </a>
     </footer>
   );
 }

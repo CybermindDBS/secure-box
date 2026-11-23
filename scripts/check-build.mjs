@@ -4,7 +4,8 @@
 // - every script and stylesheet it names exists, and is a file of the right kind;
 // - the service worker and the classic scripts it imports are there, unhashed;
 // - experiments (src/experiments.js) are left out of a production build, and are in an
-//   experimental one (node scripts/check-build.mjs --experimental).
+//   experimental one (node scripts/check-build.mjs --experimental);
+// - the privacy page is a plain page: no scripts, nothing inline, its own strict policy.
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,6 +60,18 @@ for (const file of ['sw.js', 'manifest.webmanifest', 'assets/stream-core.js', 'a
 const sw = existsSync(join(dist, 'sw.js')) ? readFileSync(join(dist, 'sw.js'), 'utf8') : '';
 for (const [, list] of sw.matchAll(/importScripts\(([^)]*)\)/g)) {
   for (const [, path] of list.matchAll(/'([^']+)'/g)) if (!existsSync(join(dist, path))) fail(`sw.js imports a missing file: ${path}`);
+}
+
+// The privacy page: no scripts at all, nothing inline, and the policy firebase.json sends it.
+const privacyFile = join(dist, 'privacy.html');
+if (!existsSync(privacyFile)) fail('Missing privacy.html');
+else {
+  const page = readFileSync(privacyFile, 'utf8');
+  if (/<script\b/i.test(page)) fail('privacy.html has a script: it must stay a plain page.');
+  if (/<style\b/i.test(page) || /\sstyle=/i.test(page) || /\son[a-z]+=/i.test(page)) fail('privacy.html has an inline style or event handler.');
+  for (const [, href] of page.matchAll(/(?:href|src)="(assets\/[^"]+)"/g)) if (!existsSync(join(dist, href))) fail(`privacy.html links a missing file: ${href}`);
+  const rule = firebase.hosting.headers.find((r) => r.source === '/privacy.html');
+  if (!rule?.headers.some((h) => h.key === 'Content-Security-Policy' && /default-src 'none'/.test(h.value) && !/script-src/.test(h.value))) fail('firebase.json must send privacy.html a policy that allows no scripts.');
 }
 
 // Experiments are named only in a build that has them (EXPERIMENTS in src/experiments.js): a
