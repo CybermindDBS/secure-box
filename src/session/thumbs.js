@@ -10,7 +10,7 @@
  */
 import { fileUrl } from '../core/stream.js';
 
-const AT_ONCE = 8; // thumbnails loading at the same time
+const AT_ONCE = 32; // thumbnails loading at the same time: a computer screen of them in one go
 const KEEP = 600; // thumbnails kept that aren't on screen (a few MB)
 const RETRY_AFTER = 60_000; // one that couldn't be loaded isn't asked for again before then
 

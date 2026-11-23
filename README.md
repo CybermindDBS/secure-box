@@ -131,7 +131,7 @@ Because it's the same everywhere, Secure Box moves a vault by copying these file
 
 **Streaming without disk.** A service worker, a small background script your browser runs for Secure Box, decrypts each file chunk by chunk as it streams in, using byte ranges so seeking works. Decrypted data is marked `no-store`, and nothing is written to the browser's storage. Only an explicit **Download** saves a file.
 
-**What runs where.** Encryption uses the browser's own WebCrypto, which works off the page on a thread of its own, at about a gigabyte a second for AES-GCM on a laptop. A small pool of workers reads documents for the viewer, makes thumbnails, and packs folders and backups into ZIPs, so the page stays responsive. With a cloud, the slow part is waiting on the network, so Secure Box keeps several requests going at once: three uploads, three copies when moving a vault, and up to four small files ahead while a ZIP downloads.
+**What runs where.** Encryption uses the browser's own WebCrypto, which works off the page on a thread of its own, at about a gigabyte a second for AES-GCM on a laptop. A small pool of workers reads documents for the viewer, makes thumbnails, and packs folders and backups into ZIPs, so the page stays responsive. With a cloud, the slow part is waiting on the network, so Secure Box keeps several requests going at once: three uploads, three copies when moving a vault, up to four small files ahead while a ZIP downloads, and up to 32 thumbnails, the ones coming into view first.
 
 </details>
 
