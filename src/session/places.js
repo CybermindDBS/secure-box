@@ -110,7 +110,8 @@ export function knownVaultsElsewhere(here) {
 
 /**
  * What the Vault tab says about each place before you choose it: what this browser knows
- * (an account, a vault here), or how you'd start.
+ * (the account it signed in with, a vault here), or how you'd start. The place used last is
+ * marked by `last`; `account`: the cloud account this browser signed in with, if any.
  */
 export function placeRows() {
   const last = lastProvider();
@@ -121,11 +122,12 @@ export function placeRows() {
     return rows;
   }
   const cloud = (provider) => {
-    const email = readHint(provider);
+    const email = readHint(provider) || '';
     return {
       provider,
       name: providerName(provider),
-      sub: email ? `${last === provider ? 'Last used' : 'Signed in before'} · ${email}` : `Sign in with ${companyName(provider)}`,
+      sub: email || `Sign in with ${companyName(provider)}`,
+      account: email,
       last: last === provider,
       icon: 'cloud',
     };
@@ -139,7 +141,7 @@ export function placeRows() {
     sub: deviceUnavailable()
       ? 'Not available in this browser'
       : device
-        ? `${last === 'local' ? 'Last used · ' : ''}Your vault is here`
+        ? 'Your vault is here'
         : BROWSER_VAULT && support.browser && support.ios && !support.standalone
           ? 'In the Home Screen app'
           : 'No account · you back it up',
