@@ -6,7 +6,7 @@
 
 **Your passwords, notes and files, encrypted in your browser and kept where you choose:<br>your own Google Drive, your OneDrive, or only on your device.**
 
-[**Open Secure Box**](https://box-6sd93.web.app) · [Try the demo](https://box-6sd93.web.app/?demo) · [Why you can trust it](#why-you-can-trust-it) · [Run your own copy](#run-your-own-copy)
+[**Open Secure Box**](https://box-6sd93.web.app) · [Try the demo](https://box-6sd93.web.app/?demo) · [Why you can trust it](#why-you-can-trust-it) · [Privacy](https://box-6sd93.web.app/privacy.html) · [Run your own copy](#run-your-own-copy)
 
 [![Tests](https://github.com/CybermindDBS/secure-box/actions/workflows/test.yml/badge.svg)](https://github.com/CybermindDBS/secure-box/actions/workflows/test.yml)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -415,7 +415,7 @@ npm run build:experimental   # dist/ with the experiments on (never deploy it)
 ```
 
 - Built with **React** and **Vite**. The page keeps its strict Content-Security-Policy in development too: no inline scripts or styles, and the only Trusted Types policy lets through just Secure Box's own scripts.
-- `npm run build` writes `dist/` and runs [`scripts/check-build.mjs`](scripts/check-build.mjs): the page's policy must match `firebase.json`'s, nothing may be inline, every file the page and the service worker load must be there, and no experiment may be in it.
+- `npm run build` writes `dist/` and runs [`scripts/check-build.mjs`](scripts/check-build.mjs): the page's policy must match `firebase.json`'s, nothing may be inline, every file the page and the service worker load must be there, no experiment may be in it, and the privacy page ([`public/privacy.html`](public/privacy.html)) must stay a plain page with no scripts.
 - **Experiments** ([`src/experiments.js`](src/experiments.js)) are features kept in the code but left out of the production app: the build drops the code only they reach. Today there's one, a vault on this device kept in the browser's own storage rather than a folder (it belongs to the site's address, so it couldn't follow Secure Box to a new one). The experimental scripts above turn them on, and the app then shows an **Experimental** badge.
 - `npm test` runs 98 unit tests: the key ring and its revisions, every encryption format, `.sbox` files and messages, the one vault format and how each place finds its files (against stand-ins for Google Drive and OneDrive), saves that cross on Google Drive, moving and copying vaults, backups and restores (cloud downloads included), missing files, ZIP reading and writing, document readers, uploads that resume, tamper detection, big vaults (thousands of changes applied in one pass, checked against applying them one at a time), and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
 - The demo can rehearse failures: add `&faults=` to `?demo`, for example http://localhost:8080/?demo&faults=trashed.

@@ -765,6 +765,9 @@ function TrustFooter() {
         <Icon name="key" size={14} />
         Your master password never leaves you
       </span>
+      <a href="privacy.html" target="_blank" rel="noopener">
+        Privacy
+      </a>
     </footer>
   );
 }

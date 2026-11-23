@@ -354,6 +354,15 @@
   gap: 6px;
 }
 
+.home-foot a {
+  color: inherit;
+  text-underline-offset: 2px;
+}
+
+.home-foot a:hover {
+  color: var(--text-2);
+}
+
 @media (max-width: 760px) {
   .home {
     padding: 12px 12px 24px;

@@ -1,0 +1,120 @@
+/* The privacy page (privacy.html): a plain document in Secure Box's colours, light or dark. */
+:root {
+  color-scheme: dark light;
+  --bg: #0e0e0d;
+  --text: #ededea;
+  --text-2: #b6b5af;
+  --text-3: #8a8983;
+  --border: #2a2a27;
+  --accent: #8b7cf6;
+  --code: #1b1b19;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fbfbf9;
+    --text: #1c1c1a;
+    --text-2: #4b4a46;
+    --text-3: #6d6c67;
+    --border: #e4e2dc;
+    --accent: #5b4bd6;
+    --code: #f0efea;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.65 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+.page {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+}
+
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 36px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.open {
+  font-size: 14px;
+  font-weight: 560;
+}
+
+h1 {
+  margin: 0;
+  font-size: 32px;
+  line-height: 1.2;
+}
+
+h2 {
+  margin: 36px 0 8px;
+  font-size: 20px;
+}
+
+.updated {
+  margin: 6px 0 24px;
+  color: var(--text-3);
+  font-size: 14px;
+}
+
+p,
+li {
+  color: var(--text-2);
+}
+
+ul {
+  padding-left: 22px;
+}
+
+li + li {
+  margin-top: 8px;
+}
+
+strong {
+  color: var(--text);
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 2px;
+}
+
+code {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--code);
+  font-size: 14px;
+}
+
+@media (max-width: 520px) {
+  body {
+    font-size: 15px;
+  }
+
+  h1 {
+    font-size: 27px;
+  }
+}

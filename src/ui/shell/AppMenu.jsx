@@ -73,6 +73,9 @@ export function AppMenu() {
       <MenuItem icon={<Icon name="code" />} href="https://github.com/CybermindDBS/secure-box">
         Source code (AGPL-3.0)
       </MenuItem>
+      <MenuItem icon={<Icon name="shield" />} href="privacy.html">
+        Privacy
+      </MenuItem>
       <MenuItem icon={<Icon name="lock" />} onSelect={() => run(lockWhenAsked)}>
         Lock
       </MenuItem>
