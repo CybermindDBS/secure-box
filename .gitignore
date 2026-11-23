@@ -2,6 +2,10 @@
 public/assets/config.json
 deploy.settings.json
 
+# A site's own verification files (Google Search Console): they stay on the machine that
+# deploys, which still serves them from public/, and never go into git
+public/google*.html
+
 # Never commit exports, key backups or Emergency Kits
 *.csv
 *Emergency Kit*.txt
