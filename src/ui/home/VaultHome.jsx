@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { localSupport } from '../../core/localstore.js';
-import { allowDeviceFolder, createDeviceVault, deleteDeviceAtGate, forgetDeviceFolderAtGate, forgetGoneDevice, openDeviceVault, relocateDevice, restoreDeviceFromGate, startOverDevice } from '../../session/device.js';
+import { BROWSER_VAULT } from '../../experiments.js';
+import { FOLDER_HINT, allowDeviceFolder, createDeviceVault, deleteDeviceAtGate, forgetDeviceFolderAtGate, forgetGoneDevice, openDeviceVault, relocateDevice, restoreDeviceFromGate, startOverDevice } from '../../session/device.js';
 import { formatDate, pickFile } from '../../session/io.js';
 import { deviceChoice } from '../../session/memory.js';
 import { setSection } from '../../session/nav.js';
@@ -378,13 +379,19 @@ function Recover({ gate }) {
 // This device
 // ---------------------------------------------------------------------------
 function DeviceNew({ gate }) {
-  const [where, setWhere] = useState('browser');
+  const [where, setWhere] = useState(BROWSER_VAULT && gate.browserOk ? 'browser' : 'folder');
   const [go, busy] = useAction(() => createDeviceVault(where));
   return (
     <>
       <h2 className="home-title">A vault on this device</h2>
       <p className="panel-text">Passwords and files kept here only. Nothing is uploaded, so nothing syncs: back it up now and then, and keep the backup somewhere else.</p>
-      {gate.folderOk ? <DeviceWhereChoice where={where} onChange={setWhere} /> : <p className="panel-hint">It’s kept in this browser’s private storage. Clearing this site’s data in the browser deletes it.</p>}
+      {BROWSER_VAULT && gate.browserOk && gate.folderOk ? (
+        <DeviceWhereChoice where={where} onChange={setWhere} />
+      ) : gate.folderOk ? (
+        <p className="panel-hint">It’s kept in a folder you choose, as ordinary encrypted files you can see, copy and back up. {FOLDER_HINT}</p>
+      ) : BROWSER_VAULT ? (
+        <p className="panel-hint">It’s kept in this browser’s private storage. Clearing this site’s data in the browser deletes it.</p>
+      ) : null}
       <FormError error={gate.error} />
       <button type="button" className={`btn btn-primary btn-block${busy ? ' is-busy' : ''}`} disabled={busy} onClick={() => go()}>
         <span className="btn-spinner" aria-hidden="true" />
@@ -657,7 +664,7 @@ function VaultMissing({ gate }) {
       </>
     );
   }
-  if (gate.kind === 'browser') {
+  if (BROWSER_VAULT && gate.kind === 'browser') {
     return (
       <>
         {head('Your vault in this browser is gone')}
@@ -731,7 +738,7 @@ const PANELS = {
   recover: Recover,
   'device-new': DeviceNew,
   'device-allow': DeviceAllow,
-  'device-ios': DeviceIos,
+  ...(BROWSER_VAULT ? { 'device-ios': DeviceIos } : {}),
   problem: Problem,
   'missing-keyring': MissingKeyring,
   'missing-vault': MissingVault,

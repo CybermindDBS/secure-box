@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { EXPERIMENTS } from '../../experiments.js';
 import { lockWhenAsked } from '../../session/cloud.js';
 import { files } from '../../session/files.js';
 import { setQuery } from '../../session/passwords.js';
@@ -74,6 +75,11 @@ export function TopBar() {
         <img className="mark-sm" src="assets/favicon.svg" alt="" width="28" height="28" />
         <span className="brand-name">Secure Box</span>
         {DEMO ? <span className="badge">Demo</span> : null}
+        {EXPERIMENTS.length ? (
+          <span className="badge badge-experimental" title={`Experimental build: ${EXPERIMENTS.join(', ')}. Not the app people use.`}>
+            Experimental
+          </span>
+        ) : null}
       </div>
       <Tabs before={unlocked ? <VaultSwitcher /> : null} />
       {searchable ? <Search open={searching} setOpen={setSearching} /> : null}

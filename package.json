@@ -16,7 +16,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:experimental": "vite --mode experimental",
     "build": "vite build && node scripts/check-build.mjs",
+    "build:experimental": "vite build --mode experimental && node scripts/check-build.mjs --experimental",
     "preview": "vite preview",
     "test": "node --test \"tests/*.test.mjs\""
   },

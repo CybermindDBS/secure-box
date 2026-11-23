@@ -11,10 +11,11 @@
  * The save that noticed it goes ahead once the vault is back (cloud.js, commit).
  */
 import { serializeKeyring } from '../core/keyring.js';
-import { forgetFolder } from '../core/localstore.js';
+import { BROWSER_VAULT } from '../experiments.js';
+import { forgetFolder, localSupport, vaultIn } from '../core/localstore.js';
 import { ask, toast } from './bridge.js';
 import { isGone, lock, pullLatest, setSyncStatus } from './cloud.js';
-import { deviceBackend, refreshDeviceStatus } from './device.js';
+import { deviceBackend, pickVaultFolder, refreshDeviceStatus } from './device.js';
 import { files } from './files.js';
 import * as memory from './memory.js';
 import { companyName, movedWhere, providerName } from './places.js';
@@ -45,7 +46,7 @@ async function describe(err) {
     };
   }
   if (backend.kind === 'local') {
-    if (backend.where === 'browser') {
+    if (BROWSER_VAULT && backend.where === 'browser') {
       return {
         title: 'Your vault in this browser was deleted',
         text: `${err.message} Secure Box still has it open, so it can save it again: ${NOT_ITS_FILES} (only a backup has those).`,
@@ -55,7 +56,7 @@ async function describe(err) {
     const there = await backend.placeIsThere();
     return {
       title: 'Your vault on this device was deleted',
-      text: `${err.message} If that was a mistake, restore it from the Recycle Bin (the Trash on a Mac), then choose Try again: everything comes back, files too. Or save what’s open again ${there ? `in “${backend.name}”` : 'in this browser, as its folder is gone too'}: ${NOT_ITS_FILES}.`,
+      text: `${err.message} If that was a mistake, restore it from the Recycle Bin (the Trash on a Mac), then choose Try again: everything comes back, files too. Or save what’s open again ${there ? `in “${backend.name}”` : BROWSER_VAULT && localSupport().browser ? 'in this browser, as its folder is gone too' : 'in a folder you choose, as its folder is gone too'}: ${NOT_ITS_FILES}.`,
       actions: [
         { id: 'again', label: 'Save it again' },
         { id: 'retry', label: 'Try again', primary: true },
@@ -117,16 +118,25 @@ export async function recoverWith(action) {
     return back('Your vault is out of the bin, as it was.');
   }
   // Save it again, from what's open.
+  const kid = state.master.kid;
+  const placeGone = backend.kind === 'local' && !(await backend.placeIsThere());
+  // Its folder is gone too: a folder chosen now (first, while the click that asked still counts),
+  // or, where that experiment is on, this browser's own storage.
+  let handle = null;
+  if (placeGone && !(BROWSER_VAULT && localSupport().browser)) {
+    handle = await pickVaultFolder();
+    if (!handle) throw new Error('Choose a folder to save your vault in.');
+    if (await vaultIn(handle)) throw new Error(`“${handle.name}” holds a vault already. Choose another folder.`);
+  }
   const keyringText = serializeKeyring(state.keyringDoc);
   const vaultText = await state.cipher.seal(state.vault);
-  const kid = state.master.kid;
-  if (backend.kind === 'local' && !(await backend.placeIsThere())) {
-    // Its folder is gone too: the vault goes into this browser instead.
-    const target = deviceBackend({ where: 'browser', kid });
+  if (placeGone) {
+    const where = handle ? 'folder' : 'browser';
+    await forgetFolder(kid, { demo: DEMO }); // the missing folder: a new one is remembered in its place
+    const target = deviceBackend({ where, handle, kid: handle ? null : kid });
     state.rev = await target.create({ keyringText, vaultText, kid });
     state.backend = target;
-    await forgetFolder(kid, { demo: DEMO });
-    memory.rememberDeviceChoice({ kid, where: 'browser' });
+    memory.rememberDeviceChoice({ kid, where });
     refreshDeviceStatus();
   } else {
     state.rev = await backend.recreate({ keyringText, vaultText, kid });

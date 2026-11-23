@@ -1,5 +1,6 @@
 import { ask } from '../../session/bridge.js';
 import { lockWhenAsked, syncNow } from '../../session/cloud.js';
+import { BROWSER_VAULT } from '../../experiments.js';
 import { backupDevice, deleteDevice, forgetDeviceFolder, restoreDevice } from '../../session/device.js';
 import { openMoveVault } from '../../session/migrate.js';
 import { exportKeyring, newEmergencyKit } from '../../session/passwords.js';
@@ -37,7 +38,7 @@ export function AppMenu() {
       </MenuItem>
       {device ? (
         <>
-          {where === 'browser' ? (
+          {BROWSER_VAULT && where === 'browser' ? (
             <MenuItem icon={<Icon name="download" />} onSelect={() => run(backupDevice)}>
               Back up this vault
             </MenuItem>

@@ -4,6 +4,7 @@
  */
 import { createCloudBackend, createOneDriveBackend } from '../core/backend.js';
 import { localSupport } from '../core/localstore.js';
+import { BROWSER_VAULT } from '../experiments.js';
 import { VaultCipher } from '../core/vault.js';
 import { deviceChoice, lastProvider, readHint } from './memory.js';
 import { DEMO, state } from './store.js';
@@ -15,6 +16,17 @@ export const currentProvider = () => state.provider || lastProvider() || 'google
 export const providerName = (provider = currentProvider()) => ({ microsoft: 'OneDrive', local: 'This device' })[provider] || 'Google Drive';
 export const companyName = (provider = currentProvider()) => (provider === 'microsoft' ? 'Microsoft' : 'Google');
 export const isDevice = () => state.backend?.kind === 'local';
+
+/**
+ * Why a vault can't be kept on this device here, or '' when it can: in the production app that
+ * takes a folder you choose, which only some browsers can open (and the demo never uses one).
+ */
+export function deviceUnavailable() {
+  const support = localSupport();
+  if (support.browser || (support.folder && !DEMO)) return '';
+  if (DEMO) return 'The demo doesn’t keep a vault on this device.';
+  return 'This browser can’t open a folder for Secure Box, so it can’t keep a vault on this device. Use Chrome or Edge on a computer, or Chrome on Android.';
+}
 
 /**
  * The app Secure Box connects to a cloud as, which decides what it can see there: Google Drive
@@ -74,7 +86,7 @@ export function placeDetail(provider = currentProvider()) {
   if (provider === 'local') {
     const backend = state.provider === 'local' ? state.backend : null;
     if (backend?.where === 'folder') return folderPath(backend.name);
-    if (backend?.where === 'browser') return 'In this browser';
+    if (BROWSER_VAULT && backend?.where === 'browser') return 'In this browser';
     return '';
   }
   if (state.provider === provider && state.identity?.email) return state.identity.email;
@@ -124,10 +136,16 @@ export function placeRows() {
   rows.push({
     provider: 'local',
     name: 'This device',
-    sub: device ? `${last === 'local' ? 'Last used · ' : ''}Your vault is here` : support.ios && !support.standalone ? 'In the Home Screen app' : 'No account · you back it up',
+    sub: deviceUnavailable()
+      ? 'Not available in this browser'
+      : device
+        ? `${last === 'local' ? 'Last used · ' : ''}Your vault is here`
+        : BROWSER_VAULT && support.browser && support.ios && !support.standalone
+          ? 'In the Home Screen app'
+          : 'No account · you back it up',
     last: last === 'local',
     icon: 'device',
-    disabled: !support.browser && !support.folder,
+    disabled: Boolean(deviceUnavailable()),
   });
   return rows;
 }
