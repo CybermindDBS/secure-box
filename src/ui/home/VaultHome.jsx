@@ -151,7 +151,18 @@ function Unlock({ gate }) {
           {gate.status}
         </p>
       ) : null}
-      <PasswordInput id="unlock-password" label="Master password" value={password} onChange={setPassword} onEnter={go} onCaps={setCaps} autoFocus disabled={busy} invalid={Boolean(gate.error)} />
+      <PasswordInput
+        id="unlock-password"
+        label="Master password"
+        placeholder="Your Secure Box master password"
+        value={password}
+        onChange={setPassword}
+        onEnter={go}
+        onCaps={setCaps}
+        autoFocus
+        disabled={busy}
+        invalid={Boolean(gate.error)}
+      />
       {gate.demoPassword ? (
         <p className="panel-hint">
           Demo master password: <span className="mono">{gate.demoPassword}</span>
@@ -214,7 +225,7 @@ function Create({ gate }) {
       <PasswordInput id="create-password" label="Master password" value={password} onChange={setPassword} autoFocus disabled={busy} />
       <StrengthMeter password={password} />
       <PasswordInput id="create-confirm" label="Repeat it" value={confirm} onChange={setConfirm} onEnter={go} disabled={busy} reveal={false} />
-      <p className="panel-hint">Use 12+ characters: a short sentence only you would think of works well. Don’t save it in your browser or online account.</p>
+      <p className="panel-hint">Use 12+ characters: a short sentence only you would think of works well. Make it different from your Google or Microsoft password, and don’t save it in your browser or online account.</p>
       <FormError error={gate.error} />
       <button type="button" className={`btn btn-primary btn-block${busy ? ' is-busy' : ''}`} disabled={busy} onClick={() => go()}>
         <span className="btn-spinner" aria-hidden="true" />
@@ -285,7 +296,7 @@ function Adopt({ gate }) {
             </button>
           </div>
           <PasswordInput id="adopt-password" label="Master password" value={secret} onChange={setSecret} onEnter={go} onCaps={setCaps} autoFocus disabled={busy} />
-          <p className="panel-hint">The master password of that vault. Its Emergency Kit’s recovery key works too.</p>
+          <p className="panel-hint">The Secure Box master password of that vault. Its Emergency Kit’s recovery key works too.</p>
         </>
       )}
       {waiting ? (
