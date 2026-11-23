@@ -287,9 +287,11 @@ function SelectionBar({ order }) {
 // ---------------------------------------------------------------------------
 // A file or folder
 // ---------------------------------------------------------------------------
-// One watcher for all the thumbnails in a list: tells each when it comes within half a screen of
-// view and when it leaves, so only those are loaded (session/thumbs.js).
-const nearWatchers = new WeakMap(); // the list that scrolls -> { observer, calls }
+// One watcher for all the thumbnails in a list: tells each card when it comes within a screen of
+// view and when it leaves, so only those are loaded (session/thumbs.js). It watches the cards
+// themselves: a card out of view keeps its size while what's inside it isn't laid out (CSS). It
+// also follows how fast the list is scrolling, to load what will be in view by the time it's here.
+const nearWatchers = new WeakMap(); // the list that scrolls -> { observer, calls, speed, top, at }
 function watchNear(el, onChange) {
   const root = el.closest('.files-body');
   let watcher = nearWatchers.get(root || document);
@@ -297,8 +299,20 @@ function watchNear(el, onChange) {
     const calls = new Map();
     const observer = new IntersectionObserver((entries) => {
       for (const entry of entries) calls.get(entry.target)?.(entry.isIntersecting);
-    }, { root, rootMargin: '50% 0px' });
-    nearWatchers.set(root || document, (watcher = { observer, calls }));
+    }, { root, rootMargin: '100% 0px' });
+    nearWatchers.set(root || document, (watcher = { observer, calls, speed: 0, top: root?.scrollTop ?? 0, at: 0 }));
+    root?.addEventListener(
+      'scroll',
+      () => {
+        const now = performance.now();
+        const since = now - watcher.at;
+        const speed = (root.scrollTop - watcher.top) / Math.max(1, since); // px per ms, down above 0
+        watcher.speed = since > 250 ? speed : watcher.speed * 0.6 + speed * 0.4;
+        watcher.top = root.scrollTop;
+        watcher.at = now;
+      },
+      { passive: true },
+    );
   }
   watcher.calls.set(el, onChange);
   watcher.observer.observe(el);
@@ -306,6 +320,30 @@ function watchNear(el, onChange) {
     watcher.calls.delete(el);
     watcher.observer.unobserve(el);
   };
+}
+
+/**
+ * Which thumbnails to load first (lowest first), going by where each card will be in `lead` ms,
+ * when a thumbnail asked for now would be here: the cards in view by then, the ones that will
+ * stay in view longest first (the top rows first while the list is still); then the others, by
+ * how far they will be from view.
+ */
+function nearness(card, lead) {
+  const list = card.closest('.files-body');
+  const watcher = list && nearWatchers.get(list);
+  const r = card.getBoundingClientRect();
+  const view = list ? list.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+  const speed = watcher && performance.now() - watcher.at < 150 ? watcher.speed : 0;
+  const height = view.bottom - view.top;
+  const shift = Math.max(-2 * height, Math.min(2 * height, speed * lead));
+  const top = r.top - shift;
+  const bottom = r.bottom - shift;
+  if (bottom > view.top && top < view.bottom) {
+    if (speed > 0.05) return -1e6 + (view.bottom - bottom); // scrolling down: the lower, the longer in view
+    if (speed < -0.05) return -1e6 + (top - view.top);
+    return -1e6 + (r.top - view.top);
+  }
+  return top >= view.bottom ? top - view.bottom : view.top - bottom;
 }
 
 /** A thumbnail for `entry` once it's near the view: { key, url } (url null: none to show). */
@@ -327,9 +365,10 @@ function useThumb(entry, wanted, ref) {
     const now = keptThumb(entry);
     if (now) show(now);
     else {
-      stopWatching = watchNear(ref.current, (near) => {
+      const card = ref.current.closest('[data-id]') || ref.current;
+      stopWatching = watchNear(card, (near) => {
         notWanted?.();
-        notWanted = near ? wantThumb(entry, show) : null;
+        notWanted = near ? wantThumb(entry, show, (lead) => nearness(card, lead)) : null;
       });
     }
     return () => {
