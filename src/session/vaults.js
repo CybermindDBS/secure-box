@@ -69,11 +69,36 @@ export const streamingReady = () => streamingStarted;
 // ===========================================================================
 let deferredSignIn = null; // a background sign-in that waits until the Vault tab is opened
 
+// A sign-in leaves this page for Google's or Microsoft's. Going Back from there brings this page
+// back exactly as it was (the browser's back/forward cache), "Redirecting to Google…" and all,
+// with nothing left to wait for. So the card you left from is noted, and Back returns to it.
+let beforeSignIn = null;
+
+function noteLeaving(provider) {
+  beforeSignIn = { gate: state.gate, provider: state.provider, last: memory.lastProvider(), hint: memory.readHint(provider), hintOf: provider };
+}
+
+/** Back from a sign-in page: the card you left from, and the place and account it remembered. */
+function backFromSignIn(event) {
+  if (!event.persisted || !beforeSignIn) return;
+  const { gate, provider, last, hint, hintOf } = beforeSignIn;
+  beforeSignIn = null;
+  memory.takeLockReason(); // kept for the round trip (state.lockMessage still has it), which didn't happen
+  state.provider = provider;
+  memory.rememberProvider(last);
+  if (hint) memory.saveHint(hint, hintOf);
+  if (gate.panel === 'working' || gate.panel === 'loading') return showWelcome({ message: state.lockMessage });
+  state.gate = gate;
+  publish();
+  return undefined;
+}
+
 export async function boot() {
   const reason = memory.takeLockReason();
   state.lockMessage = lockMessageOf(reason);
   state.section = pref('lockedSection');
   publish();
+  window.addEventListener('pageshow', backFromSignIn);
   streamingStarted = startStreaming({ describe: describeForStream, read: readForStream }).then((ok) => {
     state.streaming = ok;
   });
@@ -251,14 +276,16 @@ export function openPlace(provider) {
 export function signIn(prompt = '', provider = currentProvider()) {
   if (DEMO) return openAccount();
   if (provider === 'local') return openDeviceVault();
+  noteLeaving(provider);
   if (prompt === 'select_account') memory.clearHint(provider);
   memory.rememberProvider(provider);
   state.provider = provider;
   showWorking(`Redirecting to ${companyName(provider)}…`);
   if (provider === 'microsoft') {
-    return beginMicrosoftSignIn({ clientId: state.config.microsoftClientId, loginHint: memory.readHint('microsoft'), prompt }).catch((err) =>
-      showWelcome({ message: err.message, tone: 'error' }),
-    );
+    return beginMicrosoftSignIn({ clientId: state.config.microsoftClientId, loginHint: memory.readHint('microsoft'), prompt }).catch((err) => {
+      beforeSignIn = null; // it never left
+      showWelcome({ message: err.message, tone: 'error' });
+    });
   }
   beginGoogleSignIn({ clientId: state.config.googleClientId, loginHint: memory.readHint('google'), prompt });
   return undefined;
@@ -1155,10 +1182,14 @@ function silentSignIn(reason) {
   memory.noteSilentSignIn();
   if (reason) memory.setLockReason(reason); // still explain the lock after the round trip
   const provider = memory.lastProvider() || 'google';
+  noteLeaving(provider);
   state.provider = provider;
   showWorking(`Signing in with ${companyName(provider)}…`);
   if (provider === 'microsoft') {
-    beginMicrosoftSignIn({ clientId: state.config.microsoftClientId, loginHint: memory.readHint('microsoft'), silent: true }).catch(() => showWelcome());
+    beginMicrosoftSignIn({ clientId: state.config.microsoftClientId, loginHint: memory.readHint('microsoft'), silent: true }).catch(() => {
+      beforeSignIn = null; // it never left
+      showWelcome();
+    });
     return;
   }
   beginGoogleSignIn({ clientId: state.config.googleClientId, loginHint: memory.readHint('google'), silent: true });
