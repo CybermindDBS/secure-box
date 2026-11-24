@@ -372,6 +372,10 @@ What Secure Box can see in a cloud depends on the app it connects as. Google Dri
 - The deploy script refuses a client ID from another Google project, or another Microsoft app registration. To switch on purpose, keep the old one working and run it with `-NewCloudApps`. The old one becomes Secure Box's previous connection: when the new one finds no vault, Secure Box offers **Bring it over**, signs in through the old one too, and copies the vault across exactly as stored. Once everyone's vault is across, run it with `-ForgetPreviousCloudApps`.
 - If the old one is gone for good, people can still bring their vault back from their cloud's own download ([Recovery](#recovery)).
 
+### 6. An Android app (optional)
+
+Secure Box can go on Google Play as the website in an app (a Trusted Web Activity): Chrome opens the site full screen, and every deploy updates the app too. [`android/`](android/README.md) holds the wrapper and `build-android.ps1`, which makes your upload key and the signed app; the deploy script then publishes the site's `/.well-known/assetlinks.json` with `-AndroidPackage` and `-AndroidFingerprint`, so Chrome trusts the app.
+
 </details>
 
 <details>
@@ -415,7 +419,7 @@ npm run build:experimental   # dist/ with the experiments on (never deploy it)
 ```
 
 - Built with **React** and **Vite**. The page keeps its strict Content-Security-Policy in development too: no inline scripts or styles, and the only Trusted Types policy lets through just Secure Box's own scripts.
-- `npm run build` writes `dist/` and runs [`scripts/check-build.mjs`](scripts/check-build.mjs): the page's policy must match `firebase.json`'s, nothing may be inline, every file the page and the service worker load must be there, no experiment may be in it, and the privacy page ([`public/privacy.html`](public/privacy.html)) must stay a plain page with no scripts.
+- `npm run build` writes `dist/` and runs [`scripts/check-build.mjs`](scripts/check-build.mjs): the page's policy must match `firebase.json`'s, nothing may be inline, every file the page and the service worker load must be there, no experiment may be in it, the privacy page ([`public/privacy.html`](public/privacy.html)) must stay a plain page with no scripts, and nothing hidden may go out but the Android app's `.well-known/assetlinks.json`, in a form Chrome accepts.
 - **Experiments** ([`src/experiments.js`](src/experiments.js)) are features kept in the code but left out of the production app: the build drops the code only they reach. Today there's one, a vault on this device kept in the browser's own storage rather than a folder (it belongs to the site's address, so it couldn't follow Secure Box to a new one). The experimental scripts above turn them on, and the app then shows an **Experimental** badge.
 - `npm test` runs 98 unit tests: the key ring and its revisions, every encryption format, `.sbox` files and messages, the one vault format and how each place finds its files (against stand-ins for Google Drive and OneDrive), saves that cross on Google Drive, moving and copying vaults, backups and restores (cloud downloads included), missing files, ZIP reading and writing, document readers, uploads that resume, tamper detection, big vaults (thousands of changes applied in one pass, checked against applying them one at a time), and guards on the source itself (no HTML or code sinks, one Trusted Types policy, no injected styles).
 - The demo can rehearse failures: add `&faults=` to `?demo`, for example http://localhost:8080/?demo&faults=trashed.
@@ -485,7 +489,9 @@ src/
   styles/               the stylesheets, linked once from index.html
 docs/images/            the screenshots in this README (the demo's sample data)
 firebase.json           Firebase Hosting: publishes dist/ with the security headers
-deploy-firebase.ps1     one-command Firebase deploy (builds first, guards the cloud connection)
+deploy-firebase.ps1     one-command Firebase deploy (builds first, guards the cloud connection,
+                        publishes the Android app's asset links)
+android/                the Google Play wrapper (a Trusted Web Activity) and build-android.ps1
 tests/                  node --test suite
 ```
 

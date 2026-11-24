@@ -5,7 +5,9 @@
 // - the service worker and the classic scripts it imports are there, unhashed;
 // - experiments (src/experiments.js) are left out of a production build, and are in an
 //   experimental one (node scripts/check-build.mjs --experimental);
-// - the privacy page is a plain page: no scripts, nothing inline, its own strict policy.
+// - the privacy page is a plain page: no scripts, nothing inline, its own strict policy;
+// - nothing hidden is deployed but the Android app's .well-known/assetlinks.json, and that one
+//   is a statement Chrome accepts.
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -85,8 +87,44 @@ const hasExperiments = /[`"']browser-vault[`"']/.test(scripts); // the minifier 
 if (!experimental && hasExperiments) fail('The browser vault experiment is in this production build. Build with "npm run build", not "--mode experimental".');
 if (experimental && !hasExperiments) fail('The experimental build has no experiments in it.');
 
+// Nothing hidden goes out (dot-files and dot-folders), except the Android app's asset links,
+// which deploy-firebase.ps1 writes: a statement Chrome accepts, or none at all.
+const hidden = [];
+const walk = (dir, rel = '') => {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = rel ? `${rel}/${entry.name}` : entry.name;
+    if (entry.name.startsWith('.') && path !== '.well-known') hidden.push(path);
+    else if (entry.isDirectory()) walk(join(dir, entry.name), path);
+    else if (path.startsWith('.well-known/') && path !== '.well-known/assetlinks.json') hidden.push(path);
+  }
+};
+walk(dist);
+if (hidden.length) fail(`Hidden files in the build: ${hidden.join(', ')}`);
+const assetLinks = join(dist, '.well-known', 'assetlinks.json');
+let androidApp = '';
+if (existsSync(assetLinks)) {
+  let statements = null;
+  try {
+    statements = JSON.parse(readFileSync(assetLinks, 'utf8'));
+  } catch {
+    fail('.well-known/assetlinks.json is not JSON.');
+  }
+  const fingerprint = /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/;
+  const valid = (s) =>
+    Array.isArray(s?.relation) &&
+    s.relation.includes('delegate_permission/common.handle_all_urls') &&
+    s.target?.namespace === 'android_app' &&
+    /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(s.target.package_name || '') &&
+    Array.isArray(s.target.sha256_cert_fingerprints) &&
+    s.target.sha256_cert_fingerprints.length > 0 &&
+    s.target.sha256_cert_fingerprints.every((f) => fingerprint.test(f));
+  if (statements && !(Array.isArray(statements) && statements.length && statements.every(valid))) {
+    fail('.well-known/assetlinks.json must list the Android app: handle_all_urls, android_app, its package name and SHA-256 fingerprints (AB:CD:…).');
+  } else if (statements) androidApp = `, Android app ${statements.map((s) => s.target.package_name).join(' and ')}`;
+}
+
 if (problems.length) {
   console.error(`Build check failed:\n- ${problems.join('\n- ')}`);
   process.exit(1);
 }
-console.log(`Build check passed: same CSP as firebase.json, nothing inline, every file present, ${experimental ? 'experiments on (experimental build)' : 'no experiments'}.`);
+console.log(`Build check passed: same CSP as firebase.json, nothing inline, every file present, ${experimental ? 'experiments on (experimental build)' : 'no experiments'}${androidApp}.`);

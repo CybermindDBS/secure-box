@@ -36,6 +36,12 @@
 .EXAMPLE
   .\deploy-firebase.ps1 -ForgetPreviousCloudApps
   Ends that, once everyone's vault has been brought over.
+
+.EXAMPLE
+  .\deploy-firebase.ps1 -AndroidPackage io.github.example.securebox -AndroidFingerprint AB:CD:...:EF
+  Lets the site vouch for the Android app (android\build-android.ps1 prints this line): it publishes
+  /.well-known/assetlinks.json, so Chrome opens the app full screen without an address bar. Run it
+  again with -AndroidFingerprint for Google Play's app signing key; each fingerprint is remembered.
 #>
 [CmdletBinding()]
 param(
@@ -44,6 +50,8 @@ param(
   [string]$MicrosoftClientId,
   [int]$AutoLockMinutes,
   [int]$SessionHours,
+  [string]$AndroidPackage,
+  [string[]]$AndroidFingerprint,
   [switch]$NewCloudApps,
   [switch]$ForgetPreviousCloudApps
 )
@@ -54,6 +62,7 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $SettingsPath = Join-Path $Root 'deploy.settings.json'
 $ConfigPath = Join-Path $Root 'public\assets\config.json'
+$AssetLinksPath = Join-Path $Root 'public\.well-known\assetlinks.json'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Write-Step([string]$Text) { Write-Host ''; Write-Host "==> $Text" -ForegroundColor Cyan }
@@ -92,6 +101,25 @@ if ($GoogleClientId -notmatch '^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$'
 if ($MicrosoftClientId -and $MicrosoftClientId -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
   Stop-Deploy 'Pass -MicrosoftClientId with the Application (client) ID of your Microsoft app registration (a GUID).'
 }
+
+# --- The Android app the site vouches for (/.well-known/assetlinks.json) ----------------------
+# Its package name, and the SHA-256 fingerprints of the keys it's signed with: your upload key,
+# and Google Play's app signing key. Fingerprints given are added to the remembered ones.
+$AndroidPackage = Select-Setting $AndroidPackage 'AndroidPackage' ''
+if ($AndroidPackage -and $AndroidPackage -notmatch '^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$') {
+  Stop-Deploy "'$AndroidPackage' is not an Android package name (like io.github.example.securebox)."
+}
+$fingerprints = @()
+if ($saved.Contains('AndroidFingerprints') -and $saved['AndroidFingerprints']) { $fingerprints += @($saved['AndroidFingerprints'] | ForEach-Object { [string]$_ }) }
+foreach ($given in @($AndroidFingerprint | Where-Object { $_ })) {
+  $text = ($given -replace '\s', '').ToUpperInvariant()
+  if ($text -match '^[0-9A-F]{64}$') { $text = ($text -split '(..)' | Where-Object { $_ }) -join ':' }
+  if ($text -notmatch '^([0-9A-F]{2}:){31}[0-9A-F]{2}$') {
+    Stop-Deploy "'$given' is not a SHA-256 certificate fingerprint (32 pairs of hex digits, like AB:CD:...)."
+  }
+  if ($fingerprints -notcontains $text) { $fingerprints += $text }
+}
+if ($fingerprints.Count -and -not $AndroidPackage) { Stop-Deploy 'Pass -AndroidPackage too: the package name of the Android app those keys sign.' }
 
 # --- Guard: the Google project and the Microsoft app decide what Secure Box can see ----------
 # Google Drive shows Secure Box only the files its own Google Cloud project made (the number a
@@ -138,6 +166,8 @@ $saved['GoogleClientId'] = $GoogleClientId
 if ($MicrosoftClientId) { $saved['MicrosoftClientId'] = $MicrosoftClientId }
 $saved['AutoLockMinutes'] = $AutoLockMinutes
 $saved['SessionHours'] = $SessionHours
+if ($AndroidPackage) { $saved['AndroidPackage'] = $AndroidPackage }
+if ($fingerprints.Count) { $saved['AndroidFingerprints'] = @($fingerprints) }
 [System.IO.File]::WriteAllText($SettingsPath, ($saved | ConvertTo-Json) + "`n", $Utf8NoBom)
 
 Write-Step 'Writing public/assets/config.json'
@@ -149,6 +179,21 @@ if ($saved.Contains('PreviousMicrosoftClientId') -and $saved['PreviousMicrosoftC
 $config['autoLockMinutes'] = $AutoLockMinutes
 $config['sessionHours'] = $SessionHours
 [System.IO.File]::WriteAllText($ConfigPath, ($config | ConvertTo-Json) + "`n", $Utf8NoBom)
+
+# The Android app's Digital Asset Links: Chrome opens it full screen only for an app this lists.
+if ($AndroidPackage -and $fingerprints.Count) {
+  Write-Step 'Writing public/.well-known/assetlinks.json (the Android app)'
+  $links = @(
+    [ordered]@{
+      relation = @('delegate_permission/common.handle_all_urls')
+      target   = [ordered]@{ namespace = 'android_app'; package_name = $AndroidPackage; sha256_cert_fingerprints = @($fingerprints) }
+    }
+  )
+  New-Item -ItemType Directory -Force -Path (Split-Path $AssetLinksPath) | Out-Null
+  [System.IO.File]::WriteAllText($AssetLinksPath, (ConvertTo-Json -InputObject $links -Depth 5) + "`n", $Utf8NoBom)
+} elseif (Test-Path $AssetLinksPath) {
+  Remove-Item $AssetLinksPath
+}
 
 # --- Build: exactly the locked dependencies, no install scripts, then the build check ----------
 $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
@@ -218,3 +263,24 @@ Write-Host ''
 Write-Host '  Your data stays where it is: in each person''s Google Drive or OneDrive, or on their device.'
 Write-Host '  Use one address consistently: each address keeps its own settings and device vault in the browser.'
 Write-Host ''
+
+# --- The Android app: is the live assetlinks.json the one just written? ------------------------
+if ($AndroidPackage -and $fingerprints.Count) {
+  $url = "https://$Site.web.app/.well-known/assetlinks.json"
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $live = Invoke-RestMethod -Uri $url -Headers @{ 'Cache-Control' = 'no-cache' } -UseBasicParsing
+    $statements = @($live | ForEach-Object { $_ }) # Windows PowerShell hands a JSON array over as one object
+    $target = @($statements | Where-Object { $_.target -and $_.target.package_name -eq $AndroidPackage } | ForEach-Object { $_.target })
+    $listed = @($target | ForEach-Object { @($_.sha256_cert_fingerprints) })
+    $missing = @($fingerprints | Where-Object { $listed -notcontains $_ })
+    if ($target.Count -and -not $missing.Count) {
+      Write-Host "  Android app $AndroidPackage`: the site vouches for it ($($fingerprints.Count) signing key$(if ($fingerprints.Count -ne 1) { 's' }))." -ForegroundColor White
+    } else {
+      Write-Host "  WARNING: $url doesn't list the Android app as just written. Check it in a browser." -ForegroundColor Yellow
+    }
+  } catch {
+    Write-Host "  WARNING: couldn't read $url ($($_.Exception.Message))." -ForegroundColor Yellow
+  }
+  Write-Host ''
+}

@@ -1,0 +1,13 @@
+# Built by Gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# What build-android.ps1 makes: the signed app, and never a signing key
+release/
+*.aab
+*.apk
+*.idsig
+*.keystore
+*.jks
