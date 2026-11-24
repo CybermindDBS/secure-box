@@ -1,5 +1,6 @@
 # Written by deploy-firebase.ps1
 public/assets/config.json
+public/.well-known/
 deploy.settings.json
 
 # A site's own verification files (Google Search Console): they stay on the machine that
