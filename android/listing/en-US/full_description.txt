@@ -1,0 +1,41 @@
+Secure Box is an encrypted vault for your files: photos, videos, documents and whole folders, with your passwords alongside. Keep it in your own Google Drive or OneDrive, to have it on every device you use, or only on this phone. Everything is encrypted on your phone before it's stored, and only your master password opens it.
+
+YOUR FILES, IN YOUR CLOUD OR ON YOUR PHONE
+• Photos, videos, music, documents and whole folders, organised in folders and searchable
+• In Google Drive or OneDrive they're on your phone, tablet and computer; or keep them only on this phone, in a folder you choose
+• Google and Microsoft see only encrypted files: no names, no folders, no contents
+• Secure Box can see only what it stores in your Drive or OneDrive, nothing else there
+• Move or copy a whole vault from one place to another, encrypted the whole way
+
+STREAM AND VIEW, WITHOUT SAVING TO YOUR PHONE
+• Videos and music play straight from your vault, with seeking, decrypted as they stream
+• Photos, PDF, Word, Excel, PowerPoint, OpenDocument, EPUB, RTF, Markdown, CSV, text and code open right inside it
+• Nothing decrypted is written to your phone's storage
+• Thumbnails are made on your phone and kept encrypted
+• Download a file, or several as a ZIP, only when you want a copy
+
+YOUR PASSWORDS TOO
+• Logins and secure notes in the same vault, with a password generator
+• Copy a username or password with one tap; the clipboard clears itself after 30 seconds
+• Import and export CSV from Chrome, Firefox, Bitwarden, 1Password, LastPass and others
+
+ENCRYPTION TOOLS FOR FILES, FOLDERS AND TEXT
+• Turn any file or whole folder into an encrypted .sbox file, and any text into an encrypted message
+• Keep them, or share them with a password: whoever you send them to opens them in Secure Box, with no account and no vault
+• Names, sizes and dates are encrypted inside, too
+
+OPEN SOURCE, NO SIGN-UP
+• No Secure Box account: no email, no phone number, no personal details. A cloud vault uses your own Google or Microsoft sign-in; a vault on this phone needs no account at all
+• No Secure Box server holds your data, so nobody else can read your vault: not us, not Google, not Microsoft
+• Open source under the GNU AGPL v3, so anyone can check how it works: github.com/CybermindDBS/secure-box
+• No ads, no analytics, no trackers
+
+STRONG ENCRYPTION AND SAFETY NETS
+• AES-256-GCM; your master password is stretched with PBKDF2 (600,000 rounds) and never leaves your phone
+• Every file has its own key, and any tampering with a file is detected
+• One master password opens all your vaults
+• Secure Box locks itself after 10 minutes without use
+• An Emergency Kit resets a forgotten master password
+• Recovery from the Google Drive bin or the OneDrive recycle bin, and backups for a vault on your phone
+
+Secure Box opens in Chrome on your phone, full screen, and updates itself. It also runs in your computer's browser at box-6sd93.web.app, with the same vault. Google Drive is a trademark of Google LLC and OneDrive of Microsoft Corporation; Secure Box isn't affiliated with either.

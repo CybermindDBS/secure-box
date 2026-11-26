@@ -107,6 +107,12 @@
                 android:name="androix.browser.trusted.NAVIGATION_BAR_DIVIDER_COLOR_DARK"
                 android:resource="@color/navigationDividerColorDark" />
 
+            <!-- A plain splash screen: the page's own background colour (light or dark, as the
+                 phone is set), no picture, until the page first paints. Bubblewrap's showed the
+                 icon on a dark background, a dark flash before the light theme. With none at all,
+                 Chrome shows its toolbar (close, share, menu) for a moment while it checks the
+                 site vouches for the app. Regenerating with Bubblewrap brings its splash back:
+                 keep drawable/splash.xml and the colours in values(-night)/colors.xml. -->
             <meta-data android:name="android.support.customtabs.trusted.SPLASH_IMAGE_DRAWABLE"
                 android:resource="@drawable/splash"/>
 

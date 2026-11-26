@@ -15,4 +15,7 @@
 -->
 <resources>
     <color name="shortcut_background">#F5F5F5</color>
+    <!-- The splash screen: the page's own background, so the app opens on the colour the page
+         then fills (light here, dark in values-night; the page background in base.css). -->
+    <color name="backgroundColor">#F6F6F3</color>
 </resources>

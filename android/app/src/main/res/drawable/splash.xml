@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The splash screen's picture: nothing (see SPLASH_IMAGE_DRAWABLE in AndroidManifest.xml).
+     It has a size because the browser helper library draws it into a bitmap. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="@android:color/transparent" />
+    <size android:width="1dp" android:height="1dp" />
+</shape>
