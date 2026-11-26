@@ -4,11 +4,11 @@
   "name": "Secure Box",
   "launcherName": "Secure Box",
   "display": "standalone",
-  "themeColor": "#0E0E0D",
+  "themeColor": "#F6F6F3",
   "themeColorDark": "#0E0E0D",
-  "navigationColor": "#0E0E0D",
+  "navigationColor": "#F6F6F3",
   "navigationColorDark": "#0E0E0D",
-  "navigationDividerColor": "#0E0E0D",
+  "navigationDividerColor": "#F6F6F3",
   "navigationDividerColorDark": "#0E0E0D",
   "backgroundColor": "#0E0E0D",
   "enableNotifications": false,
@@ -20,8 +20,8 @@
     "path": "./upload.keystore",
     "alias": "upload"
   },
-  "appVersionName": "1.0.0",
-  "appVersionCode": 1,
+  "appVersionName": "1.0.2",
+  "appVersionCode": 3,
   "shortcuts": [],
   "generatorApp": "unknown",
   "webManifestUrl": "https://box-6sd93.web.app/manifest.webmanifest",
@@ -43,5 +43,5 @@
   "fileHandlers": [],
   "launchHandlerClientMode": "",
   "displayOverride": [],
-  "appVersion": "1.0.0"
+  "appVersion": "1.0.2"
 }

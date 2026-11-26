@@ -26,13 +26,12 @@ def twaManifest = [
     launchUrl: '/index.html', // The start path for the TWA. Must be relative to the domain.
     name: 'Secure Box', // The application name.
     launcherName: 'Secure Box', // The name shown on the Android Launcher.
-    themeColor: '#0E0E0D', // The color used for the status bar.
+    themeColor: '#F6F6F3', // The color used for the status bar (light theme; the page's own background).
     themeColorDark: '#0E0E0D', // The color used for the dark status bar.
-    navigationColor: '#0E0E0D', // The color used for the navigation bar.
+    navigationColor: '#F6F6F3', // The color used for the navigation bar (light theme).
     navigationColorDark: '#0E0E0D', // The color used for the dark navbar.
-    navigationDividerColor: '#0E0E0D', // The navbar divider color.
+    navigationDividerColor: '#F6F6F3', // The navbar divider color (light theme).
     navigationDividerColorDark: '#0E0E0D', // The dark navbar divider color.
-    backgroundColor: '#0E0E0D', // The color used for the splash screen background.
     enableNotifications: false, // Set to true to enable notification delegation.
     // Every shortcut must include the following fields:
     // - name: String that will show up in the shortcut.
@@ -41,6 +40,7 @@ def twaManifest = [
     // - icon: Name of the resource in the drawable folder to use as an icon.
     shortcuts: [],
     // The duration of fade out animation in milliseconds to be played when removing splash screen.
+    // (The splash screen's colours are in res/values/colors.xml and res/values-night/colors.xml.)
     splashScreenFadeOutDuration: 300,
     generatorApp: 'unknown', // Application that generated the Android Project
     // The fallback strategy for when Trusted Web Activity is not available. Possible values are
@@ -57,8 +57,8 @@ android {
         applicationId "io.github.cyberminddbs.securebox"
         minSdkVersion 24
         targetSdkVersion 36
-        versionCode 1
-        versionName "1.0.0"
+        versionCode 3
+        versionName "1.0.2"
 
         // The name for the application
         resValue "string", "appName", twaManifest.name
@@ -119,10 +119,6 @@ android {
         // set here or in `res/values/colors.xml`. Setting in both places is an error and the 
         //app will not compile. If not set, the divider color defaults to #000000 - black.
         resValue "color", "navigationDividerColorDark", twaManifest.navigationDividerColorDark
-
-        // Sets the color for the background used for the splash screen when launching the
-        // Trusted Web Activity.
-        resValue "color", "backgroundColor", twaManifest.backgroundColor
 
         // Defines a provider authority for the Splash Screen
         resValue "string", "providerAuthority", twaManifest.applicationId + '.fileprovider'
